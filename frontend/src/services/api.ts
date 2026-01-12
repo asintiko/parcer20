@@ -46,33 +46,60 @@ export interface Transaction {
     parsing_confidence: number | null;
     is_p2p?: boolean;
     created_at: string;
+    raw_message?: string | null;
 }
 
 export interface TransactionListResponse {
     total: number;
     page: number;
     page_size: number;
-    transactions: Transaction[];
+    items: Transaction[];
+}
+
+export interface TransactionsQueryParams {
+    page?: number;
+    page_size?: number;
+    sort_by?: string;
+    sort_dir?: 'asc' | 'desc';
+    date_from?: string;
+    date_to?: string;
+    operators?: string[];
+    apps?: string[];
+    operator?: string;
+    app?: string;
+    amount_min?: string;
+    amount_max?: string;
+    parsing_method?: string;
+    confidence_min?: number;
+    confidence_max?: number;
+    search?: string;
+    source_type?: 'AUTO' | 'MANUAL';
+    transaction_type?: 'DEBIT' | 'CREDIT' | 'CONVERSION' | 'REVERSAL';
+    transaction_types?: string[];
+    currency?: 'UZS' | 'USD';
+    card?: string;
+    days_of_week?: number[];
 }
 
 // Update/Delete types
 export interface TransactionUpdateRequest {
-    datetime?: string;
-    operator?: string;
-    app?: string;
+    transaction_date?: string;
+    operator_raw?: string;
+    application_mapped?: string;
     amount?: string;
-    balance?: string;
-    card_last4?: string;
-    is_p2p?: boolean;
+    balance_after?: string;
+    card_last_4?: string;
     transaction_type?: 'DEBIT' | 'CREDIT' | 'CONVERSION' | 'REVERSAL';
     currency?: 'UZS' | 'USD';
-    source?: 'auto' | 'manual';
+    source_type?: 'AUTO' | 'MANUAL';
+    parsing_method?: string;
+    parsing_confidence?: number;
 }
 
 export interface TransactionUpdateResponse {
     success: boolean;
     message: string;
-    check: Transaction;
+    transaction: Transaction;
 }
 
 export interface DeleteResponse {
@@ -115,16 +142,42 @@ export interface SummaryResponse {
 
 // API methods
 export const transactionsApi = {
-    getTransactions: async (params: {
-        page?: number;
-        page_size?: number;
-        card?: string;
-        app?: string;
-        start_date?: string;
-        end_date?: string;
-        transaction_type?: string;
-    }): Promise<TransactionListResponse> => {
-        const response = await apiClient.get<TransactionListResponse>('/api/transactions/', { params });
+    getTransactions: async (params: TransactionsQueryParams): Promise<TransactionListResponse> => {
+        const query: Record<string, any> = {
+            page: params.page,
+            page_size: params.page_size,
+            sort_by: params.sort_by,
+            sort_dir: params.sort_dir,
+            date_from: params.date_from,
+            date_to: params.date_to,
+            operator: params.operator,
+            app: params.app,
+            amount_min: params.amount_min,
+            amount_max: params.amount_max,
+            parsing_method: params.parsing_method,
+            confidence_min: params.confidence_min,
+            confidence_max: params.confidence_max,
+            search: params.search,
+            source_type: params.source_type,
+            transaction_type: params.transaction_type,
+            currency: params.currency,
+            card: params.card,
+        };
+
+        if (params.operators?.length) {
+            query.operators = params.operators.join(',');
+        }
+        if (params.apps?.length) {
+            query.apps = params.apps.join(',');
+        }
+        if (params.transaction_types?.length) {
+            query.transaction_types = params.transaction_types.join(',');
+        }
+        if (params.days_of_week?.length) {
+            query.days_of_week = params.days_of_week.join(',');
+        }
+
+        const response = await apiClient.get<TransactionListResponse>('/api/transactions/', { params: query });
         return response.data;
     },
 

@@ -88,6 +88,12 @@ npm install
 npm run dev
 ```
 
+#### Table Virtualization (Performance)
+- The transactions grid uses `@tanstack/react-virtual` inside `TransactionTable.tsx` to only render visible rows while keeping the header sticky and all table interactions (sorting, filtering, inline edit, drag-to-select) intact.
+- Row height is estimated per density (`compact`, `standard`, `comfortable`); adjust `ROW_HEIGHT_BY_DENSITY` for custom sizing if row heights change.
+- Overscan is set to `10` rows; tune `overscan` in the `useVirtualizer` config for smoother scroll on slow machines (higher = fewer reflows, lower = less work per scroll).
+- A dev-only guard logs a warning if a large dataset (>2000 rows) ever renders without virtualization.
+
 ### Telegram Web K (bots-only)
 
 The Userbot tab embeds a local build of Telegram Web K from `telegram-web-k/`.

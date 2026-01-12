@@ -44,16 +44,17 @@ export const useInlineEdit = (options?: UseInlineEditOptions) => {
         async (rowId: number, columnId: string, newValue: any) => {
             // Map UI column IDs to API field names
             const fieldMap: Record<string, string> = {
-                transaction_date: 'datetime',
-                operator_raw: 'operator',
-                application_mapped: 'app',
+                transaction_date: 'transaction_date',
+                operator_raw: 'operator_raw',
+                application_mapped: 'application_mapped',
                 amount: 'amount',
-                balance_after: 'balance',
-                card_last_4: 'card_last4',
-                is_p2p: 'is_p2p',
+                balance_after: 'balance_after',
+                card_last_4: 'card_last_4',
                 transaction_type: 'transaction_type',
                 currency: 'currency',
-                source_type: 'source',
+                source_type: 'source_type',
+                parsing_method: 'parsing_method',
+                parsing_confidence: 'parsing_confidence',
             };
 
             const apiField = fieldMap[columnId] || columnId;

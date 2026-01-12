@@ -3,13 +3,10 @@
  * Uses TanStack Table for data-dense display
  * Features: Resize, Reorder (@dnd-kit), Context Menu (Color/Align), Excel-like grid, Multi-Selection, Drag-to-Select
  */
-import React, { useMemo, useState, useCallback, useEffect, CSSProperties } from 'react';
+import React, { useMemo, useState, useCallback, useEffect, CSSProperties, useRef } from 'react';
 import {
     useReactTable,
     getCoreRowModel,
-    getSortedRowModel,
-    getFilteredRowModel,
-    getPaginationRowModel,
     flexRender,
     ColumnDef,
     SortingState,
@@ -17,7 +14,9 @@ import {
     ColumnOrderState,
     Row,
     Header,
+    PaginationState,
 } from '@tanstack/react-table';
+import { useVirtualizer } from '@tanstack/react-virtual';
 import { Transaction } from '../services/api';
 import { formatDate, formatTime, formatDateTime, EMPTY_VALUE as DATE_EMPTY } from '../utils/dateTimeFormatters';
 import { ChevronUp, ChevronDown, Search, FileText, Filter, Eye, Undo2, Redo2 } from 'lucide-react';
@@ -52,7 +51,18 @@ import { CSS } from '@dnd-kit/utilities';
 
 interface TransactionTableProps {
     data: Transaction[];
+    total: number;
+    page: number;
+    pageSize: number;
     isLoading?: boolean;
+    onQueryChange: (query: Partial<{
+        search: string;
+        filters: ActiveFilters;
+        sort_by: string;
+        sort_dir: 'asc' | 'desc';
+    }>) => void;
+    onPageChange: (page: number) => void;
+    onPageSizeChange: (size: number) => void;
 }
 
 // Types for Styling
@@ -74,6 +84,14 @@ const SOURCE_TYPE_LABELS: Record<string, string> = {
     MANUAL: 'Ручной',
 };
 const EMPTY_VALUE = '—';
+const ROW_HEIGHT_BY_DENSITY: Record<'compact' | 'standard' | 'comfortable', number> = {
+    compact: 28,
+    standard: 40,
+    comfortable: 52,
+};
+const VIRTUAL_WARN_THRESHOLD = 2000;
+
+type ActiveFilters = any;
 
 // Draggable Header Component
 const DraggableTableHeader = ({
@@ -130,8 +148,8 @@ const DraggableTableHeader = ({
 };
 
 
-export const TransactionTable: React.FC<TransactionTableProps> = ({ data, isLoading }) => {
-    const [sorting, setSorting] = useState<SortingState>([]);
+export const TransactionTable: React.FC<TransactionTableProps> = ({ data, total, page, pageSize, isLoading, onQueryChange, onPageChange, onPageSizeChange }) => {
+    const [sorting, setSorting] = useState<SortingState>([{ id: 'transaction_date', desc: true }]);
     const [columnFilters, setColumnFilters] = useState<ColumnFiltersState>([]);
     const [columnOrder, setColumnOrder] = useState<ColumnOrderState>([]);
 
@@ -143,7 +161,7 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({ data, isLoad
 
     // Advanced Filters State
     const [filterDrawerOpen, setFilterDrawerOpen] = useState(false);
-    const [activeFilters, setActiveFilters] = useState<any>({ currency: 'UZS' }); // Default to UZS
+    const [activeFilters, setActiveFilters] = useState<ActiveFilters>({ currency: 'UZS' }); // Default to UZS
     const activeFilterCount = Object.keys(activeFilters).filter(k => {
         const v = activeFilters[k];
         if (!v) return false;
@@ -160,6 +178,25 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({ data, isLoad
         }, 300);
         return () => clearTimeout(timeout);
     }, [searchValue]);
+
+    const sortFieldMap = useMemo<Record<string, string>>(() => ({
+        date_time: 'transaction_date',
+        transaction_date: 'transaction_date',
+        amount: 'amount',
+        created_at: 'created_at',
+        parsing_confidence: 'parsing_confidence',
+    }), []);
+
+    useEffect(() => {
+        const sortState = sorting[0];
+        const backendSort = sortState ? (sortFieldMap[sortState.id] || sortState.id) : undefined;
+        onQueryChange({
+            search: globalFilter,
+            filters: activeFilters,
+            sort_by: backendSort,
+            sort_dir: sortState?.desc ? 'desc' : 'asc',
+        });
+    }, [sorting, globalFilter, activeFilters, onQueryChange, sortFieldMap]);
 
     // Styling State
     const [columnStyles, setColumnStyles] = useState<Record<string, CellStyle>>({});
@@ -204,6 +241,8 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({ data, isLoad
             }
         },
     });
+
+    const tableContainerRef = useRef<HTMLDivElement>(null);
 
     // Wrap saveEdit to track history
     const saveEdit = useCallback(
@@ -404,7 +443,7 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({ data, isLoad
     );
 
     // Column Type Mapping for Inline Editing
-    const columnTypeMap: Record<string, CellType> = {
+    const columnTypeMap: Record<string, CellType> = useMemo(() => ({
         date_time: 'datetime',
         transaction_date: 'date',
         time: 'time',
@@ -417,13 +456,13 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({ data, isLoad
         transaction_type: 'select',
         currency: 'select',
         source_type: 'select',
-    };
+    }), []);
 
-    const columnOptionsMap: Record<string, string[]> = {
+    const columnOptionsMap: Record<string, string[]> = useMemo(() => ({
         transaction_type: ['DEBIT', 'CREDIT', 'CONVERSION', 'REVERSAL'],
         currency: ['UZS', 'USD'],
         source_type: ['AUTO', 'MANUAL'],
-    };
+    }), []);
 
     // Initial load column order
     React.useEffect(() => {
@@ -433,101 +472,65 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({ data, isLoad
     }, [columns, columnOrder.length]);
 
     // Manual Global Filter & Advanced Filters
-    const filteredData = useMemo(() => {
-        let result = data;
-
-        // 1. Advanced Filters (including currency filter)
-        if (activeFilters.currency || activeFilterCount > 0) {
-            result = result.filter(row => {
-                const f = activeFilters;
-
-                // Date
-                if (f.dateFrom) {
-                    const d = new Date(row.transaction_date);
-                    if (d < new Date(f.dateFrom)) return false;
-                }
-                if (f.dateTo) {
-                    const d = new Date(row.transaction_date);
-                    // Set to end of day
-                    const end = new Date(f.dateTo);
-                    end.setHours(23, 59, 59, 999);
-                    if (d > end) return false;
-                }
-                if (f.daysOfWeek && f.daysOfWeek.length > 0) {
-                    const d = new Date(row.transaction_date);
-                    if (!f.daysOfWeek.includes(d.getDay())) return false;
-                }
-
-                // Finance
-                if (f.amountMin) {
-                    if (parseFloat(row.amount) < parseFloat(f.amountMin)) return false;
-                }
-                if (f.amountMax) {
-                    if (parseFloat(row.amount) > parseFloat(f.amountMax)) return false;
-                }
-                if (f.currency) {
-                    if (row.currency !== f.currency) return false;
-                }
-                if (f.transactionTypes && f.transactionTypes.length > 0) {
-                    // Check logic based on exact values or mapping
-                    if (!f.transactionTypes.includes(row.transaction_type)) return false;
-                }
-
-                // Entities
-                if (f.operators && f.operators.length > 0) {
-                    if (!f.operators.includes(row.operator_raw || '')) return false;
-                }
-                if (f.apps && f.apps.length > 0) {
-                    if (!f.apps.includes(row.application_mapped || '')) return false;
-                }
-                if (f.sourceType && f.sourceType !== 'ALL') {
-                    if (row.source_type !== f.sourceType) return false;
-                }
-
-                // ID
-                if (f.cardId) {
-                    if (!(row.card_last_4 || '').includes(f.cardId)) return false;
-                }
-
-                return true;
-            });
-        }
-
-        // 2. Global Search
-        if (globalFilter) {
-            const lower = globalFilter.toLowerCase();
-            result = result.filter(row => {
-                return Object.values(row).some(val =>
-                    val !== null && val !== undefined && String(val).toLowerCase().includes(lower)
-                );
-            });
-        }
-
-        return result;
-    }, [data, globalFilter, activeFilters, activeFilterCount]);
+    const paginationState = useMemo(() => ({ pageIndex: Math.max(page - 1, 0), pageSize }), [page, pageSize]);
 
     const table = useReactTable({
-        data: filteredData,
+        data,
         columns,
         state: {
             sorting,
             columnFilters,
             columnOrder,
+            pagination: paginationState,
         },
+        manualPagination: true,
+        manualSorting: true,
+        manualFiltering: true,
         columnResizeMode: 'onChange',
         onSortingChange: setSorting,
         onColumnFiltersChange: setColumnFilters,
         onColumnOrderChange: setColumnOrder,
-        getCoreRowModel: getCoreRowModel(),
-        getSortedRowModel: getSortedRowModel(),
-        getFilteredRowModel: getFilteredRowModel(),
-        getPaginationRowModel: getPaginationRowModel(),
-        initialState: {
-            pagination: {
-                pageSize: 50,
-            },
+        onPaginationChange: (updater) => {
+            const next = typeof updater === 'function'
+                ? (updater as (old: PaginationState) => PaginationState)(paginationState)
+                : updater as PaginationState;
+
+            if (next.pageSize !== pageSize) {
+                onPageSizeChange(next.pageSize);
+            }
+            if (next.pageIndex !== paginationState.pageIndex) {
+                onPageChange(next.pageIndex + 1);
+            }
         },
+        getCoreRowModel: getCoreRowModel(),
+        pageCount: Math.max(Math.ceil(total / pageSize), 1),
     });
+
+    const rowHeight = useMemo(() => ROW_HEIGHT_BY_DENSITY[density] || ROW_HEIGHT_BY_DENSITY.standard, [density]);
+    const rows = table.getRowModel().rows;
+    const rowCount = rows.length;
+
+    const rowVirtualizer = useVirtualizer({
+        count: rowCount,
+        getScrollElement: () => tableContainerRef.current,
+        estimateSize: () => rowHeight,
+        overscan: 10,
+        getItemKey: (index) => rows[index]?.id ?? index,
+    });
+
+    const virtualRows = rowVirtualizer.getVirtualItems();
+    const totalSize = rowVirtualizer.getTotalSize();
+    const paddingTop = virtualRows.length > 0 ? virtualRows[0].start : 0;
+    const paddingBottom = virtualRows.length > 0 ? totalSize - virtualRows[virtualRows.length - 1].end : 0;
+    const virtualizationActive = virtualRows.length < rowCount;
+
+    const isDev = (import.meta as any)?.env?.DEV ?? false;
+
+    useEffect(() => {
+        if (isDev && rowCount > VIRTUAL_WARN_THRESHOLD && !virtualizationActive) {
+            console.warn(`[TransactionTable] Rendering ${rowCount} rows without virtualization enabled`);
+        }
+    }, [rowCount, virtualizationActive, isDev]);
 
     // DnD Sensors
     const sensors = useSensors(
@@ -612,10 +615,10 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({ data, isLoad
 
         // Calculate all cells in box
         const newSelection = new Set<string>();
-        const rows = table.getRowModel().rows;
+        const rowList = rows;
 
         for (let r = startRow; r <= endRow; r++) {
-            const row = rows[r];
+            const row = rowList[r];
             if (!row) continue;
             for (let c = startColIdx; c <= endColIdx; c++) {
                 const col = visibleColumns[c];
@@ -735,6 +738,21 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({ data, isLoad
     };
 
     // Copy/Paste/Delete Handlers
+    const fieldMap: Record<string, string> = useMemo(() => ({
+        date_time: 'transaction_date',
+        transaction_date: 'transaction_date',
+        time: 'transaction_date',
+        operator_raw: 'operator_raw',
+        application_mapped: 'application_mapped',
+        amount: 'amount',
+        balance_after: 'balance_after',
+        card_last_4: 'card_last_4',
+        is_p2p: 'is_p2p',
+        transaction_type: 'transaction_type',
+        currency: 'currency',
+        source_type: 'source_type',
+    }), []);
+
     const handleCopy = useCallback(() => {
         if (selectedCells.size === 0) return;
 
@@ -777,22 +795,7 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({ data, isLoad
             () => showToast('success', 'Скопировано в буфер обмена'),
             () => showToast('error', 'Не удалось скопировать')
         );
-    }, [selectedCells, data, table, showToast]);
-
-    const fieldMap: Record<string, string> = {
-        date_time: 'transaction_date',
-        transaction_date: 'transaction_date',
-        time: 'transaction_date',
-        operator_raw: 'operator_raw',
-        application_mapped: 'application_mapped',
-        amount: 'amount',
-        balance_after: 'balance_after',
-        card_last_4: 'card_last_4',
-        is_p2p: 'is_p2p',
-        transaction_type: 'transaction_type',
-        currency: 'currency',
-        source_type: 'source_type',
-    };
+    }, [selectedCells, data, table, showToast, fieldMap]);
 
     const handlePaste = useCallback(async () => {
         if (selectedCells.size === 0) return;
@@ -851,7 +854,7 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({ data, isLoad
         } catch (error) {
             showToast('error', 'Не удалось вставить из буфера обмена');
         }
-    }, [selectedCells, data, table, saveEdit, addAction, showToast]);
+    }, [selectedCells, data, table, saveEdit, addAction, showToast, fieldMap]);
 
     const handleDeleteSelected = useCallback(async () => {
         if (selectedCells.size === 0) return;
@@ -1105,7 +1108,10 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({ data, isLoad
                 onDragEnd={handleDragEnd}
                 sensors={sensors}
             >
-                <div className="flex-1 overflow-auto border border-table-border bg-surface shadow-sm">
+                <div
+                    className="flex-1 overflow-auto border border-table-border bg-surface shadow-sm"
+                    ref={tableContainerRef}
+                >
                     <table className="strict-table w-full relative" style={{ minWidth: table.getTotalSize() }}>
                         <thead className="sticky top-0 z-10 bg-table-header shadow-sm">
                             {table.getHeaderGroups().map((headerGroup) => (
@@ -1139,62 +1145,82 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({ data, isLoad
                                 </tr>
                             ))}
                         </thead>
-                        <tbody>
-                            {table.getRowModel().rows.map((row) => (
-                                <tr key={row.id}>
-                                    {row.getVisibleCells().map((cell) => {
-                                        const cellKey = `${row.id}:${cell.column.id}`;
-                                        const isSelected = selectedCells.has(cellKey);
-
-                                        // Use index from list of visible columns to ensure drag selection works with reorder
-                                        const colIndex = table.getVisibleLeafColumns().findIndex(c => c.id === cell.column.id);
-
-                                        // Style Resolution: Cell Style > Column Style > Default
-                                        const colStyle = columnStyles[cell.column.id] || {};
-                                        const cStyle = cellStyles[cellKey] || {};
-
-                                        const finalStyle: CSSProperties = {
-                                            width: cell.column.getSize(),
-                                            textAlign: cStyle.textAlign || colStyle.textAlign || 'left',
-                                            backgroundColor: cStyle.backgroundColor || colStyle.backgroundColor || undefined,
-                                        };
-
-                                        const densityClasses = {
-                                            compact: '!py-0.5',
-                                            standard: '!py-2',
-                                            comfortable: '!py-4',
-                                        };
-
-                                        return (
-                                            <td
-                                                key={cell.id}
-                                                style={finalStyle}
-                                                className={`cursor-default select-none border border-table-border px-2 text-table-text ${densityClasses[density]} ${isSelected ? 'ring-2 ring-inset ring-primary z-10 bg-table-row-selected' : ''}`}
-                                                onClick={(e) => handleCellClick(e, cellKey)}
-                                                onMouseDown={(e) => handleCellMouseDown(e, row.id, cell.column.id, row.index, colIndex)}
-                                                onMouseEnter={() => handleCellMouseEnter(row.index, colIndex)}
-                                                onContextMenu={(e) => handleCellContextMenu(e, cellKey)}
-                                            >
-                                                {cell.column.id === 'row_number' || cell.column.id === 'day' ? (
-                                                    flexRender(cell.column.columnDef.cell, cell.getContext())
-                                                ) : (
-                                                    <EditableCell
-                                                        value={cell.getValue()}
-                                                        rowId={Number(row.id)}
-                                                        columnId={cell.column.id}
-                                                        cellType={columnTypeMap[cell.column.id] || 'text'}
-                                                        options={columnOptionsMap[cell.column.id]}
-                                                        onSave={saveEdit}
-                                                        onCancel={cancelEdit}
-                                                        isEditing={editingCell?.rowId === Number(row.id) && editingCell?.columnId === cell.column.id}
-                                                        onStartEdit={() => startEdit(Number(row.id), cell.column.id)}
-                                                    />
-                                                )}
-                                            </td>
-                                        );
-                                    })}
+                        <tbody style={{ position: 'relative' }}>
+                            {paddingTop > 0 && (
+                                <tr style={{ height: `${paddingTop}px` }}>
+                                    <td colSpan={table.getVisibleLeafColumns().length} />
                                 </tr>
-                            ))}
+                            )}
+                            {virtualRows.map((virtualRow) => {
+                                const row = rows[virtualRow.index];
+                                if (!row) return null;
+
+                                return (
+                                    <tr
+                                        key={row.id}
+                                        data-index={virtualRow.index}
+                                        ref={rowVirtualizer.measureElement}
+                                        style={{ height: `${virtualRow.size}px` }}
+                                    >
+                                        {row.getVisibleCells().map((cell) => {
+                                            const cellKey = `${row.id}:${cell.column.id}`;
+                                            const isSelected = selectedCells.has(cellKey);
+
+                                            // Use index from list of visible columns to ensure drag selection works with reorder
+                                            const colIndex = table.getVisibleLeafColumns().findIndex(c => c.id === cell.column.id);
+
+                                            // Style Resolution: Cell Style > Column Style > Default
+                                            const colStyle = columnStyles[cell.column.id] || {};
+                                            const cStyle = cellStyles[cellKey] || {};
+
+                                            const finalStyle: CSSProperties = {
+                                                width: cell.column.getSize(),
+                                                textAlign: cStyle.textAlign || colStyle.textAlign || 'left',
+                                                backgroundColor: cStyle.backgroundColor || colStyle.backgroundColor || undefined,
+                                            };
+
+                                            const densityClasses = {
+                                                compact: '!py-0.5',
+                                                standard: '!py-2',
+                                                comfortable: '!py-4',
+                                            };
+
+                                            return (
+                                                <td
+                                                    key={cell.id}
+                                                    style={finalStyle}
+                                                    className={`cursor-default select-none border border-table-border px-2 text-table-text ${densityClasses[density]} ${isSelected ? 'ring-2 ring-inset ring-primary z-10 bg-table-row-selected' : ''}`}
+                                                    onClick={(e) => handleCellClick(e, cellKey)}
+                                                    onMouseDown={(e) => handleCellMouseDown(e, row.id, cell.column.id, row.index, colIndex)}
+                                                    onMouseEnter={() => handleCellMouseEnter(row.index, colIndex)}
+                                                    onContextMenu={(e) => handleCellContextMenu(e, cellKey)}
+                                                >
+                                                    {cell.column.id === 'row_number' || cell.column.id === 'day' ? (
+                                                        flexRender(cell.column.columnDef.cell, cell.getContext())
+                                                    ) : (
+                                                        <EditableCell
+                                                            value={cell.getValue()}
+                                                            rowId={Number(row.id)}
+                                                            columnId={cell.column.id}
+                                                            cellType={columnTypeMap[cell.column.id] || 'text'}
+                                                            options={columnOptionsMap[cell.column.id]}
+                                                            onSave={saveEdit}
+                                                            onCancel={cancelEdit}
+                                                            isEditing={editingCell?.rowId === Number(row.id) && editingCell?.columnId === cell.column.id}
+                                                            onStartEdit={() => startEdit(Number(row.id), cell.column.id)}
+                                                        />
+                                                    )}
+                                                </td>
+                                            );
+                                        })}
+                                    </tr>
+                                );
+                            })}
+                            {paddingBottom > 0 && (
+                                <tr style={{ height: `${paddingBottom}px` }}>
+                                    <td colSpan={table.getVisibleLeafColumns().length} />
+                                </tr>
+                            )}
                         </tbody>
                     </table>
                 </div>
@@ -1203,7 +1229,7 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({ data, isLoad
             {/* Pagination */}
             <div className="flex items-center justify-between text-sm text-foreground-secondary px-1">
                 <div>
-                    Rows: {table.getRowModel().rows.length}
+                    Rows: {rowCount}
                 </div>
                 <div className="flex items-center gap-2">
                     <button

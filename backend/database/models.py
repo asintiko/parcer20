@@ -62,8 +62,12 @@ class Transaction(Base):
             name='check_parsing_method'
         ),
         Index('idx_transactions_date', 'transaction_date', postgresql_using='btree'),
+        Index('idx_transactions_created', 'created_at', postgresql_using='btree'),
         Index('idx_transactions_card', 'card_last_4'),
         Index('idx_transactions_app', 'application_mapped'),
+        Index('idx_transactions_operator', 'operator_raw'),
+        Index('idx_transactions_amount', 'amount'),
+        Index('idx_transactions_parsing', 'parsing_method', 'parsing_confidence'),
         Index('idx_transactions_source', 'source_type', 'source_chat_id'),
         Index('idx_transactions_parsed_at', 'parsed_at'),
     )
