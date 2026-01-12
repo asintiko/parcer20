@@ -1,6 +1,6 @@
 import { useState, useCallback } from 'react';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
-import { transactionsApi, TransactionUpdateRequest } from '../services/api';
+import { transactionsApi, TransactionUpdateRequest, Transaction } from '../services/api';
 import { useToast } from '../components/Toast';
 
 export interface EditingCell {
@@ -41,8 +41,7 @@ export const useInlineEdit = (options?: UseInlineEditOptions) => {
     }, []);
 
     const saveEdit = useCallback(
-        async (rowId: number, columnId: string, newValue: any) => {
-            // Map UI column IDs to API field names
+        async (rowId: number, columnId: string, newValue: any, row?: Transaction) => {
             const fieldMap: Record<string, string> = {
                 transaction_date: 'transaction_date',
                 operator_raw: 'operator_raw',
@@ -58,9 +57,28 @@ export const useInlineEdit = (options?: UseInlineEditOptions) => {
             };
 
             const apiField = fieldMap[columnId] || columnId;
-            const updateData: TransactionUpdateRequest = {
-                [apiField]: newValue,
-            };
+            const updateData: TransactionUpdateRequest = {};
+
+            if (apiField === 'transaction_date') {
+                const current = row?.transaction_date ? new Date(row.transaction_date) : null;
+                if (columnId === 'time' && current) {
+                    const [hh, mm] = String(newValue).split(':');
+                    current.setHours(Number(hh || 0), Number(mm || 0), 0, 0);
+                    updateData.transaction_date = current.toISOString();
+                } else if (columnId === 'transaction_date' && current) {
+                    const [y, m, d] = String(newValue).split('-').map(Number);
+                    current.setFullYear(y, (m || 1) - 1, d || 1);
+                    updateData.transaction_date = current.toISOString();
+                } else if (columnId === 'date_time') {
+                    updateData.transaction_date = new Date(newValue).toISOString();
+                } else {
+                    updateData.transaction_date = newValue;
+                }
+            } else if (apiField === 'source_type') {
+                updateData.source_type = newValue === 'AUTO' || newValue === 'MANUAL' ? newValue : String(newValue || '').toUpperCase() as any;
+            } else {
+                (updateData as any)[apiField] = newValue;
+            }
 
             await updateMutation.mutateAsync({ id: rowId, data: updateData });
         },

@@ -283,7 +283,6 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({ data, total,
     // Wrap saveEdit to track history
     const saveEdit = useCallback(
         async (rowId: number, columnId: string, newValue: any) => {
-            // Find old value
             const row = data.find(r => r.id === rowId);
             if (!row) return;
 
@@ -303,7 +302,7 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({ data, total,
             const field = fieldMap[columnId];
             const oldValue = field ? row[field] : undefined;
 
-            await originalSaveEdit(rowId, columnId, newValue);
+            await originalSaveEdit(rowId, columnId, newValue, row);
             addAction({ type: 'EDIT', rowId, columnId, oldValue, newValue });
         },
         [data, originalSaveEdit, addAction]

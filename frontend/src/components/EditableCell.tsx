@@ -41,9 +41,51 @@ export const EditableCell: React.FC<EditableCellProps> = ({
         }
     }, [isEditing]);
 
+    const toDateString = (val: any) => {
+        if (val instanceof Date && !isNaN(val.getTime())) {
+            const y = val.getFullYear();
+            const m = String(val.getMonth() + 1).padStart(2, '0');
+            const d = String(val.getDate()).padStart(2, '0');
+            return `${y}-${m}-${d}`;
+        }
+        if (typeof val === 'string') return val;
+        return '';
+    };
+
+    const toTimeString = (val: any) => {
+        if (val instanceof Date && !isNaN(val.getTime())) {
+            const hh = String(val.getHours()).padStart(2, '0');
+            const mm = String(val.getMinutes()).padStart(2, '0');
+            return `${hh}:${mm}`;
+        }
+        if (typeof val === 'string') return val;
+        return '';
+    };
+
+    const toDateTimeString = (val: any) => {
+        if (val instanceof Date && !isNaN(val.getTime())) {
+            const y = val.getFullYear();
+            const m = String(val.getMonth() + 1).padStart(2, '0');
+            const d = String(val.getDate()).padStart(2, '0');
+            const hh = String(val.getHours()).padStart(2, '0');
+            const mm = String(val.getMinutes()).padStart(2, '0');
+            return `${y}-${m}-${d}T${hh}:${mm}`;
+        }
+        if (typeof val === 'string') return val;
+        return '';
+    };
+
     useEffect(() => {
-        setEditValue(value);
-    }, [value]);
+        if (cellType === 'date') {
+            setEditValue(toDateString(value));
+        } else if (cellType === 'time') {
+            setEditValue(toTimeString(value));
+        } else if (cellType === 'datetime') {
+            setEditValue(toDateTimeString(value));
+        } else {
+            setEditValue(value);
+        }
+    }, [value, cellType]);
 
     const handleSave = async () => {
         if (editValue === value) {
@@ -55,7 +97,15 @@ export const EditableCell: React.FC<EditableCellProps> = ({
         setError(null);
 
         try {
-            await onSave(rowId, columnId, editValue);
+            let payload = editValue;
+            if (cellType === 'date') {
+                payload = toDateString(editValue);
+            } else if (cellType === 'time') {
+                payload = toTimeString(editValue);
+            } else if (cellType === 'datetime') {
+                payload = toDateTimeString(editValue);
+            }
+            await onSave(rowId, columnId, payload);
             onCancel(); // Exit edit mode
         } catch (err) {
             setError(err instanceof Error ? err.message : 'Save failed');
