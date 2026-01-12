@@ -6,6 +6,7 @@ interface ContextMenuProps {
     onClose: () => void;
     onAlign: (alignment: 'left' | 'center' | 'right') => void;
     onColor: (color: string) => void;
+    onHideColumn?: () => void;
 }
 
 // Colors for cell background - light theme values
@@ -20,7 +21,7 @@ const COLORS = [
     { label: 'Оранж', value: 'rgba(255, 165, 0, 0.15)' }, // warning-light variant
 ];
 
-export const ContextMenu: React.FC<ContextMenuProps> = ({ x, y, onClose, onAlign, onColor }) => {
+export const ContextMenu: React.FC<ContextMenuProps> = ({ x, y, onClose, onAlign, onColor, onHideColumn }) => {
     const menuRef = useRef<HTMLDivElement>(null);
 
     useEffect(() => {
@@ -92,6 +93,21 @@ export const ContextMenu: React.FC<ContextMenuProps> = ({ x, y, onClose, onAlign
                     </button>
                 ))}
             </div>
+
+            {onHideColumn && (
+                <>
+                    <div className="border-t border-context-menu-border my-2"></div>
+                    <button
+                        className="w-full text-left px-3 py-2 text-sm text-context-menu-text hover:bg-context-menu-hover"
+                        onClick={() => {
+                            onHideColumn();
+                            onClose();
+                        }}
+                    >
+                        Скрыть колонку
+                    </button>
+                </>
+            )}
         </div>
     );
 };

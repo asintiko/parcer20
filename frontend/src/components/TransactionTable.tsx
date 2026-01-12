@@ -28,6 +28,7 @@ import { useHistory, HistoryAction } from '../hooks/useHistory';
 import { useKeyboardShortcuts } from '../hooks/useKeyboardShortcuts';
 import { useToast } from './Toast';
 import { transactionsApi } from '../services/api';
+import { useTableViewPresets, type TableViewState } from '../hooks/useTableViewPresets';
 import * as XLSX from 'xlsx';
 
 // DnD Imports
@@ -91,6 +92,7 @@ const ROW_HEIGHT_BY_DENSITY: Record<'compact' | 'standard' | 'comfortable', numb
 };
 const VIRTUAL_WARN_THRESHOLD = 2000;
 const LOW_CONFIDENCE_THRESHOLD = 0.6;
+const LOCKED_COLUMNS = new Set(['row_number', 'day']);
 
 type ActiveFilters = {
     dateFrom?: string;
@@ -168,12 +170,15 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({ data, total,
     const [sorting, setSorting] = useState<SortingState>([{ id: 'transaction_date', desc: true }]);
     const [columnFilters, setColumnFilters] = useState<ColumnFiltersState>([]);
     const [columnOrder, setColumnOrder] = useState<ColumnOrderState>([]);
+    const [columnVisibility, setColumnVisibility] = useState<Record<string, boolean>>({});
+    const [columnSizing, setColumnSizing] = useState<Record<string, number>>({});
 
     // Search State
     const [globalFilter, setGlobalFilter] = useState('');
     const [searchValue, setSearchValue] = useState('');
     const [density, setDensity] = useState<'compact' | 'standard' | 'comfortable'>('standard');
     const [viewMenuOpen, setViewMenuOpen] = useState(false);
+    const [presetName, setPresetName] = useState('');
 
     // Advanced Filters State
     const [filterDrawerOpen, setFilterDrawerOpen] = useState(false);
@@ -187,6 +192,14 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({ data, total,
         if (k === 'sourceType') return v !== 'ALL';
         return true;
     }).length;
+
+    const ensureLockedVisibility = useCallback((visibility: Record<string, boolean>) => {
+        const next = { ...visibility };
+        LOCKED_COLUMNS.forEach(col => {
+            next[col] = true;
+        });
+        return next;
+    }, []);
 
     // Debounce Search
     useEffect(() => {
@@ -251,6 +264,30 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({ data, total,
 
     // Inline Editing Hooks
     const { editingCell, startEdit, cancelEdit, saveEdit: originalSaveEdit, isSaving } = useInlineEdit();
+    const { presets, defaultPreset, savePreset, deletePreset, renamePreset, setDefaultPreset, getPreset } = useTableViewPresets();
+
+    const captureCurrentViewState = useCallback((): TableViewState => ({
+        columnOrder,
+        columnSizing,
+        columnVisibility: ensureLockedVisibility(columnVisibility),
+        density,
+        activeFilters,
+        globalFilter,
+        columnStyles,
+        cellStyles,
+    }), [activeFilters, cellStyles, columnOrder, columnSizing, columnStyles, columnVisibility, density, ensureLockedVisibility, globalFilter]);
+
+    const applyPresetState = useCallback((state: TableViewState) => {
+        setColumnOrder(state.columnOrder || []);
+        setColumnVisibility(ensureLockedVisibility(state.columnVisibility || {}));
+        setColumnSizing(state.columnSizing || {});
+        setDensity(state.density || 'standard');
+        setActiveFilters(state.activeFilters || {});
+        setSearchValue(state.globalFilter || '');
+        setGlobalFilter(state.globalFilter || '');
+        setColumnStyles(state.columnStyles || {});
+        setCellStyles(state.cellStyles || {});
+    }, [ensureLockedVisibility]);
 
     // History Hook (Undo/Redo)
     const { addAction, undo, redo, canUndo, canRedo } = useHistory({
@@ -547,6 +584,13 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({ data, total,
         }
     }, [columns, columnOrder.length]);
 
+    // Apply default preset on mount
+    React.useEffect(() => {
+        if (defaultPreset) {
+            applyPresetState(defaultPreset.state);
+        }
+    }, [defaultPreset, applyPresetState]);
+
     // Manual Global Filter & Advanced Filters
     const paginationState = useMemo(() => ({ pageIndex: Math.max(page - 1, 0), pageSize }), [page, pageSize]);
 
@@ -557,6 +601,8 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({ data, total,
             sorting,
             columnFilters,
             columnOrder,
+            columnVisibility,
+            columnSizing,
             pagination: paginationState,
         },
         getRowId: (row) => String(row.id),
@@ -567,6 +613,8 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({ data, total,
         onSortingChange: setSorting,
         onColumnFiltersChange: setColumnFilters,
         onColumnOrderChange: setColumnOrder,
+        onColumnVisibilityChange: setColumnVisibility,
+        onColumnSizingChange: setColumnSizing,
         onPaginationChange: (updater) => {
             const next = typeof updater === 'function'
                 ? (updater as (old: PaginationState) => PaginationState)(paginationState)
@@ -582,6 +630,62 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({ data, total,
         getCoreRowModel: getCoreRowModel(),
         pageCount: Math.max(Math.ceil(total / pageSize), 1),
     });
+
+    const toggleColumnVisibility = useCallback((columnId: string, isVisible: boolean) => {
+        if (LOCKED_COLUMNS.has(columnId)) return;
+        setColumnVisibility(prev => ensureLockedVisibility({ ...prev, [columnId]: isVisible }));
+    }, [ensureLockedVisibility]);
+
+    const hideAllColumns = useCallback(() => {
+        const next: Record<string, boolean> = {};
+        table.getAllLeafColumns().forEach(col => {
+            if (!LOCKED_COLUMNS.has(col.id)) {
+                next[col.id] = false;
+            }
+        });
+        setColumnVisibility(prev => ensureLockedVisibility({ ...prev, ...next }));
+    }, [table, ensureLockedVisibility]);
+
+    const showAllColumns = useCallback(() => {
+        const next: Record<string, boolean> = {};
+        table.getAllLeafColumns().forEach(col => {
+            if (!LOCKED_COLUMNS.has(col.id)) {
+                next[col.id] = true;
+            }
+        });
+        setColumnVisibility(prev => ensureLockedVisibility({ ...prev, ...next }));
+    }, [table, ensureLockedVisibility]);
+
+    const handleLoadPreset = useCallback((name: string) => {
+        const preset = getPreset(name);
+        if (!preset) return;
+        applyPresetState(preset.state);
+        setViewMenuOpen(false);
+    }, [applyPresetState, getPreset]);
+
+    const handleSavePreset = useCallback((markDefault = false) => {
+        const name = (presetName || '').trim() || 'Текущий вид';
+        savePreset(name, captureCurrentViewState(), markDefault);
+        setPresetName('');
+        if (markDefault) {
+            setViewMenuOpen(false);
+        }
+    }, [captureCurrentViewState, presetName, savePreset]);
+
+    const handleRenamePreset = useCallback((name: string) => {
+        const newName = prompt('Новое имя вида', name);
+        if (!newName || !newName.trim()) return;
+        renamePreset(name, newName.trim());
+    }, [renamePreset]);
+
+    const handleDeletePreset = useCallback((name: string) => {
+        if (!confirm(`Удалить вид "${name}"?`)) return;
+        deletePreset(name);
+    }, [deletePreset]);
+
+    const handleSetDefaultPreset = useCallback((name: string) => {
+        setDefaultPreset(name);
+    }, [setDefaultPreset]);
 
     const rowHeight = useMemo(() => ROW_HEIGHT_BY_DENSITY[density] || ROW_HEIGHT_BY_DENSITY.standard, [density]);
     const rows = table.getRowModel().rows;
@@ -712,6 +816,11 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({ data, total,
         e.preventDefault();
         setContextMenu({ x: e.clientX, y: e.clientY, targetIdx: columnId, type: 'header' });
     };
+
+    const handleHideColumn = useCallback((columnId: string) => {
+        if (LOCKED_COLUMNS.has(columnId)) return;
+        setColumnVisibility(prev => ensureLockedVisibility({ ...prev, [columnId]: false }));
+    }, [ensureLockedVisibility]);
 
     const handleCellContextMenu = (e: React.MouseEvent, cellId: string) => {
         e.preventDefault();
@@ -1033,6 +1142,9 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({ data, total,
                     onClose={() => setContextMenu(null)}
                     onAlign={handleAlign}
                     onColor={handleColor}
+                    onHideColumn={contextMenu.type === 'header' && !LOCKED_COLUMNS.has(contextMenu.targetIdx)
+                        ? () => handleHideColumn(contextMenu.targetIdx)
+                        : undefined}
                 />
             )}
 
@@ -1131,7 +1243,43 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({ data, total,
                         Вид
                     </button>
                     {viewMenuOpen && (
-                        <div className="absolute top-full left-0 mt-1 w-56 bg-surface border border-border rounded-md shadow-lg z-50">
+                        <div className="absolute top-full left-0 mt-1 w-96 bg-surface border border-border rounded-md shadow-lg z-50">
+                            <div className="p-2 border-b border-border">
+                                <div className="text-xs font-semibold text-foreground-muted mb-2 px-2">Столбцы</div>
+                                <div className="flex items-center gap-2 px-2 mb-2">
+                                    <button
+                                        className="px-2 py-1 text-xs border border-border rounded hover:bg-surface-2"
+                                        onClick={showAllColumns}
+                                    >
+                                        Показать все
+                                    </button>
+                                    <button
+                                        className="px-2 py-1 text-xs border border-border rounded hover:bg-surface-2"
+                                        onClick={hideAllColumns}
+                                    >
+                                        Скрыть все
+                                    </button>
+                                </div>
+                                <div className="max-h-44 overflow-auto px-2 space-y-1 pb-1">
+                                    {table.getAllLeafColumns().map((col) => {
+                                        const label = typeof col.columnDef.header === 'string'
+                                            ? col.columnDef.header
+                                            : (col.id === 'details' ? 'Детали' : col.id);
+                                        const disabled = LOCKED_COLUMNS.has(col.id);
+                                        return (
+                                            <label key={col.id} className="flex items-center gap-2 text-sm text-foreground">
+                                                <input
+                                                    type="checkbox"
+                                                    checked={col.getIsVisible()}
+                                                    disabled={disabled}
+                                                    onChange={(e) => toggleColumnVisibility(col.id, e.target.checked)}
+                                                />
+                                                <span className={disabled ? 'text-foreground-muted' : ''}>{label}</span>
+                                            </label>
+                                        );
+                                    })}
+                                </div>
+                            </div>
                             <div className="p-2 border-b border-border">
                                 <div className="text-xs font-semibold text-foreground-muted mb-2 px-2">Плотность строк</div>
                                 <button
@@ -1152,6 +1300,70 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({ data, total,
                                 >
                                     Крупный
                                 </button>
+                            </div>
+                            <div className="p-2 border-b border-border">
+                                <div className="text-xs font-semibold text-foreground-muted mb-2 px-2">Сохраненные виды</div>
+                                <div className="flex items-center gap-2 px-2 mb-2">
+                                    <input
+                                        type="text"
+                                        value={presetName}
+                                        onChange={(e) => setPresetName(e.target.value)}
+                                        placeholder="Название вида"
+                                        className="flex-1 px-2 py-1 text-sm border border-border rounded bg-surface"
+                                    />
+                                    <button
+                                        className="px-2 py-1 text-xs border border-border rounded hover:bg-surface-2"
+                                        onClick={() => handleSavePreset(false)}
+                                    >
+                                        Сохранить
+                                    </button>
+                                    <button
+                                        className="px-2 py-1 text-xs border border-border rounded hover:bg-surface-2"
+                                        onClick={() => handleSavePreset(true)}
+                                    >
+                                        Сохранить и по умолчанию
+                                    </button>
+                                </div>
+                                <div className="max-h-48 overflow-auto flex flex-col gap-2 px-2">
+                                    {presets.length === 0 ? (
+                                        <div className="text-xs text-foreground-muted px-1">Пока нет сохраненных видов</div>
+                                    ) : (
+                                        presets.map((preset) => (
+                                            <div key={preset.name} className="flex items-center justify-between gap-2 px-2 py-1 rounded hover:bg-surface-2 border border-transparent hover:border-border">
+                                                <div className="flex flex-col">
+                                                    <span className="text-sm font-medium text-foreground">{preset.name}</span>
+                                                    {preset.isDefault && <span className="text-[11px] text-primary">По умолчанию</span>}
+                                                </div>
+                                                <div className="flex items-center gap-1">
+                                                    <button
+                                                        className="px-2 py-1 text-xs border border-border rounded hover:bg-surface-3"
+                                                        onClick={() => handleLoadPreset(preset.name)}
+                                                    >
+                                                        Загрузить
+                                                    </button>
+                                                    <button
+                                                        className="px-2 py-1 text-xs border border-border rounded hover:bg-surface-3"
+                                                        onClick={() => handleRenamePreset(preset.name)}
+                                                    >
+                                                        Имя
+                                                    </button>
+                                                    <button
+                                                        className={`px-2 py-1 text-xs border rounded ${preset.isDefault ? 'border-primary text-primary' : 'border-border hover:bg-surface-3'}`}
+                                                        onClick={() => handleSetDefaultPreset(preset.name)}
+                                                    >
+                                                        По умолчанию
+                                                    </button>
+                                                    <button
+                                                        className="px-2 py-1 text-xs border border-border rounded hover:bg-danger-light text-danger"
+                                                        onClick={() => handleDeletePreset(preset.name)}
+                                                    >
+                                                        Удалить
+                                                    </button>
+                                                </div>
+                                            </div>
+                                        ))
+                                    )}
+                                </div>
                             </div>
                             <div className="p-2">
                                 <button
