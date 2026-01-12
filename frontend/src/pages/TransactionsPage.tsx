@@ -20,6 +20,8 @@ type FiltersState = {
     parsing_method?: string;
     confidence_min?: number;
     confidence_max?: number;
+    parsingMethod?: 'REGEX' | 'GPT' | 'MANUAL';
+    lowConfidence?: boolean;
     source_type?: 'AUTO' | 'MANUAL';
     transaction_type?: 'DEBIT' | 'CREDIT' | 'CONVERSION' | 'REVERSAL';
     transaction_types?: string[];
@@ -90,6 +92,11 @@ export function TransactionsPage() {
             updatedFilters.transaction_types = incomingFilters.transactionTypes && incomingFilters.transactionTypes.length > 1 ? incomingFilters.transactionTypes : undefined;
             updatedFilters.card = incomingFilters.cardId || undefined;
             updatedFilters.days_of_week = incomingFilters.daysOfWeek && incomingFilters.daysOfWeek.length ? incomingFilters.daysOfWeek : undefined;
+            updatedFilters.parsing_method = incomingFilters.parsingMethod || undefined;
+            updatedFilters.lowConfidence = incomingFilters.lowConfidence || false;
+            updatedFilters.confidence_max = incomingFilters.confidenceMax !== undefined
+                ? incomingFilters.confidenceMax
+                : (incomingFilters.lowConfidence ? 0.6 : undefined);
         }
 
         if (Object.keys(updatedFilters).length > 0) {

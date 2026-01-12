@@ -19,7 +19,7 @@ import {
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { Transaction } from '../services/api';
 import { formatDate, formatTime, formatDateTime, EMPTY_VALUE as DATE_EMPTY } from '../utils/dateTimeFormatters';
-import { ChevronUp, ChevronDown, Search, FileText, Filter, Eye, Undo2, Redo2 } from 'lucide-react';
+import { ChevronUp, ChevronDown, Search, FileText, Filter, Eye, Undo2, Redo2, X } from 'lucide-react';
 import { ContextMenu } from './ContextMenu';
 import { FilterDrawer } from './FilterDrawer';
 import { EditableCell, CellType } from './EditableCell';
@@ -90,8 +90,24 @@ const ROW_HEIGHT_BY_DENSITY: Record<'compact' | 'standard' | 'comfortable', numb
     comfortable: 52,
 };
 const VIRTUAL_WARN_THRESHOLD = 2000;
+const LOW_CONFIDENCE_THRESHOLD = 0.6;
 
-type ActiveFilters = any;
+type ActiveFilters = {
+    dateFrom?: string;
+    dateTo?: string;
+    daysOfWeek?: number[];
+    amountMin?: string;
+    amountMax?: string;
+    currency?: 'UZS' | 'USD';
+    transactionTypes?: string[];
+    operators?: string[];
+    apps?: string[];
+    sourceType?: 'ALL' | 'AUTO' | 'MANUAL';
+    cardId?: string;
+    parsingMethod?: 'REGEX' | 'GPT' | 'MANUAL';
+    lowConfidence?: boolean;
+    confidenceMax?: number;
+};
 
 // Draggable Header Component
 const DraggableTableHeader = ({
@@ -163,11 +179,12 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({ data, total,
     const [filterDrawerOpen, setFilterDrawerOpen] = useState(false);
     const [activeFilters, setActiveFilters] = useState<ActiveFilters>({ currency: 'UZS' }); // Default to UZS
     const activeFilterCount = Object.keys(activeFilters).filter(k => {
-        const v = activeFilters[k];
+        const v = (activeFilters as any)[k];
+        if (k === 'currency') return false; // Don't count currency as active filter
+        if (k === 'lowConfidence') return Boolean(v);
         if (!v) return false;
         if (Array.isArray(v)) return v.length > 0;
         if (k === 'sourceType') return v !== 'ALL';
-        if (k === 'currency') return false; // Don't count currency as active filter
         return true;
     }).length;
 
@@ -186,6 +203,24 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({ data, total,
         created_at: 'created_at',
         parsing_confidence: 'parsing_confidence',
     }), []);
+
+    const setMethodFilter = useCallback((method: ActiveFilters['parsingMethod']) => {
+        setActiveFilters(prev => ({
+            ...prev,
+            parsingMethod: method || undefined,
+        }));
+    }, []);
+
+    const toggleLowConfidence = useCallback(() => {
+        setActiveFilters(prev => {
+            const nextFlag = !prev.lowConfidence;
+            return {
+                ...prev,
+                lowConfidence: nextFlag,
+                confidenceMax: nextFlag ? LOW_CONFIDENCE_THRESHOLD : undefined,
+            };
+        });
+    }, []);
 
     useEffect(() => {
         const sortState = sorting[0];
@@ -206,6 +241,7 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({ data, total,
     const [selectedCells, setSelectedCells] = useState<Set<string>>(new Set()); // Set of "rowId:colId"
     const [isSelecting, setIsSelecting] = useState(false);
     const [selectionStart, setSelectionStart] = useState<{ rowId: string; colId: string; rowIndex: number; colIndex: number } | null>(null);
+    const [detailRow, setDetailRow] = useState<Transaction | null>(null);
 
     // Context Menu State
     const [contextMenu, setContextMenu] = useState<{ x: number; y: number; targetIdx: string; type: 'header' | 'cell' } | null>(null);
@@ -279,7 +315,33 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({ data, total,
                 id: 'row_number',
                 header: '№',
                 size: 60,
-                cell: (info) => <div className="font-mono text-table-xs">{info.row.index + 1}</div>,
+                cell: (info) => <div className="font-mono text-table-xs">{(page - 1) * pageSize + info.row.index + 1}</div>,
+            },
+            {
+                accessorFn: (row) => row.parsing_method || '',
+                id: 'parsing_method',
+                header: 'Метод',
+                size: 100,
+                cell: (info) => {
+                    const method = (info.getValue() as string) || '';
+                    if (!method) return <span className="text-foreground-muted">—</span>;
+                    if (method.startsWith('REGEX')) return <span className="text-blue-700 font-medium">Regex</span>;
+                    if (method === 'GPT') return <span className="text-purple-700 font-medium">GPT</span>;
+                    return <span className="text-foreground">{method}</span>;
+                },
+            },
+            {
+                accessorFn: (row) => row.parsing_confidence ?? null,
+                id: 'parsing_confidence',
+                header: 'Уверенность',
+                size: 110,
+                cell: (info) => {
+                    const conf = info.getValue() as number | null;
+                    if (conf === null || conf === undefined) return <span className="text-foreground-muted">—</span>;
+                    const pct = Math.round(conf * 100);
+                    const tone = conf < 0.6 ? 'text-danger' : conf < 0.8 ? 'text-warning' : 'text-success';
+                    return <span className={`font-mono ${tone}`}>{pct}%</span>;
+                },
             },
             {
                 accessorFn: (row) => row.transaction_date ? new Date(row.transaction_date) : null,
@@ -438,8 +500,21 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({ data, total,
                     );
                 },
             },
+            {
+                id: 'details',
+                header: '',
+                size: 80,
+                cell: (info) => (
+                    <button
+                        className="px-2 py-1 text-xs bg-surface-2 border border-border rounded hover:bg-surface-3 focus:outline-none focus:ring-2 focus:ring-primary"
+                        onClick={() => setDetailRow(info.row.original)}
+                    >
+                        Детали
+                    </button>
+                ),
+            },
         ],
-        []
+        [page, pageSize]
     );
 
     // Column Type Mapping for Inline Editing
@@ -456,6 +531,8 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({ data, total,
         transaction_type: 'select',
         currency: 'select',
         source_type: 'select',
+        parsing_method: 'text',
+        parsing_confidence: 'number',
     }), []);
 
     const columnOptionsMap: Record<string, string[]> = useMemo(() => ({
@@ -994,6 +1071,35 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({ data, total,
                 />
             </div>
 
+            {/* Quick quality filters */}
+            <div className="flex flex-wrap gap-2 mb-2">
+                <span className="text-xs text-foreground-muted mr-2">Метод:</span>
+                <button
+                    onClick={() => setMethodFilter(undefined)}
+                    className={`px-3 py-1 text-xs rounded-full border ${!activeFilters.parsingMethod ? 'bg-primary-light text-primary border-primary/30' : 'bg-surface border-border text-foreground'}`}
+                >
+                    Все
+                </button>
+                <button
+                    onClick={() => setMethodFilter('REGEX')}
+                    className={`px-3 py-1 text-xs rounded-full border ${activeFilters.parsingMethod === 'REGEX' ? 'bg-blue-50 text-blue-700 border-blue-200' : 'bg-surface border-border text-foreground'}`}
+                >
+                    Regex
+                </button>
+                <button
+                    onClick={() => setMethodFilter('GPT')}
+                    className={`px-3 py-1 text-xs rounded-full border ${activeFilters.parsingMethod === 'GPT' ? 'bg-purple-50 text-purple-700 border-purple-200' : 'bg-surface border-border text-foreground'}`}
+                >
+                    GPT
+                </button>
+                <button
+                    onClick={toggleLowConfidence}
+                    className={`px-3 py-1 text-xs rounded-full border ${activeFilters.lowConfidence ? 'bg-amber-50 text-amber-800 border-amber-200' : 'bg-surface border-border text-foreground'}`}
+                >
+                    Низкая уверенность (&lt; {Math.round(LOW_CONFIDENCE_THRESHOLD * 100)}%)
+                </button>
+            </div>
+
             {/* Toolbar */}
             <div className="flex items-center gap-2 mb-4">
                 <button
@@ -1154,6 +1260,9 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({ data, total,
                             {virtualRows.map((virtualRow) => {
                                 const row = rows[virtualRow.index];
                                 if (!row) return null;
+                                const rowData = row.original;
+                                const lowConf = (rowData.parsing_confidence ?? 1) < LOW_CONFIDENCE_THRESHOLD;
+                                const rowClass = lowConf ? 'bg-amber-50/60' : '';
 
                                 return (
                                     <tr
@@ -1161,6 +1270,7 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({ data, total,
                                         data-index={virtualRow.index}
                                         ref={rowVirtualizer.measureElement}
                                         style={{ height: `${virtualRow.size}px` }}
+                                        className={rowClass}
                                     >
                                         {row.getVisibleCells().map((cell) => {
                                             const cellKey = `${row.id}:${cell.column.id}`;
@@ -1185,6 +1295,8 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({ data, total,
                                                 comfortable: '!py-4',
                                             };
 
+                                            const isDetailsCell = cell.column.id === 'details';
+
                                             return (
                                                 <td
                                                     key={cell.id}
@@ -1195,7 +1307,17 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({ data, total,
                                                     onMouseEnter={() => handleCellMouseEnter(row.index, colIndex)}
                                                     onContextMenu={(e) => handleCellContextMenu(e, cellKey)}
                                                 >
-                                                    {cell.column.id === 'row_number' || cell.column.id === 'day' ? (
+                                                    {isDetailsCell ? (
+                                                        <button
+                                                            className="px-2 py-1 text-xs bg-surface-2 border border-border rounded hover:bg-surface-3 focus:outline-none focus:ring-2 focus:ring-primary w-full"
+                                                            onClick={(e) => {
+                                                                e.stopPropagation();
+                                                                setDetailRow(row.original);
+                                                            }}
+                                                        >
+                                                            Детали
+                                                        </button>
+                                                    ) : cell.column.id === 'row_number' || cell.column.id === 'day' ? (
                                                         flexRender(cell.column.columnDef.cell, cell.getContext())
                                                     ) : (
                                                         <EditableCell
@@ -1252,6 +1374,56 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({ data, total,
                     </button>
                 </div>
             </div>
+
+            {/* Details Drawer */}
+            {detailRow && (
+                <div className="fixed inset-0 z-50 flex justify-end">
+                    <div className="absolute inset-0 bg-black/30" onClick={() => setDetailRow(null)} />
+                    <div className="relative w-full max-w-4xl h-full bg-surface shadow-xl border-l border-border overflow-y-auto">
+                        <div className="flex items-center justify-between p-4 border-b border-border">
+                            <div>
+                                <div className="text-lg font-semibold text-foreground">Детали транзакции #{detailRow.id}</div>
+                                <div className="text-xs text-foreground-secondary">Метод: {detailRow.parsing_method || '—'} · Уверенность: {detailRow.parsing_confidence !== null && detailRow.parsing_confidence !== undefined ? `${Math.round(detailRow.parsing_confidence * 100)}%` : '—'}</div>
+                            </div>
+                            <button
+                                className="p-2 rounded-full hover:bg-surface-2 border border-border text-foreground-secondary"
+                                onClick={() => setDetailRow(null)}
+                            >
+                                <X className="w-4 h-4" />
+                            </button>
+                        </div>
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-4 p-4">
+                            <div className="space-y-2">
+                                <div className="text-sm font-medium text-foreground">Исходный текст</div>
+                                <div className="border border-border rounded-md bg-surface-2 p-3 text-sm text-foreground max-h-[300px] overflow-auto whitespace-pre-wrap">
+                                    {detailRow.raw_message || '—'}
+                                </div>
+                            </div>
+                            <div className="space-y-2">
+                                <div className="text-sm font-medium text-foreground">Распарсенные поля</div>
+                                <div className="border border-border rounded-md bg-surface-2 p-3 text-sm text-foreground space-y-2">
+                                    {[
+                                        { label: 'Дата', value: formatDateTime(new Date(detailRow.transaction_date)) },
+                                        { label: 'Сумма', value: detailRow.amount },
+                                        { label: 'Валюта', value: detailRow.currency },
+                                        { label: 'Оператор', value: detailRow.operator_raw || '—' },
+                                        { label: 'Приложение', value: detailRow.application_mapped || '—' },
+                                        { label: 'Тип', value: detailRow.transaction_type },
+                                        { label: 'Карта', value: detailRow.card_last_4 || '—' },
+                                        { label: 'Источник', value: detailRow.source_type },
+                                        { label: 'Остаток', value: detailRow.balance_after || '—' },
+                                    ].map((item) => (
+                                        <div key={item.label} className="flex justify-between gap-4">
+                                            <span className="text-foreground-muted">{item.label}</span>
+                                            <span className="font-mono text-right">{item.value}</span>
+                                        </div>
+                                    ))}
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            )}
         </div>
     );
 };

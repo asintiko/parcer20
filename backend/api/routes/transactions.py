@@ -157,7 +157,10 @@ async def get_transactions(
             query = query.filter(Transaction.amount >= amount_min)
         if amount_max is not None:
             query = query.filter(Transaction.amount <= amount_max)
-        if parsing_method:
+    if parsing_method:
+        if parsing_method.upper() == "REGEX":
+            query = query.filter(Transaction.parsing_method.ilike("REGEX%"))
+        else:
             query = query.filter(Transaction.parsing_method == parsing_method)
         if confidence_min is not None:
             query = query.filter(Transaction.parsing_confidence >= confidence_min)
