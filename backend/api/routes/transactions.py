@@ -52,6 +52,19 @@ def normalize_amount_for_response(amount: Decimal) -> str:
     """
     return f"{abs(Decimal(amount))}"
 
+def compute_weekday_label(dt: datetime) -> str:
+    weekdays = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс']
+    return weekdays[dt.weekday()]
+
+
+def compute_date_display(dt: datetime) -> str:
+    months = ['янв', 'фев', 'мар', 'апр', 'май', 'июн', 'июл', 'авг', 'сен', 'окт', 'ноя', 'дек']
+    return f"{dt.day} {months[dt.month - 1]}"
+
+
+def compute_time_display(dt: datetime) -> str:
+    return dt.strftime("%H:%M")
+
 router = APIRouter()
 
 
@@ -154,6 +167,19 @@ class BulkUpdateResponse(BaseModel):
     updated_count: int
     failed_ids: List[int]
     errors: List[str]
+
+
+class TransactionCreateRequest(BaseModel):
+    datetime: datetime = Field(..., description="Transaction datetime")
+    operator: str = Field(..., min_length=1, max_length=255)
+    amount: Decimal = Field(..., ge=0)
+    card_last4: str = Field(..., pattern=r'^\d{4}$')
+    transaction_type: str = Field(..., pattern=r'^(DEBIT|CREDIT|CONVERSION|REVERSAL)$')
+    currency: str = Field(..., pattern=r'^(UZS|USD)$')
+    app: Optional[str] = Field(None, max_length=100)
+    balance: Optional[Decimal] = None
+    is_p2p: Optional[bool] = False
+    raw_text: Optional[str] = None
 
 
 @router.patch("/bulk-update", response_model=BulkUpdateResponse)
@@ -377,6 +403,72 @@ async def get_transactions(
         page_size=page_size,
         items=items
     )
+
+
+@router.post("/", response_model=TransactionResponse)
+async def create_transaction(
+    payload: TransactionCreateRequest,
+    db: Session = Depends(get_db_session)
+):
+    """
+    Manually create a new transaction/check.
+    """
+    try:
+        txn_type = normalize_transaction_type(payload.transaction_type)
+        amount = Decimal(str(payload.amount))
+        store_amount = -abs(amount) if txn_type == "DEBIT" else abs(amount)
+
+        dt = payload.datetime
+        weekday_label = compute_weekday_label(dt)
+        date_display = compute_date_display(dt)
+        time_display = compute_time_display(dt)
+
+        check = Check(
+            datetime=dt,
+            weekday=weekday_label,
+            date_display=date_display,
+            time_display=time_display,
+            operator=payload.operator,
+            app=payload.app,
+            amount=store_amount,
+            balance=payload.balance,
+            card_last4=payload.card_last4,
+            is_p2p=payload.is_p2p or False,
+            transaction_type=txn_type,
+            currency=payload.currency,
+            source="Manual",
+            added_via="manual",
+            raw_text=payload.raw_text,
+        )
+
+        db.add(check)
+        db.commit()
+        db.refresh(check)
+
+        return TransactionResponse(
+            id=check.id,
+            transaction_date=check.datetime,
+            amount=normalize_amount_for_response(check.amount),
+            currency=check.currency,
+            card_last_4=check.card_last4,
+            operator_raw=check.operator,
+            application_mapped=check.app,
+            transaction_type=check.transaction_type,
+            balance_after=str(check.balance) if check.balance is not None else None,
+            source_type=normalize_source_type(check.added_via),
+            parsing_method=check.added_via,
+            parsing_confidence=None,
+            is_p2p=check.is_p2p,
+            created_at=check.created_at,
+            updated_at=check.updated_at,
+            raw_message=check.raw_text
+        )
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Create failed: {str(e)}")
 
 
 @router.get("/{transaction_id}", response_model=TransactionResponse)

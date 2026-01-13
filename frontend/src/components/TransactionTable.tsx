@@ -57,6 +57,8 @@ interface TransactionTableProps {
     isLoading?: boolean;
     exportViewRows?: Transaction[];
     exportAllRows?: Transaction[];
+    highlightRowId?: number | null;
+    onAddClick?: () => void;
     onTransactionsUpdated?: (txs: Transaction[]) => void;
     onTransactionsDeleted?: (ids: number[]) => void;
     onTransactionsFieldsUpdated?: (updates: Array<{ id: number; fields: Record<string, any> }>) => void;
@@ -86,6 +88,7 @@ const ROW_HEIGHT_BY_DENSITY: Record<'compact' | 'standard' | 'comfortable', numb
 const VIRTUAL_WARN_THRESHOLD = 2000;
 const LOW_CONFIDENCE_THRESHOLD = 0.6;
 const LOCKED_COLUMNS = new Set(['row_number', 'day']);
+const TABLE_STATE_STORAGE_KEY = 'transactionsTableState:v1';
 
 type ActiveFilters = {
     dateFrom?: string;
@@ -99,9 +102,6 @@ type ActiveFilters = {
     apps?: string[];
     sourceType?: 'ALL' | 'AUTO' | 'MANUAL';
     cardId?: string;
-    parsingMethod?: 'REGEX' | 'GPT' | 'MANUAL';
-    lowConfidence?: boolean;
-    confidenceMax?: number;
 };
 
 // Draggable Header Component
@@ -167,6 +167,8 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
     isLoading,
     exportViewRows,
     exportAllRows,
+    highlightRowId,
+    onAddClick,
     onTransactionsUpdated,
     onTransactionsDeleted,
     onTransactionsFieldsUpdated,
@@ -174,7 +176,7 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
     onPageChange,
     onPageSizeChange,
 }) => {
-    const [sorting, setSorting] = useState<SortingState>([{ id: 'transaction_date', desc: true }]);
+    const [sorting, setSorting] = useState<SortingState>([{ id: 'transaction_date', desc: false }]);
     const [columnFilters, setColumnFilters] = useState<ColumnFiltersState>([]);
     const [columnOrder, setColumnOrder] = useState<ColumnOrderState>([]);
     const [columnVisibility, setColumnVisibility] = useState<Record<string, boolean>>({});
@@ -194,12 +196,16 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
     const activeFilterCount = Object.keys(activeFilters).filter(k => {
         const v = (activeFilters as any)[k];
         if (k === 'currency') return false; // Don't count currency as active filter
-        if (k === 'lowConfidence') return Boolean(v);
         if (!v) return false;
         if (Array.isArray(v)) return v.length > 0;
         if (k === 'sourceType') return v !== 'ALL';
         return true;
     }).length;
+
+    const appliedDefaultStateRef = React.useRef(false);
+    const restoredStateRef = React.useRef(false);
+    const loadAttemptedRef = React.useRef(false);
+    const saveTimeoutRef = React.useRef<number | null>(null);
 
     const ensureLockedVisibility = useCallback((visibility: Record<string, boolean>) => {
         const next = { ...visibility };
@@ -224,24 +230,6 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
         created_at: 'created_at',
         parsing_confidence: 'parsing_confidence',
     }), []);
-
-    const setMethodFilter = useCallback((method: ActiveFilters['parsingMethod']) => {
-        setActiveFilters(prev => ({
-            ...prev,
-            parsingMethod: method || undefined,
-        }));
-    }, []);
-
-    const toggleLowConfidence = useCallback(() => {
-        setActiveFilters(prev => {
-            const nextFlag = !prev.lowConfidence;
-            return {
-                ...prev,
-                lowConfidence: nextFlag,
-                confidenceMax: nextFlag ? LOW_CONFIDENCE_THRESHOLD : undefined,
-            };
-        });
-    }, []);
 
     useEffect(() => {
         const sortState = sorting[0];
@@ -368,32 +356,6 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
                 header: '№',
                 size: 60,
                 cell: (info) => <div className="font-mono text-table-xs">{(page - 1) * pageSize + info.row.index + 1}</div>,
-            },
-            {
-                accessorFn: (row) => row.parsing_method || '',
-                id: 'parsing_method',
-                header: 'Метод',
-                size: 100,
-                cell: (info) => {
-                    const method = (info.getValue() as string) || '';
-                    if (!method) return <span className="text-foreground-muted">—</span>;
-                    if (method.startsWith('REGEX')) return <span className="text-blue-700 font-medium">Regex</span>;
-                    if (method === 'GPT') return <span className="text-purple-700 font-medium">GPT</span>;
-                    return <span className="text-foreground">{method}</span>;
-                },
-            },
-            {
-                accessorFn: (row) => row.parsing_confidence ?? null,
-                id: 'parsing_confidence',
-                header: 'Уверенность',
-                size: 110,
-                cell: (info) => {
-                    const conf = info.getValue() as number | null;
-                    if (conf === null || conf === undefined) return <span className="text-foreground-muted">—</span>;
-                    const pct = Math.round(conf * 100);
-                    const tone = conf < 0.6 ? 'text-danger' : conf < 0.8 ? 'text-warning' : 'text-success';
-                    return <span className={`font-mono ${tone}`}>{pct}%</span>;
-                },
             },
             {
                 accessorFn: (row) => row.transaction_date ? new Date(row.transaction_date) : null,
@@ -583,8 +545,6 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
         transaction_type: 'select',
         currency: 'select',
         source_type: 'select',
-        parsing_method: 'text',
-        parsing_confidence: 'number',
     }), []);
 
     const columnOptionsMap: Record<string, string[]> = useMemo(() => ({
@@ -602,10 +562,47 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
 
     // Apply default preset on mount
     React.useEffect(() => {
-        if (defaultPreset) {
+        if (defaultPreset && !restoredStateRef.current) {
             applyPresetState(defaultPreset.state);
         }
     }, [defaultPreset, applyPresetState]);
+
+    // Restore from localStorage
+    React.useEffect(() => {
+        if (loadAttemptedRef.current) return;
+        loadAttemptedRef.current = true;
+        try {
+            const raw = localStorage.getItem(TABLE_STATE_STORAGE_KEY);
+            if (!raw) return;
+            const stored = JSON.parse(raw);
+            if (stored.sorting) setSorting(stored.sorting);
+            if (stored.columnOrder) setColumnOrder(stored.columnOrder);
+            if (stored.columnVisibility) setColumnVisibility(ensureLockedVisibility(stored.columnVisibility));
+            if (stored.columnSizing) setColumnSizing(stored.columnSizing);
+            if (stored.density) setDensity(stored.density);
+            if (stored.globalFilter !== undefined) {
+                setGlobalFilter(stored.globalFilter);
+                setSearchValue(stored.globalFilter);
+            }
+            if (stored.activeFilters) {
+                const restoredFilters = { currency: 'UZS', ...stored.activeFilters };
+                setActiveFilters(restoredFilters);
+            }
+            if (stored.columnStyles) setColumnStyles(stored.columnStyles);
+            if (stored.cellStyles) setCellStyles(stored.cellStyles);
+            if (stored.pageSize && stored.pageSize !== pageSize) {
+                onPageSizeChange(stored.pageSize);
+            }
+            if (stored.pageIndex !== undefined) {
+                onPageChange((stored.pageIndex || 0) + 1);
+            }
+            restoredStateRef.current = true;
+            appliedDefaultStateRef.current = true;
+        } catch (error) {
+            console.warn('Failed to restore table state', error);
+        }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, []);
 
     // Manual Global Filter & Advanced Filters
     const paginationState = useMemo(() => ({ pageIndex: Math.max(page - 1, 0), pageSize }), [page, pageSize]);
@@ -706,6 +703,53 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
     const rowHeight = useMemo(() => ROW_HEIGHT_BY_DENSITY[density] || ROW_HEIGHT_BY_DENSITY.standard, [density]);
     const rows = table.getRowModel().rows;
     const rowCount = rows.length;
+
+    // Clamp/initialize pagination
+    React.useEffect(() => {
+        const maxPage = Math.max(1, Math.ceil(total / pageSize));
+        if (page > maxPage) {
+            onPageChange(maxPage);
+            return;
+        }
+        if (!restoredStateRef.current && !appliedDefaultStateRef.current && total > 0) {
+            onPageChange(maxPage);
+            appliedDefaultStateRef.current = true;
+        }
+    }, [total, pageSize, page, onPageChange]);
+
+    // Persist state
+    React.useEffect(() => {
+        if (saveTimeoutRef.current) {
+            clearTimeout(saveTimeoutRef.current);
+        }
+        const stateToSave = {
+            sorting,
+            pageIndex: Math.max(0, page - 1),
+            pageSize,
+            columnOrder,
+            columnSizing,
+            columnVisibility,
+            density,
+            globalFilter,
+            activeFilters: { currency: activeFilters.currency || 'UZS', ...activeFilters },
+            columnStyles,
+            cellStyles,
+        };
+        saveTimeoutRef.current = window.setTimeout(() => {
+            try {
+                localStorage.setItem(TABLE_STATE_STORAGE_KEY, JSON.stringify(stateToSave));
+            } catch (error) {
+                console.warn('Failed to persist table state', error);
+            }
+        }, 300);
+
+        return () => {
+            if (saveTimeoutRef.current) {
+                clearTimeout(saveTimeoutRef.current);
+                saveTimeoutRef.current = null;
+            }
+        };
+    }, [sorting, page, pageSize, columnOrder, columnSizing, columnVisibility, density, globalFilter, activeFilters, columnStyles, cellStyles]);
 
     const rowVirtualizer = useVirtualizer({
         count: rowCount,
@@ -1172,35 +1216,6 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
                 />
             </div>
 
-            {/* Quick quality filters */}
-            <div className="flex flex-wrap gap-2 mb-2">
-                <span className="text-xs text-foreground-muted mr-2">Метод:</span>
-                <button
-                    onClick={() => setMethodFilter(undefined)}
-                    className={`px-3 py-1 text-xs rounded-full border ${!activeFilters.parsingMethod ? 'bg-primary-light text-primary border-primary/30' : 'bg-surface border-border text-foreground'}`}
-                >
-                    Все
-                </button>
-                <button
-                    onClick={() => setMethodFilter('REGEX')}
-                    className={`px-3 py-1 text-xs rounded-full border ${activeFilters.parsingMethod === 'REGEX' ? 'bg-blue-50 text-blue-700 border-blue-200' : 'bg-surface border-border text-foreground'}`}
-                >
-                    Regex
-                </button>
-                <button
-                    onClick={() => setMethodFilter('GPT')}
-                    className={`px-3 py-1 text-xs rounded-full border ${activeFilters.parsingMethod === 'GPT' ? 'bg-purple-50 text-purple-700 border-purple-200' : 'bg-surface border-border text-foreground'}`}
-                >
-                    GPT
-                </button>
-                <button
-                    onClick={toggleLowConfidence}
-                    className={`px-3 py-1 text-xs rounded-full border ${activeFilters.lowConfidence ? 'bg-amber-50 text-amber-800 border-amber-200' : 'bg-surface border-border text-foreground'}`}
-                >
-                    Низкая уверенность (&lt; {Math.round(LOW_CONFIDENCE_THRESHOLD * 100)}%)
-                </button>
-            </div>
-
             {/* Toolbar */}
             <div className="flex items-center gap-2 mb-4">
                 <div className="relative">
@@ -1228,6 +1243,12 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
                         </div>
                     )}
                 </div>
+                <button
+                    onClick={onAddClick}
+                    className="flex items-center gap-2 px-3 py-1.5 text-sm font-medium text-foreground bg-primary text-white border border-primary rounded hover:bg-primary-dark focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-primary"
+                >
+                    Добавить
+                </button>
                 <button
                     onClick={() => setFilterDrawerOpen(true)}
                     className={`flex items-center gap-2 px-3 py-1.5 text-sm font-medium border rounded hover:bg-surface-2 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-primary ${activeFilterCount > 0 ? 'bg-primary-light text-primary border-primary/30' : 'text-foreground bg-surface border-border'}`}
@@ -1481,7 +1502,8 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
                                 if (!row) return null;
                                 const rowData = row.original;
                                 const lowConf = (rowData.parsing_confidence ?? 1) < LOW_CONFIDENCE_THRESHOLD;
-                                const rowClass = lowConf ? 'bg-amber-50/60' : '';
+                                const highlighted = highlightRowId && Number(row.id) === highlightRowId;
+                                const rowClass = `${lowConf ? 'bg-amber-50/60' : ''} ${highlighted ? 'ring-2 ring-primary/70' : ''}`;
 
                                 return (
                                     <tr

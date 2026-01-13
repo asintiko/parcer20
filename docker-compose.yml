@@ -13,7 +13,7 @@ services:
       - ./receipt_parser_dump.sql:/docker-entrypoint-initdb.d/00_receipt_parser_dump.sql
       - ./backend/database/schema.sql:/docker-entrypoint-initdb.d/schema.sql
     ports:
-      - "5432:5432"
+      - "9990:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
       interval: 10s
@@ -24,7 +24,7 @@ services:
     image: redis:7-alpine
     container_name: uzbek_parser_redis
     ports:
-      - "6379:6379"
+      - "9991:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s

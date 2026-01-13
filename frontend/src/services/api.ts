@@ -133,6 +133,19 @@ export interface BulkUpdateResponse {
     errors: string[];
 }
 
+export interface CreateTransactionRequest {
+    datetime: string;
+    operator: string;
+    amount: string;
+    card_last4: string;
+    transaction_type: 'DEBIT' | 'CREDIT' | 'CONVERSION' | 'REVERSAL';
+    currency: 'UZS' | 'USD';
+    app?: string | null;
+    balance?: string | null;
+    is_p2p?: boolean;
+    raw_text?: string | null;
+}
+
 export interface TopAgentResponse {
     period_start: string;
     period_end: string;
@@ -217,6 +230,11 @@ export const transactionsApi = {
 
     bulkUpdateTransactions: async (payload: BulkUpdatePayload): Promise<BulkUpdateResponse> => {
         const response = await apiClient.patch<BulkUpdateResponse>('/api/transactions/bulk-update', payload);
+        return response.data;
+    },
+
+    createTransaction: async (payload: CreateTransactionRequest): Promise<Transaction> => {
+        const response = await apiClient.post<Transaction>('/api/transactions/', payload);
         return response.data;
     },
 };

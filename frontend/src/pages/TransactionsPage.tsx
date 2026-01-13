@@ -6,6 +6,8 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Transaction } from '../services/api';
 import { TransactionTable } from '../components/TransactionTable';
 import { useOfflineTransactions } from '../hooks/useOfflineTransactions';
+import { AddTransactionModal } from '../components/AddTransactionModal';
+import { transactionsApi, CreateTransactionRequest } from '../services/api';
 
 type SortState = { sort_by: string; sort_dir: 'asc' | 'desc' };
 
@@ -17,11 +19,6 @@ type FiltersState = {
     apps?: string[];
     amountMin?: string;
     amountMax?: string;
-    parsing_method?: string;
-    confidence_min?: number;
-    confidence_max?: number;
-    parsingMethod?: 'REGEX' | 'GPT' | 'MANUAL';
-    lowConfidence?: boolean;
     source_type?: 'AUTO' | 'MANUAL';
     transaction_type?: 'DEBIT' | 'CREDIT' | 'CONVERSION' | 'REVERSAL';
     transaction_types?: string[];
@@ -33,8 +30,10 @@ type FiltersState = {
 export function TransactionsPage() {
     const [page, setPage] = useState(1);
     const [pageSize, setPageSize] = useState(100);
-    const [sort, setSort] = useState<SortState>({ sort_by: 'transaction_date', sort_dir: 'desc' });
+    const [sort, setSort] = useState<SortState>({ sort_by: 'transaction_date', sort_dir: 'asc' });
     const [filters, setFilters] = useState<FiltersState>({ currency: 'UZS' });
+    const [addModalOpen, setAddModalOpen] = useState(false);
+    const [highlightRowId, setHighlightRowId] = useState<number | null>(null);
 
     const {
         data,
@@ -50,8 +49,6 @@ export function TransactionsPage() {
 
     const filteredData = useMemo(() => {
         const search = (filters.search || '').trim().toLowerCase();
-        const parsingMethod = filters.parsing_method || filters.parsingMethod;
-        const confidenceMax = filters.confidence_max ?? (filters.lowConfidence ? 0.6 : undefined);
 
         return data.filter((tx: Transaction) => {
             const txDate = tx.transaction_date ? new Date(tx.transaction_date) : null;
@@ -83,13 +80,6 @@ export function TransactionsPage() {
             if (filters.transaction_types?.length && !filters.transaction_types.includes(tx.transaction_type)) return false;
             if (filters.source_type && tx.source_type !== filters.source_type) return false;
             if (filters.card && tx.card_last_4 && tx.card_last_4 !== filters.card) return false;
-
-            if (parsingMethod) {
-                if (!tx.parsing_method) return false;
-                if (tx.parsing_method.toUpperCase() !== parsingMethod.toUpperCase()) return false;
-            }
-            if (confidenceMax !== undefined && tx.parsing_confidence !== null && tx.parsing_confidence !== undefined && tx.parsing_confidence > confidenceMax) return false;
-            if (filters.lowConfidence && (tx.parsing_confidence ?? 1) >= (confidenceMax ?? 0.6)) return false;
 
             if (search) {
                 const blob = `${tx.operator_raw || ''} ${tx.application_mapped || ''} ${tx.raw_message || ''} ${tx.amount || ''} ${tx.currency || ''}`.toLowerCase();
@@ -174,11 +164,6 @@ export function TransactionsPage() {
             updatedFilters.transaction_types = incomingFilters.transactionTypes && incomingFilters.transactionTypes.length > 1 ? incomingFilters.transactionTypes : undefined;
             updatedFilters.card = incomingFilters.cardId || undefined;
             updatedFilters.days_of_week = incomingFilters.daysOfWeek && incomingFilters.daysOfWeek.length ? incomingFilters.daysOfWeek : undefined;
-            updatedFilters.parsing_method = incomingFilters.parsingMethod || undefined;
-            updatedFilters.lowConfidence = incomingFilters.lowConfidence || false;
-            updatedFilters.confidence_max = incomingFilters.confidenceMax !== undefined
-                ? incomingFilters.confidenceMax
-                : (incomingFilters.lowConfidence ? 0.6 : undefined);
         }
 
         if (Object.keys(updatedFilters).length > 0) {
@@ -208,6 +193,22 @@ export function TransactionsPage() {
         updateTransactionFields(updates);
     }, [updateTransactionFields]);
 
+    const handleCreateTransaction = useCallback(async (payload: CreateTransactionRequest) => {
+        const created = await transactionsApi.createTransaction(payload);
+        upsertTransactions([created]);
+        const nextTotal = total + 1;
+        const nextMaxPage = Math.max(1, Math.ceil(nextTotal / pageSize));
+        setPage(nextMaxPage);
+        setHighlightRowId(created.id);
+        setAddModalOpen(false);
+    }, [pageSize, total, upsertTransactions]);
+
+    useEffect(() => {
+        if (!highlightRowId) return;
+        const t = setTimeout(() => setHighlightRowId(null), 2000);
+        return () => clearTimeout(t);
+    }, [highlightRowId]);
+
     return (
         <div className="h-full flex flex-col bg-bg">
             <div className="flex-1 overflow-hidden p-4">
@@ -236,6 +237,8 @@ export function TransactionsPage() {
                             isLoading={offlineLoading && !isOfflineReady}
                             exportViewRows={sortedData}
                             exportAllRows={allSortedData}
+                            highlightRowId={highlightRowId}
+                            onAddClick={() => setAddModalOpen(true)}
                             onTransactionsUpdated={handleTransactionsUpdated}
                             onTransactionsDeleted={handleTransactionsDeleted}
                             onTransactionsFieldsUpdated={handleTransactionsFieldsUpdated}
@@ -249,6 +252,11 @@ export function TransactionsPage() {
                     </div>
                 </div>
             </div>
+            <AddTransactionModal
+                isOpen={addModalOpen}
+                onClose={() => setAddModalOpen(false)}
+                onSubmit={handleCreateTransaction}
+            />
         </div>
     );
 }
