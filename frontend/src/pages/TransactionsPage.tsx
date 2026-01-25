@@ -19,7 +19,7 @@ type FiltersState = {
     apps?: string[];
     amountMin?: string;
     amountMax?: string;
-    source_type?: 'AUTO' | 'MANUAL';
+    source_channel?: 'TELEGRAM' | 'SMS' | 'MANUAL';
     transaction_type?: 'DEBIT' | 'CREDIT' | 'CONVERSION' | 'REVERSAL';
     transaction_types?: string[];
     currency?: 'UZS' | 'USD';
@@ -78,7 +78,7 @@ export function TransactionsPage() {
 
             if (filters.transaction_type && tx.transaction_type !== filters.transaction_type) return false;
             if (filters.transaction_types?.length && !filters.transaction_types.includes(tx.transaction_type)) return false;
-            if (filters.source_type && tx.source_type !== filters.source_type) return false;
+            if (filters.source_channel && tx.source_channel !== filters.source_channel) return false;
             if (filters.card && tx.card_last_4 && tx.card_last_4 !== filters.card) return false;
 
             if (search) {
@@ -159,7 +159,7 @@ export function TransactionsPage() {
             updatedFilters.currency = incomingFilters.currency || undefined;
             updatedFilters.operators = incomingFilters.operators && incomingFilters.operators.length ? incomingFilters.operators : undefined;
             updatedFilters.apps = incomingFilters.apps && incomingFilters.apps.length ? incomingFilters.apps : undefined;
-            updatedFilters.source_type = incomingFilters.sourceType && incomingFilters.sourceType !== 'ALL' ? incomingFilters.sourceType : undefined;
+            updatedFilters.source_channel = incomingFilters.sourceType && incomingFilters.sourceType !== 'ALL' ? incomingFilters.sourceType : undefined;
             updatedFilters.transaction_type = incomingFilters.transactionTypes?.length === 1 ? incomingFilters.transactionTypes[0] : undefined;
             updatedFilters.transaction_types = incomingFilters.transactionTypes && incomingFilters.transactionTypes.length > 1 ? incomingFilters.transactionTypes : undefined;
             updatedFilters.card = incomingFilters.cardId || undefined;

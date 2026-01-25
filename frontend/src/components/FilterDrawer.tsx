@@ -11,7 +11,7 @@ interface FilterState {
     transactionTypes: string[];
     operators: string[];
     apps: string[];
-    sourceType: 'ALL' | 'AUTO' | 'MANUAL';
+    sourceType: 'ALL' | 'TELEGRAM' | 'SMS' | 'MANUAL';
     cardId: string;
 }
 
@@ -263,7 +263,7 @@ export const FilterDrawer: React.FC<FilterDrawerProps> = ({ isOpen, onClose, onA
                         <div className="mt-4">
                             <label className="text-xs text-foreground-muted mb-2 block">Источник</label>
                             <div className="flex gap-4">
-                                {['ALL', 'AUTO', 'MANUAL'].map(src => (
+                                {['ALL', 'TELEGRAM', 'SMS', 'MANUAL'].map(src => (
                                     <label key={src} className="flex items-center gap-2 text-sm text-foreground">
                                         <input
                                             type="radio"
@@ -330,7 +330,8 @@ const getTypeLabel = (type: string) => {
 const getSourceLabel = (src: string) => {
     const map: Record<string, string> = {
         ALL: 'Все',
-        AUTO: 'Авто',
+        TELEGRAM: 'Телеграм',
+        SMS: 'СМС',
         MANUAL: 'Ручной',
     };
     return map[src] || src;

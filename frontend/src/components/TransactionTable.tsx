@@ -21,7 +21,7 @@ import { formatDate, formatTime, formatDateTime, EMPTY_VALUE as DATE_EMPTY } fro
 import { ChevronUp, ChevronDown, Search, FileText, Filter, Eye, Undo2, Redo2, X } from 'lucide-react';
 import { ContextMenu } from './ContextMenu';
 import { FilterDrawer } from './FilterDrawer';
-import { EditableCell, CellType } from './EditableCell';
+import { EditableCell, CellType, SelectOption } from './EditableCell';
 import { useInlineEdit } from '../hooks/useInlineEdit';
 import { useHistory, HistoryAction } from '../hooks/useHistory';
 import { useKeyboardShortcuts } from '../hooks/useKeyboardShortcuts';
@@ -89,6 +89,27 @@ const VIRTUAL_WARN_THRESHOLD = 2000;
 const LOW_CONFIDENCE_THRESHOLD = 0.6;
 const LOCKED_COLUMNS = new Set(['row_number', 'day']);
 const TABLE_STATE_STORAGE_KEY = 'transactionsTableState:v1';
+const TRANSACTION_TYPE_LABELS: Record<string, string> = {
+    DEBIT: 'Списание',
+    CREDIT: 'Пополнение',
+    CONVERSION: 'Конверсия',
+    REVERSAL: 'Отмена',
+};
+const SOURCE_CHANNEL_LABELS: Record<string, string> = {
+    TELEGRAM: 'Телеграм',
+    SMS: 'СМС',
+    MANUAL: 'Ручной',
+};
+
+const resolveTransactionTypeDisplay = (tx: Transaction) =>
+    tx.transaction_type_display || TRANSACTION_TYPE_LABELS[tx.transaction_type] || tx.transaction_type;
+
+const resolveSourceDisplay = (tx: Transaction) => {
+    if (tx.source_display) return tx.source_display;
+    if (tx.source_channel && SOURCE_CHANNEL_LABELS[tx.source_channel]) return SOURCE_CHANNEL_LABELS[tx.source_channel];
+    if (tx.source_type === 'MANUAL') return SOURCE_CHANNEL_LABELS.MANUAL;
+    return SOURCE_CHANNEL_LABELS.SMS;
+};
 
 type ActiveFilters = {
     dateFrom?: string;
@@ -100,7 +121,7 @@ type ActiveFilters = {
     transactionTypes?: string[];
     operators?: string[];
     apps?: string[];
-    sourceType?: 'ALL' | 'AUTO' | 'MANUAL';
+    sourceType?: 'ALL' | 'TELEGRAM' | 'SMS' | 'MANUAL';
     cardId?: string;
 };
 
@@ -483,15 +504,11 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
                 id: 'transaction_type',
                 header: 'Тип',
                 size: 80,
-                cell: (info) => {
-                    const typeMap: Record<string, string> = {
-                        DEBIT: 'Списание',
-                        CREDIT: 'Пополнение',
-                        CONVERSION: 'Конверсия',
-                        REVERSAL: 'Отмена',
-                    };
-                    return <div className="text-table-xs">{typeMap[info.getValue() as string] || String(info.getValue())}</div>;
-                },
+                cell: (info) => (
+                    <div className="text-table-xs">
+                        {resolveTransactionTypeDisplay(info.row.original)}
+                    </div>
+                ),
             },
             {
                 accessorKey: 'currency',
@@ -505,14 +522,11 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
                 id: 'source_type',
                 header: 'Источник',
                 size: 80,
-                cell: (info) => {
-                    const source = info.getValue() as string;
-                    return (
-                        <div className="text-table-xs">
-                            {source === 'AUTO' ? 'Авто' : 'Ручной'}
-                        </div>
-                    );
-                },
+                cell: (info) => (
+                    <div className="text-table-xs">
+                        {resolveSourceDisplay(info.row.original) || '—'}
+                    </div>
+                ),
             },
             {
                 id: 'details',
@@ -547,10 +561,18 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
         source_type: 'select',
     }), []);
 
-    const columnOptionsMap: Record<string, string[]> = useMemo(() => ({
-        transaction_type: ['DEBIT', 'CREDIT', 'CONVERSION', 'REVERSAL'],
+    const columnOptionsMap: Record<string, SelectOption[]> = useMemo(() => ({
+        transaction_type: [
+            { value: 'DEBIT', label: 'Списание' },
+            { value: 'CREDIT', label: 'Пополнение' },
+            { value: 'CONVERSION', label: 'Конверсия' },
+            { value: 'REVERSAL', label: 'Отмена' },
+        ],
         currency: ['UZS', 'USD'],
-        source_type: ['AUTO', 'MANUAL'],
+        source_type: [
+            { value: 'AUTO', label: 'Авто' },
+            { value: 'MANUAL', label: 'Ручной' },
+        ],
     }), []);
 
     // Initial load column order
@@ -1053,9 +1075,25 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
 
             if (payload.updates.length === 0) return;
 
+            const localUpdates = payload.updates.map(update => {
+                const newFields = { ...update.fields };
+                if (newFields.transaction_type) {
+                    newFields.transaction_type_display = TRANSACTION_TYPE_LABELS[String(newFields.transaction_type)] || newFields.transaction_type;
+                }
+                if (newFields.source_type) {
+                    const targetRow = data.find(r => r.id === update.id);
+                    const channel = newFields.source_type === 'MANUAL'
+                        ? 'MANUAL'
+                        : (targetRow?.source_channel && targetRow.source_channel !== 'MANUAL' ? targetRow.source_channel : 'SMS');
+                    newFields.source_channel = channel;
+                    newFields.source_display = SOURCE_CHANNEL_LABELS[channel] || channel;
+                }
+                return { id: update.id, fields: newFields };
+            });
+
             await transactionsApi.bulkUpdateTransactions(payload);
             addAction({ type: 'PASTE', cells: [] });
-            onTransactionsFieldsUpdated?.(payload.updates);
+            onTransactionsFieldsUpdated?.(localUpdates);
             showToast('success', `Вставлено ${payload.updates.length} строк`);
         } catch (error) {
             showToast('error', 'Не удалось вставить из буфера обмена');
@@ -1563,6 +1601,13 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
                                                     ) : (
                                                         <EditableCell
                                                             value={cell.getValue()}
+                                                            displayValue={
+                                                                cell.column.id === 'transaction_type'
+                                                                    ? resolveTransactionTypeDisplay(row.original)
+                                                                    : cell.column.id === 'source_type'
+                                                                        ? resolveSourceDisplay(row.original)
+                                                                        : undefined
+                                                            }
                                                             rowId={Number(row.id)}
                                                             columnId={cell.column.id}
                                                             cellType={columnTypeMap[cell.column.id] || 'text'}
@@ -1649,9 +1694,9 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
                                         { label: 'Валюта', value: detailRow.currency },
                                         { label: 'Оператор', value: detailRow.operator_raw || '—' },
                                         { label: 'Приложение', value: detailRow.application_mapped || '—' },
-                                        { label: 'Тип', value: detailRow.transaction_type },
+                                        { label: 'Тип', value: resolveTransactionTypeDisplay(detailRow) },
                                         { label: 'Карта', value: detailRow.card_last_4 || '—' },
-                                        { label: 'Источник', value: detailRow.source_type },
+                                        { label: 'Источник', value: resolveSourceDisplay(detailRow) },
                                         { label: 'Остаток', value: detailRow.balance_after || '—' },
                                     ].map((item) => (
                                         <div key={item.label} className="flex justify-between gap-4">

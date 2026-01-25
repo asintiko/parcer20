@@ -1,15 +1,17 @@
-import React, { useState, useEffect, useRef, KeyboardEvent } from 'react';
+import React, { useState, useEffect, useRef, KeyboardEvent, useMemo } from 'react';
 import { formatDate, formatTime, formatDateTime, EMPTY_VALUE } from '../utils/dateTimeFormatters';
 
 // Type mappings for different columns
 export type CellType = 'text' | 'number' | 'date' | 'time' | 'datetime' | 'select' | 'checkbox';
+export type SelectOption = string | { value: string; label: string };
 
 export interface EditableCellProps {
     value: any;
+    displayValue?: any;
     rowId: number;
     columnId: string;
     cellType: CellType;
-    options?: string[]; // For select type
+    options?: SelectOption[]; // For select type
     onSave: (rowId: number, columnId: string, newValue: any) => Promise<void>;
     onCancel: () => void;
     isEditing: boolean;
@@ -18,6 +20,7 @@ export interface EditableCellProps {
 
 export const EditableCell: React.FC<EditableCellProps> = ({
     value,
+    displayValue,
     rowId,
     columnId,
     cellType,
@@ -31,6 +34,11 @@ export const EditableCell: React.FC<EditableCellProps> = ({
     const [isSaving, setIsSaving] = useState(false);
     const [error, setError] = useState<string | null>(null);
     const inputRef = useRef<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement>(null);
+
+    const normalizedOptions = useMemo(
+        () => (options || []).map(opt => typeof opt === 'string' ? { value: opt, label: opt } : opt),
+        [options]
+    );
 
     useEffect(() => {
         if (isEditing && inputRef.current) {
@@ -181,6 +189,12 @@ export const EditableCell: React.FC<EditableCellProps> = ({
             return EMPTY_VALUE;
         }
 
+        // Select labels
+        if (cellType === 'select' && normalizedOptions.length) {
+            const match = normalizedOptions.find(opt => opt.value === val);
+            if (match) return match.label;
+        }
+
         // Convert to string
         return String(val);
     };
@@ -273,9 +287,9 @@ export const EditableCell: React.FC<EditableCellProps> = ({
                         className={baseClass}
                         disabled={isSaving}
                     >
-                        {options.map((opt) => (
-                            <option key={opt} value={opt}>
-                                {opt}
+                        {normalizedOptions.map((opt) => (
+                            <option key={opt.value} value={opt.value}>
+                                {opt.label}
                             </option>
                         ))}
                     </select>
@@ -302,6 +316,8 @@ export const EditableCell: React.FC<EditableCellProps> = ({
         }
     };
 
+    const renderedValue = displayValue !== undefined ? displayValue : value;
+
     if (!isEditing) {
         return (
             <div
@@ -309,7 +325,7 @@ export const EditableCell: React.FC<EditableCellProps> = ({
                 onDoubleClick={onStartEdit}
                 title="Double-click to edit"
             >
-                {formatDisplayValue(value)}
+                {formatDisplayValue(renderedValue)}
             </div>
         );
     }

@@ -40,8 +40,11 @@ export interface Transaction {
     operator_raw: string | null;
     application_mapped: string | null;
     transaction_type: 'DEBIT' | 'CREDIT' | 'CONVERSION' | 'REVERSAL';
+    transaction_type_display: string;
     balance_after: string | null;
     source_type: 'MANUAL' | 'AUTO';
+    source_channel: 'TELEGRAM' | 'SMS' | 'MANUAL';
+    source_display: string;
     parsing_method: string | null;
     parsing_confidence: number | null;
     is_p2p?: boolean;
@@ -74,6 +77,7 @@ export interface TransactionsQueryParams {
     confidence_max?: number;
     search?: string;
     source_type?: 'AUTO' | 'MANUAL';
+    source_channel?: 'TELEGRAM' | 'SMS' | 'MANUAL';
     transaction_type?: 'DEBIT' | 'CREDIT' | 'CONVERSION' | 'REVERSAL';
     transaction_types?: string[];
     currency?: 'UZS' | 'USD';
@@ -186,6 +190,7 @@ export const transactionsApi = {
             confidence_max: params.confidence_max,
             search: params.search,
             source_type: params.source_type,
+            source_channel: params.source_channel,
             transaction_type: params.transaction_type,
             currency: params.currency,
             card: params.card,

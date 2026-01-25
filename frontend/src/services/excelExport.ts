@@ -78,10 +78,15 @@ const formatExcelValue = (row: Transaction, columnId: string, rowIndex: number) 
             CONVERSION: 'Конверсия',
             REVERSAL: 'Отмена',
         };
-        return map[String(value)] || String(value ?? '');
+        return row.transaction_type_display || map[String(value)] || String(value ?? '');
     }
     if (columnId === 'source_type') {
-        return value === 'AUTO' ? 'Авто' : 'Ручной';
+        const sourceLabels: Record<string, string> = {
+            TELEGRAM: 'Телеграм',
+            SMS: 'СМС',
+            MANUAL: 'Ручной',
+        };
+        return row.source_display || sourceLabels[row.source_channel as string] || '';
     }
     if (columnId === 'parsing_method') {
         if (!value) return '';

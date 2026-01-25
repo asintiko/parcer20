@@ -142,10 +142,10 @@ export const AddTransactionModal: React.FC<AddTransactionModalProps> = ({ isOpen
                                 value={form.transaction_type}
                                 onChange={(e) => handleChange('transaction_type', e.target.value)}
                             >
-                                <option value="DEBIT">DEBIT</option>
-                                <option value="CREDIT">CREDIT</option>
-                                <option value="CONVERSION">CONVERSION</option>
-                                <option value="REVERSAL">REVERSAL</option>
+                                <option value="DEBIT">Списание</option>
+                                <option value="CREDIT">Пополнение</option>
+                                <option value="CONVERSION">Конверсия</option>
+                                <option value="REVERSAL">Отмена</option>
                             </select>
                         </label>
                         <label className="flex flex-col text-sm text-foreground">
