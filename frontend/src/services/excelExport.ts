@@ -92,6 +92,8 @@ const formatExcelValue = (row: Transaction, columnId: string, rowIndex: number) 
         if (String(value).startsWith('REGEX')) return 'Regex';
         return String(value);
     }
+    if (columnId === 'receiver_name') return value ?? '';
+    if (columnId === 'receiver_card') return value ?? '';
     return value ?? '';
 };
 
