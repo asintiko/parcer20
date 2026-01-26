@@ -170,6 +170,13 @@ class MonitoredBotChat(Base):
     enabled = Column(Boolean, nullable=False, server_default='true')
     last_processed_message_id = Column(BigInteger, nullable=False, server_default='0')
     last_error = Column(Text)
+
+    # Group support and filtering
+    chat_type = Column(String(50), nullable=False, server_default='private')
+    filter_mode = Column(String(20), nullable=False, server_default='all')  # 'all', 'whitelist', 'blacklist'
+    filter_keywords = Column(Text, nullable=True)  # JSON array: ["чек", "квитанция"]
+    chat_title = Column(String(255), nullable=True)  # Cached title from TDLib
+
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 

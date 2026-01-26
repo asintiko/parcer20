@@ -405,13 +405,33 @@ class TelegramTDLibManager:
         search: Optional[str] = None,
         limit: int = 50,
         offset: int = 0,
+        chat_types: Optional[List[str]] = None,  # NEW: ['private', 'group', 'supergroup']
     ) -> Dict[str, Any]:
+        """
+        List Telegram chats (bots and/or groups).
+
+        Args:
+            db: Database session
+            include_hidden: Include chats marked as hidden
+            search: Search query for chat titles
+            limit: Maximum number of chats to return
+            offset: Number of chats to skip
+            chat_types: List of chat types to include: ['private', 'group', 'supergroup', 'channel']
+                        If None, defaults to ['private'] (only bots, backward compatible)
+
+        Returns:
+            Dict with 'total' count and 'items' list of chat info
+        """
         limit = min(max(limit, 1), 200)
         offset = max(offset, 0)
 
         hidden_ids = {row[0] for row in db.query(HiddenBotChat.chat_id).all()}
 
-        chats = await self._fetch_bot_chats(search=search, limit=limit + offset)
+        chats = await self._fetch_bot_chats(
+            search=search,
+            limit=limit + offset,
+            allowed_types=chat_types
+        )
 
         filtered: List[Dict[str, Any]] = []
         for chat in chats:
@@ -426,7 +446,23 @@ class TelegramTDLibManager:
         sliced = filtered[offset : offset + limit]
         return {"total": total, "items": sliced}
 
-    async def _fetch_bot_chats(self, search: Optional[str], limit: int) -> List[Dict[str, Any]]:
+    async def _fetch_bot_chats(
+        self,
+        search: Optional[str],
+        limit: int,
+        allowed_types: Optional[List[str]] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Fetch chats from TDLib with type filtering.
+
+        Args:
+            search: Search query for chat titles
+            limit: Maximum number of chats to fetch
+            allowed_types: List of allowed chat types (passed to _get_chat_info)
+
+        Returns:
+            List of chat info dicts
+        """
         request_payload: Dict[str, Any]
         if search:
             request_payload = {"@type": "searchChats", "query": search, "limit": limit}
@@ -442,41 +478,148 @@ class TelegramTDLibManager:
         chat_ids: List[int] = response.get("chat_ids") or []
         chats: List[Dict[str, Any]] = []
         for chat_id in chat_ids:
-            info = await self._get_chat_info(chat_id)
-            if info and info.get("is_bot"):
+            info = await self._get_chat_info(chat_id, allowed_types=allowed_types)
+            if info:
                 chats.append(info)
         return chats
 
-    async def _get_chat_info(self, chat_id: int) -> Optional[Dict[str, Any]]:
+    async def _get_chat_info(
+        self,
+        chat_id: int,
+        allowed_types: Optional[List[str]] = None
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Get chat info with flexible type filtering.
+
+        Args:
+            chat_id: Telegram chat ID
+            allowed_types: List of allowed types: ['private', 'group', 'basicGroup', 'supergroup', 'channel']
+                           If None, only allow private bot chats (backward compatible)
+
+        Returns:
+            Chat info dict with chat_type field, or None if filtered out
+        """
         if chat_id in self._chat_cache:
-            return self._chat_cache.get(chat_id)
+            cached = self._chat_cache.get(chat_id)
+            # Check if cached chat matches allowed types
+            if allowed_types is not None:
+                cached_type = cached.get("chat_type", "")
+                type_mapping_reverse = {
+                    'bot': 'private',
+                    'user': 'private',
+                    'group': 'group',
+                    'supergroup': 'supergroup',
+                    'channel': 'channel',
+                }
+                mapped_type = type_mapping_reverse.get(cached_type, cached_type)
+                if mapped_type not in allowed_types and cached_type not in allowed_types:
+                    return None
+            return cached
 
         try:
             chat = await self._send_request({"@type": "getChat", "chat_id": chat_id})
         except Exception as exc:  # noqa: BLE001
             logger.warning("Failed to fetch chat %s: %s", chat_id, exc)
             return None
+
         chat_type = chat.get("type", {}) if isinstance(chat, dict) else {}
-        if chat_type.get("@type") != "chatTypePrivate":
-            return None
+        chat_type_name = chat_type.get("@type", "")
 
-        user_id = chat_type.get("user_id")
-        if not user_id:
-            return None
+        # Default: only private bots if not specified (backward compatible)
+        if allowed_types is None:
+            allowed_types = ["private"]
 
-        user = await self._ensure_user(user_id)
-        if not user or user.get("type", {}).get("@type") != "userTypeBot":
-            return None
-
-        formatted = {
-            "chat_id": chat_id,
-            "title": chat.get("title") or user.get("first_name") or "Bot",
-            "username": user.get("username"),
-            "is_bot": True,
-            "last_message": self._format_message(chat.get("last_message")),
+        # Map friendly names to TDLib types
+        type_mapping = {
+            'private': 'chatTypePrivate',
+            'group': 'chatTypeBasicGroup',
+            'basicGroup': 'chatTypeBasicGroup',
+            'supergroup': 'chatTypeSupergroup',
+            'channel': 'chatTypeSupergroup',  # channels are supergroups with is_channel=true
         }
-        self._chat_cache[chat_id] = formatted
-        return formatted
+
+        allowed_tdlib_types = [type_mapping.get(t, t) for t in allowed_types]
+
+        # Filter by type
+        if chat_type_name not in allowed_tdlib_types:
+            return None
+
+        # Get type-specific info
+        formatted = None
+
+        if chat_type_name == "chatTypePrivate":
+            user_id = chat_type.get("user_id")
+            if not user_id:
+                return None
+
+            user = await self._ensure_user(user_id)
+            if not user:
+                return None
+
+            is_bot = user.get("type", {}).get("@type") == "userTypeBot"
+
+            # If only private bots allowed, filter out non-bots
+            if allowed_types == ["private"] and not is_bot:
+                return None
+
+            formatted = {
+                "chat_id": chat_id,
+                "title": chat.get("title") or user.get("first_name") or ("Bot" if is_bot else "User"),
+                "username": user.get("usernames", {}).get("editable_username") or user.get("username"),
+                "chat_type": "bot" if is_bot else "user",
+                "last_message": self._format_message(chat.get("last_message")),
+            }
+
+        elif chat_type_name == "chatTypeBasicGroup":
+            group_id = chat_type.get("basic_group_id")
+            if not group_id:
+                return None
+
+            try:
+                group = await self._send_request({"@type": "getBasicGroup", "basic_group_id": group_id})
+            except Exception as exc:
+                logger.warning("Failed to fetch basic group %s: %s", group_id, exc)
+                return None
+
+            formatted = {
+                "chat_id": chat_id,
+                "title": chat.get("title") or "Group",
+                "username": None,
+                "chat_type": "group",
+                "member_count": group.get("member_count"),
+                "last_message": self._format_message(chat.get("last_message")),
+            }
+
+        elif chat_type_name == "chatTypeSupergroup":
+            supergroup_id = chat_type.get("supergroup_id")
+            if not supergroup_id:
+                return None
+
+            try:
+                supergroup = await self._send_request({
+                    "@type": "getSupergroup",
+                    "supergroup_id": supergroup_id
+                })
+            except Exception as exc:
+                logger.warning("Failed to fetch supergroup %s: %s", supergroup_id, exc)
+                return None
+
+            is_channel = supergroup.get("is_channel", False)
+
+            formatted = {
+                "chat_id": chat_id,
+                "title": chat.get("title") or ("Channel" if is_channel else "Supergroup"),
+                "username": supergroup.get("usernames", {}).get("editable_username") or supergroup.get("username"),
+                "chat_type": "channel" if is_channel else "supergroup",
+                "member_count": supergroup.get("member_count"),
+                "last_message": self._format_message(chat.get("last_message")),
+            }
+
+        if formatted:
+            self._chat_cache[chat_id] = formatted
+            return formatted
+
+        return None
 
     async def _ensure_user(self, user_id: int) -> Optional[Dict[str, Any]]:
         if user_id in self._user_cache:

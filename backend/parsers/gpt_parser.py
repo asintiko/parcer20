@@ -22,6 +22,8 @@ class TransactionSchema(BaseModel):
     operator_raw: Optional[str] = Field(None, description="Raw operator/merchant name from receipt")
     transaction_type: str = Field(description="Transaction type: DEBIT, CREDIT, CONVERSION, or REVERSAL")
     balance_after: Optional[float] = Field(None, description="Account balance after transaction")
+    receiver_name: Optional[str] = Field(None, description="Receiver name for P2P transfers (e.g., Иван Иванов)")
+    receiver_card: Optional[str] = Field(None, description="Last 4 digits of receiver card for P2P transfers")
     confidence: float = Field(description="Confidence score from 0.0 to 1.0")
 
 
@@ -62,6 +64,9 @@ Context:
   * CREDIT: Deposits, refunds (Пополнение, Popolnenie)
   * CONVERSION: Currency exchange (Конверсия)
   * REVERSAL: Cancellation (OTMENA)
+- For P2P transfers (card-to-card, person-to-person):
+  * Extract receiver name if shown (e.g., "Получатель: Иван Иванов", "Receiver: John Smith")
+  * Extract last 4 digits of receiver card if shown (e.g., "Карта получателя: ***1234")
 
 Extract all available fields with high confidence. If a field is not present, return null.
 For dates, convert to ISO 8601 format (YYYY-MM-DDTHH:MM:SS).
@@ -101,6 +106,8 @@ Return ONLY a JSON object matching TransactionSchema keys."""
             'operator_raw': parsed.operator_raw,
             'transaction_date': transaction_date,
             'balance_after': Decimal(str(parsed.balance_after)) if parsed.balance_after else None,
+            'receiver_name': parsed.receiver_name[:255] if parsed.receiver_name else None,
+            'receiver_card': parsed.receiver_card if parsed.receiver_card else None,
             'parsing_method': 'GPT',
             'parsing_confidence': parsed.confidence
         }
@@ -160,7 +167,8 @@ Return ONLY a JSON object matching TransactionSchema keys."""
         prompt = (
             "Extract structured transaction data from these receipt images. "
             "Return ONLY a JSON object with keys: amount, currency, transaction_date_iso, "
-            "card_last_4, operator_raw, transaction_type, balance_after, confidence."
+            "card_last_4, operator_raw, transaction_type, balance_after, receiver_name, "
+            "receiver_card, confidence."
         )
         user_content: List[Dict[str, Any]] = [{"type": "text", "text": prompt}]
         if text_hint:

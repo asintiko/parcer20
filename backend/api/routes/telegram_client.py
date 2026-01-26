@@ -77,6 +77,8 @@ class BotChat(BaseModel):
     chat_id: int
     title: str
     username: Optional[str] = None
+    chat_type: str  # 'bot', 'user', 'group', 'supergroup', 'channel'
+    member_count: Optional[int] = None  # For groups and channels
     is_hidden: bool = False
     is_monitored: Optional[bool] = False
     monitor_enabled: Optional[bool] = False
@@ -100,6 +102,8 @@ class MonitoredChat(BaseModel):
 class MonitorUpdateRequest(BaseModel):
     enabled: bool
     start_from_latest: bool = False
+    filter_mode: str = Field(default="all", pattern="^(all|whitelist|blacklist)$")
+    filter_keywords: Optional[List[str]] = None
 
 
 class MonitorStatusResponse(BaseModel):
@@ -335,10 +339,24 @@ async def list_chats(
     include_hidden: bool = Query(False, description="Include hidden chats"),
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
+    chat_types: str = Query("private", description="Comma-separated chat types: private,group,supergroup,channel"),
     db: Session = Depends(get_db_session),
     manager: TelegramTDLibManager = Depends(tdlib_manager_dep),
     current_user: dict = Depends(get_current_user),
 ) -> ChatListResponse:
+    """
+    List Telegram chats (bots and/or groups).
+
+    Args:
+        search: Search term for filtering chats
+        include_hidden: Include chats marked as hidden
+        limit: Maximum number of chats to return
+        offset: Number of chats to skip
+        chat_types: Comma-separated list of chat types to include (e.g., "private,group,supergroup")
+    """
+    # Parse chat types
+    types_list = [t.strip() for t in chat_types.split(",") if t.strip()]
+
     monitors = {row.chat_id: row for row in db.query(MonitoredBotChat).all()}
     try:
         result = await manager.list_bot_chats(
@@ -347,6 +365,7 @@ async def list_chats(
             search=search,
             limit=limit,
             offset=offset,
+            chat_types=types_list,
         )
     except TDLibUnavailableError as exc:
         raise HTTPException(status_code=503, detail=str(exc))
@@ -359,6 +378,8 @@ async def list_chats(
                 chat_id=item.get("chat_id"),
                 title=item.get("title", ""),
                 username=item.get("username"),
+                chat_type=item.get("chat_type", "bot"),
+                member_count=item.get("member_count"),
                 is_hidden=item.get("is_hidden", False),
                 is_monitored=monitors.get(item.get("chat_id")) is not None,
                 monitor_enabled=monitors.get(item.get("chat_id")).enabled if monitors.get(item.get("chat_id")) else False,

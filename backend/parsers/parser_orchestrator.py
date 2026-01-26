@@ -2,6 +2,7 @@
 Parser orchestrator - coordinates regex and GPT parsers with operator mapping
 """
 import os
+import re
 from typing import Dict, Any, Optional
 from sqlalchemy.orm import Session
 
@@ -185,4 +186,39 @@ class ParserOrchestrator:
             operator_raw = (data.get('operator_raw') or '').upper()
             data['is_p2p'] = 'P2P' in operator_raw
 
+        # Extract receiver fields if not already set by parser
+        if not data.get('receiver_name'):
+            data['receiver_name'] = self._extract_receiver_name(raw_text)
+        if not data.get('receiver_card'):
+            data['receiver_card'] = self._extract_receiver_card(raw_text)
+
         return data
+
+    def _extract_receiver_name(self, text: str) -> Optional[str]:
+        """Extract receiver name from receipt text"""
+        patterns = [
+            r'(?:Receiver\s+name|Имя\s+получателя|Получатель)\s*:?\s*([А-ЯЁA-Z][а-яёa-zA-Z\s\-\']+)',
+            r'(?:Receiver|RECEIVER)\s*:?\s*([А-ЯЁA-Z][а-яёa-zA-Z\s\-\']+)',
+            r'(?:На\s+имя|Кому)\s*:?\s*([А-ЯЁA-Z][а-яёa-zA-Z\s\-\']+)',
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, text, re.IGNORECASE | re.MULTILINE)
+            if match:
+                name = match.group(1).strip()
+                # Filter out common false positives
+                if len(name) > 3 and not name.upper() in ['CARD', 'КАРТА', 'NUMBER', 'НОМЕР']:
+                    return name[:255]  # Limit to DB column size
+        return None
+
+    def _extract_receiver_card(self, text: str) -> Optional[str]:
+        """Extract receiver card last 4 digits from receipt text"""
+        patterns = [
+            r'(?:Receiver\s+card|Receiver|Получатель|Карта\s+получателя)\s*:?\s*\**(\d{4})',
+            r'(?:на\s+карту|to\s+card)\s*:?\s*\**(\d{4})',
+            r'(?:Receiver)\s*[:\s]+\**(\d{4})',
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                return match.group(1)
+        return None
