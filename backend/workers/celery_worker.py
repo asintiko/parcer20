@@ -5,6 +5,7 @@ import os
 import json
 import logging
 import re
+import hashlib
 from datetime import datetime
 from decimal import Decimal
 
@@ -89,6 +90,16 @@ def normalize_amount_positive(value) -> Decimal:
     if value is None:
         return None
     return abs(Decimal(value))
+
+
+def compute_fingerprint(amount: Decimal, transaction_date: datetime, card_last4: str) -> str:
+    """Compute SHA256 fingerprint for duplicate detection."""
+    # Normalize: use absolute amount, date to minute precision, last 4 of card
+    amount_str = str(abs(amount)) if amount else "0"
+    date_str = transaction_date.strftime("%Y-%m-%d %H:%M") if transaction_date else ""
+    card_str = str(card_last4)[-4:] if card_last4 else "0000"
+    data = f"{amount_str}|{date_str}|{card_str}"
+    return hashlib.sha256(data.encode()).hexdigest()
 
 
 def download_pdf_text(file_id: int, return_bytes: bool = False):
@@ -383,6 +394,37 @@ def process_receipt_task(self, task_data_json: str):
             confidence_value = parsed_data.get('parsing_confidence')
             method_value = parsed_data.get('parsing_method')
 
+            # Compute fingerprint for duplicate detection
+            fp = compute_fingerprint(amount, tx_datetime, card_last4)
+            
+            # Check if fingerprint already exists (duplicate content)
+            existing_by_fp = (
+                db.query(Transaction)
+                .filter(Transaction.fingerprint == fp)
+                .first()
+            )
+            if existing_by_fp:
+                processing_time = int((datetime.now() - start_time).total_seconds() * 1000)
+                if tracking:
+                    tracking.status = 'done'
+                    tracking.transaction_id = existing_by_fp.id
+                    db.commit()
+                log = ParsingLog(
+                    raw_message=raw_text,
+                    parsing_method=method_value,
+                    success=True,
+                    processing_time_ms=processing_time
+                )
+                db.add(log)
+                db.commit()
+                print(f"⚠️ Duplicate receipt detected by fingerprint, skipping")
+                return {
+                    'success': True,
+                    'duplicate': True,
+                    'transaction_id': str(existing_by_fp.uuid),
+                    'id': existing_by_fp.id
+                }
+
             transaction = Transaction(
                 raw_message=raw_text,
                 source_type=tx_source_type,
@@ -402,6 +444,7 @@ def process_receipt_task(self, task_data_json: str):
                 is_gpt_parsed=is_gpt_parsed_flag,
                 parsing_confidence=confidence_value,
                 parsing_method=method_value,
+                fingerprint=fp,
             )
 
             db.add(transaction)

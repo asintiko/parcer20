@@ -1,5 +1,6 @@
 """Shared receipt processing logic for TDLib messages."""
 import asyncio
+import hashlib
 from datetime import datetime
 from decimal import Decimal
 from typing import Any, Dict, Optional, TYPE_CHECKING
@@ -16,6 +17,15 @@ from services.telegram_tdlib_manager import TDLibUnavailableError, TelegramTDLib
 if TYPE_CHECKING:
     # Avoid runtime circular import
     from api.routes.transactions import ProcessReceiptResponse, ParsingInfo
+
+
+def compute_fingerprint(amount: Decimal, transaction_date: datetime, card_last4: str) -> str:
+    """Compute SHA256 fingerprint for duplicate detection."""
+    amount_str = str(abs(amount)) if amount else "0"
+    date_str = transaction_date.strftime("%Y-%m-%d %H:%M") if transaction_date else ""
+    card_str = str(card_last4)[-4:] if card_last4 else "0000"
+    data = f"{amount_str}|{date_str}|{card_str}"
+    return hashlib.sha256(data.encode()).hexdigest()
 
 
 async def process_tdlib_message(
@@ -206,6 +216,27 @@ async def process_tdlib_message(
     is_gpt_parsed = (parsed.get("parsing_method") or "").upper().startswith("GPT")
     parsed_is_p2p = parsed.get("is_p2p")
 
+    # Compute fingerprint for duplicate detection
+    fp = compute_fingerprint(amount, transaction_date, card_last4)
+    
+    # Check if fingerprint already exists (duplicate content)
+    existing_by_fp = (
+        db.query(Transaction)
+        .filter(Transaction.fingerprint == fp)
+        .first()
+    )
+    if existing_by_fp and not force:
+        return ProcessReceiptResponse(
+            created=False,
+            duplicate=True,
+            transaction=build_transaction_response(existing_by_fp),
+            parsing=ParsingInfo(
+                method=getattr(existing_by_fp, "parsing_method", None),
+                confidence=None,
+                notes="Duplicate detected by fingerprint",
+            ),
+        )
+
     txn = Transaction(
         transaction_date=transaction_date,
         operator_raw=operator_raw,
@@ -225,6 +256,7 @@ async def process_tdlib_message(
         is_gpt_parsed=is_gpt_parsed,
         source_chat_id=str(chat_id),
         source_message_id=str(message_id),
+        fingerprint=fp,
     )
 
     try:

@@ -17,7 +17,7 @@ const BORDER_SIDE = { style: 'thin', color: { argb: 'FFCBD5E1' } } as const; // 
 
 const pxToExcelWidth = (px?: number) => {
     if (!px) return 14;
-    return Math.max(8, Math.round(px / 7));
+    return Math.max(12, Math.round(px / 7));
 };
 
 const colorToARGB = (color?: string) => {

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
     Bot,
@@ -20,7 +20,10 @@ import {
     Pause,
     Sparkles,
     BadgeCheck,
+    CheckSquare,
+    Square,
 } from 'lucide-react';
+import { MessageItem } from '../components/MessageItem';
 import {
     telegramClientApi,
     TelegramAuthStatus,
@@ -307,6 +310,18 @@ export const UserbotPage: React.FC = () => {
         });
     };
 
+    // Select all / Deselect all functions
+    const selectAllMessages = useCallback(() => {
+        const allIds = messagesState
+            .map((m) => m.id)
+            .filter((id): id is number => typeof id === 'number');
+        setSelectedMessageIds(new Set(allIds));
+    }, [messagesState]);
+
+    const deselectAllMessages = useCallback(() => {
+        setSelectedMessageIds(new Set());
+    }, []);
+
     const sendPhoneMutation = useMutation({
         mutationFn: (phone: string) => telegramClientApi.sendPhoneNumber(phone),
         onSuccess: async () => {
@@ -485,26 +500,26 @@ export const UserbotPage: React.FC = () => {
 
         return (
             <div className="bg-surface border border-border rounded-lg p-4 flex flex-col gap-3 shadow-sm">
-                    <div className="flex items-center justify-between">
-                        <div className="flex items-center gap-3">
-                            <div className={`px-3 py-1 rounded-full text-sm font-medium ${meta.tone}`}>
-                                {meta.label}
-                            </div>
-                            {meta.description && (
-                                <span className="text-sm text-foreground-secondary">{meta.description}</span>
-                            )}
+                <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-3">
+                        <div className={`px-3 py-1 rounded-full text-sm font-medium ${meta.tone}`}>
+                            {meta.label}
                         </div>
-                        <button
-                            onClick={() => {
-                                refetchStatus();
-                                chatsQuery.refetch();
-                            }}
-                            className="flex items-center gap-2 px-3 py-2 rounded-md border border-border text-sm text-foreground hover:bg-surface-2 transition-colors focus:outline-none focus:ring-2 focus:ring-primary"
-                        >
-                            <RefreshCcw className="w-4 h-4" />
-                            Обновить
-                        </button>
+                        {meta.description && (
+                            <span className="text-sm text-foreground-secondary">{meta.description}</span>
+                        )}
                     </div>
+                    <button
+                        onClick={() => {
+                            refetchStatus();
+                            chatsQuery.refetch();
+                        }}
+                        className="flex items-center gap-2 px-3 py-2 rounded-md border border-border text-sm text-foreground hover:bg-surface-2 transition-colors focus:outline-none focus:ring-2 focus:ring-primary"
+                    >
+                        <RefreshCcw className="w-4 h-4" />
+                        Обновить
+                    </button>
+                </div>
 
                 {(authStatus.state === 'tdlib_unavailable' || authStatus.state === 'misconfigured') && (
                     <div className="flex items-start gap-3 bg-danger-light border border-danger/30 rounded-md px-3 py-2 text-sm text-danger">
@@ -643,585 +658,578 @@ export const UserbotPage: React.FC = () => {
 
     return (
         <>
-        <div className="h-screen flex flex-col bg-bg">
-            <div className="flex-1 overflow-hidden p-6 min-h-0">
-                <div className="max-w-7xl mx-auto space-y-4 h-full flex flex-col min-h-0">
-                    <div className="flex items-center gap-3">
-                        <div className="p-3 rounded-lg bg-gradient-to-br from-primary to-primary-dark text-foreground-inverse shadow-md">
-                            <Bot className="w-6 h-6" />
-                        </div>
-                        <div>
-                            <h1 className="text-2xl font-semibold text-foreground">Telegram Chats</h1>
-                            <p className="text-sm text-foreground-secondary">
-                                TDLib-клиент для ботов и групп: авторизация, список чатов, сообщения и скрытие диалогов.
-                            </p>
-                        </div>
-                    </div>
-
-                    {renderAuthPanel()}
-
-                    {authStatus?.state === 'ready' && (
-                        <div className="bg-surface border border-border rounded-lg p-3 flex flex-wrap items-center gap-4 text-sm shadow-sm">
-                            <div className="flex items-center gap-2">
-                                <Sparkles className="w-4 h-4 text-primary" />
-                                <span className="font-semibold text-foreground">Серверный автомониторинг</span>
+            <div className="h-screen flex flex-col bg-bg">
+                <div className="flex-1 overflow-hidden p-6 min-h-0">
+                    <div className="max-w-7xl mx-auto space-y-4 h-full flex flex-col min-h-0">
+                        <div className="flex items-center gap-3">
+                            <div className="p-3 rounded-lg bg-gradient-to-br from-primary to-primary-dark text-foreground-inverse shadow-md">
+                                <Bot className="w-6 h-6" />
                             </div>
-                            {monitorStatusQuery.isLoading ? (
-                                <div className="flex items-center gap-2 text-foreground-secondary">
-                                    <Loader2 className="w-4 h-4 animate-spin" /> Загружаем статус...
+                            <div>
+                                <h1 className="text-2xl font-semibold text-foreground">Telegram Chats</h1>
+                                <p className="text-sm text-foreground-secondary">
+                                    TDLib-клиент для ботов и групп: авторизация, список чатов, сообщения и скрытие диалогов.
+                                </p>
+                            </div>
+                        </div>
+
+                        {renderAuthPanel()}
+
+                        {authStatus?.state === 'ready' && (
+                            <div className="bg-surface border border-border rounded-lg p-3 flex flex-wrap items-center gap-4 text-sm shadow-sm">
+                                <div className="flex items-center gap-2">
+                                    <Sparkles className="w-4 h-4 text-primary" />
+                                    <span className="font-semibold text-foreground">Серверный автомониторинг</span>
                                 </div>
-                            ) : monitorStatusQuery.data ? (
-                                <>
-                                    <span className="px-2 py-1 rounded-md text-xs border border-border bg-surface-2">
-                                        Очередь: {monitorStatusQuery.data.queue_size}
-                                    </span>
-                                    <span className="px-2 py-1 rounded-md text-xs border border-border bg-surface-2">
-                                        Воркеров: {monitorStatusQuery.data.workers}
-                                    </span>
-                                    <span
-                                        className={`px-2 py-1 rounded-md text-xs border ${
-                                            monitorStatusQuery.data.running
+                                {monitorStatusQuery.isLoading ? (
+                                    <div className="flex items-center gap-2 text-foreground-secondary">
+                                        <Loader2 className="w-4 h-4 animate-spin" /> Загружаем статус...
+                                    </div>
+                                ) : monitorStatusQuery.data ? (
+                                    <>
+                                        <span className="px-2 py-1 rounded-md text-xs border border-border bg-surface-2">
+                                            Очередь: {monitorStatusQuery.data.queue_size}
+                                        </span>
+                                        <span className="px-2 py-1 rounded-md text-xs border border-border bg-surface-2">
+                                            Воркеров: {monitorStatusQuery.data.workers}
+                                        </span>
+                                        <span
+                                            className={`px-2 py-1 rounded-md text-xs border ${monitorStatusQuery.data.running
                                                 ? 'border-success text-success bg-success/10'
                                                 : 'border-border text-foreground-secondary'
-                                        }`}
-                                    >
-                                        {monitorStatusQuery.data.running ? 'Работает' : 'Остановлен'}
-                                    </span>
-                                </>
-                            ) : (
-                                <span className="text-foreground-secondary">Статус недоступен</span>
-                            )}
-                        </div>
-                    )}
+                                                }`}
+                                        >
+                                            {monitorStatusQuery.data.running ? 'Работает' : 'Остановлен'}
+                                        </span>
+                                    </>
+                                ) : (
+                                    <span className="text-foreground-secondary">Статус недоступен</span>
+                                )}
+                            </div>
+                        )}
 
-                    <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 h-full min-h-0">
-                        <div className="bg-surface border border-border rounded-lg shadow-sm grid grid-rows-[auto,1fr] h-full min-h-0">
-                            <div className="p-4 border-b border-border flex flex-col gap-3">
-                                <div className="flex items-center justify-between">
-                                    <div className="flex items-center gap-2">
-                                        <MessageSquare className="w-5 h-5 text-foreground-secondary" />
-                                        <h2 className="text-sm font-semibold text-foreground">Чаты (боты и группы)</h2>
+                        <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 h-full min-h-0">
+                            <div className="bg-surface border border-border rounded-lg shadow-sm grid grid-rows-[auto,1fr] h-full min-h-0">
+                                <div className="p-4 border-b border-border flex flex-col gap-3">
+                                    <div className="flex items-center justify-between">
+                                        <div className="flex items-center gap-2">
+                                            <MessageSquare className="w-5 h-5 text-foreground-secondary" />
+                                            <h2 className="text-sm font-semibold text-foreground">Чаты (боты и группы)</h2>
+                                        </div>
+                                        <label className="flex items-center gap-2 text-xs text-foreground-secondary cursor-pointer">
+                                            <input
+                                                type="checkbox"
+                                                checked={showHidden}
+                                                onChange={(e) => setShowHidden(e.target.checked)}
+                                                className="w-4 h-4 text-primary border-border rounded focus:ring-primary"
+                                            />
+                                            Показать скрытые
+                                        </label>
                                     </div>
-                                    <label className="flex items-center gap-2 text-xs text-foreground-secondary cursor-pointer">
+                                    <div className="relative">
+                                        <Search className="w-4 h-4 text-foreground-muted absolute left-3 top-3" />
                                         <input
-                                            type="checkbox"
-                                            checked={showHidden}
-                                            onChange={(e) => setShowHidden(e.target.checked)}
-                                            className="w-4 h-4 text-primary border-border rounded focus:ring-primary"
+                                            type="text"
+                                            value={search}
+                                            onChange={(e) => setSearch(e.target.value)}
+                                            placeholder="Поиск чатов"
+                                            className="w-full pl-9 pr-3 py-2 border border-border rounded-lg focus:ring-2 focus:ring-primary focus:border-transparent bg-input-bg text-input-text"
                                         />
-                                        Показать скрытые
-                                    </label>
-                                </div>
-                                <div className="relative">
-                                    <Search className="w-4 h-4 text-foreground-muted absolute left-3 top-3" />
-                                    <input
-                                        type="text"
-                                        value={search}
-                                        onChange={(e) => setSearch(e.target.value)}
-                                        placeholder="Поиск чатов"
-                                        className="w-full pl-9 pr-3 py-2 border border-border rounded-lg focus:ring-2 focus:ring-primary focus:border-transparent bg-input-bg text-input-text"
-                                    />
-                                </div>
-                                <div className="flex flex-wrap gap-2">
-                                    {chatTypeOptions.map((opt) => {
-                                        const active = selectedTypes.has(opt.id);
-                                        return (
-                                            <button
-                                                key={opt.id}
-                                                onClick={() => toggleType(opt.id)}
-                                                className={`px-3 py-1.5 rounded-md text-xs border transition-colors ${
-                                                    active
+                                    </div>
+                                    <div className="flex flex-wrap gap-2">
+                                        {chatTypeOptions.map((opt) => {
+                                            const active = selectedTypes.has(opt.id);
+                                            return (
+                                                <button
+                                                    key={opt.id}
+                                                    onClick={() => toggleType(opt.id)}
+                                                    className={`px-3 py-1.5 rounded-md text-xs border transition-colors ${active
                                                         ? 'border-primary bg-primary/10 text-primary'
                                                         : 'border-border text-foreground-secondary hover:bg-surface-2'
-                                                }`}
-                                            >
-                                                {opt.label}
-                                            </button>
-                                        );
-                                    })}
-                                </div>
-                                <div className="flex items-center gap-2 flex-wrap">
-                                    <button
-                                        onClick={() => bulkKeepMutation.mutate(Array.from(keepSelection))}
-                                        disabled={!keepSelection.size || bulkKeepMutation.isPending}
-                                        className={`px-3 py-1.5 rounded-md text-xs border transition-colors ${
-                                            keepSelection.size
+                                                        }`}
+                                                >
+                                                    {opt.label}
+                                                </button>
+                                            );
+                                        })}
+                                    </div>
+                                    <div className="flex items-center gap-2 flex-wrap">
+                                        <button
+                                            onClick={() => bulkKeepMutation.mutate(Array.from(keepSelection))}
+                                            disabled={!keepSelection.size || bulkKeepMutation.isPending}
+                                            className={`px-3 py-1.5 rounded-md text-xs border transition-colors ${keepSelection.size
                                                 ? 'border-primary bg-primary/10 text-primary hover:bg-primary/15'
                                                 : 'border-border text-foreground-secondary bg-surface-2 cursor-not-allowed'
-                                        }`}
-                                    >
-                                        {bulkKeepMutation.isPending ? 'Применяем...' : 'Оставить выбранные (скрыть остальные)'}
-                                    </button>
-                                    {keepSelection.size > 0 && (
-                                        <span className="text-xs text-foreground-secondary">
-                                            Выбрано {keepSelection.size}
-                                        </span>
-                                    )}
+                                                }`}
+                                        >
+                                            {bulkKeepMutation.isPending ? 'Применяем...' : 'Оставить выбранные (скрыть остальные)'}
+                                        </button>
+                                        {keepSelection.size > 0 && (
+                                            <span className="text-xs text-foreground-secondary">
+                                                Выбрано {keepSelection.size}
+                                            </span>
+                                        )}
+                                    </div>
                                 </div>
-                            </div>
 
-                            <div className="overflow-auto min-h-0">
-                                {chatsQuery.isLoading && (
-                                    <div className="flex items-center justify-center h-full text-foreground-secondary gap-2">
-                                        <Loader2 className="w-4 h-4 animate-spin" />
-                                        Загружаем чаты...
-                                    </div>
-                                )}
+                                <div className="overflow-auto min-h-0">
+                                    {chatsQuery.isLoading && (
+                                        <div className="flex items-center justify-center h-full text-foreground-secondary gap-2">
+                                            <Loader2 className="w-4 h-4 animate-spin" />
+                                            Загружаем чаты...
+                                        </div>
+                                    )}
 
-                                {!chatsQuery.isLoading && (!chatsQuery.data?.items?.length || authStatus?.state !== 'ready') && (
-                                    <div className="flex flex-col items-center justify-center h-full text-foreground-secondary gap-2 px-4 text-center">
-                                        <AlertCircle className="w-5 h-5" />
-                                        <p className="text-sm">Нет доступных чатов. Убедитесь, что сессия активна и аккаунт подключен.</p>
-                                    </div>
-                                )}
+                                    {!chatsQuery.isLoading && (!chatsQuery.data?.items?.length || authStatus?.state !== 'ready') && (
+                                        <div className="flex flex-col items-center justify-center h-full text-foreground-secondary gap-2 px-4 text-center">
+                                            <AlertCircle className="w-5 h-5" />
+                                            <p className="text-sm">Нет доступных чатов. Убедитесь, что сессия активна и аккаунт подключен.</p>
+                                        </div>
+                                    )}
 
-                                <div className="divide-y divide-border">
-                                    {chatsQuery.data?.items.map((chat: TelegramChat) => (
-                                        <button
-                                            key={chat.chat_id}
-                                            onClick={() => setSelectedChatId(chat.chat_id)}
-                                            className={`w-full text-left p-4 transition-colors ${
-                                                chat.chat_id === selectedChatId
+                                    <div className="divide-y divide-border">
+                                        {chatsQuery.data?.items.map((chat: TelegramChat) => (
+                                            <button
+                                                key={chat.chat_id}
+                                                onClick={() => setSelectedChatId(chat.chat_id)}
+                                                className={`w-full text-left p-4 transition-colors ${chat.chat_id === selectedChatId
                                                     ? 'bg-primary-light/40 border-l-2 border-primary'
                                                     : 'hover:bg-surface-2'
-                                            }`}
-                                        >
-                                            <div className="flex items-start justify-between gap-2">
-                                                <div className="flex-1">
-                                                    <div className="flex items-center gap-2">
-                                                        <input
-                                                            type="checkbox"
-                                                            checked={keepSelection.has(chat.chat_id)}
-                                                            onChange={(e) => {
-                                                                e.stopPropagation();
-                                                                toggleKeepChat(chat.chat_id);
-                                                            }}
-                                                            className="w-4 h-4 text-primary border-border rounded focus:ring-primary"
-                                                        />
-                                                        <span className="text-sm font-semibold text-foreground">{chat.title}</span>
-                                                        <span className="text-[11px] px-2 py-0.5 rounded-full bg-surface-2 border border-border text-foreground-secondary">
-                                                            {chatTypeLabel[chat.chat_type] || chat.chat_type}
-                                                        </span>
-                                                        {chat.is_hidden && (
-                                                            <span className="text-[11px] px-2 py-0.5 rounded-full bg-border text-foreground-secondary">
-                                                                скрыт
+                                                    }`}
+                                            >
+                                                <div className="flex items-start justify-between gap-2">
+                                                    <div className="flex-1">
+                                                        <div className="flex items-center gap-2">
+                                                            <input
+                                                                type="checkbox"
+                                                                checked={keepSelection.has(chat.chat_id)}
+                                                                onChange={(e) => {
+                                                                    e.stopPropagation();
+                                                                    toggleKeepChat(chat.chat_id);
+                                                                }}
+                                                                className="w-4 h-4 text-primary border-border rounded focus:ring-primary"
+                                                            />
+                                                            <span className="text-sm font-semibold text-foreground">{chat.title}</span>
+                                                            <span className="text-[11px] px-2 py-0.5 rounded-full bg-surface-2 border border-border text-foreground-secondary">
+                                                                {chatTypeLabel[chat.chat_type] || chat.chat_type}
                                                             </span>
-                                                        )}
-                                                        {chat.monitor_enabled && (
-                                                            <span className="inline-flex items-center gap-1 text-[11px] px-2 py-0.5 rounded-full bg-success/10 text-success border border-success/40">
-                                                                <BadgeCheck className="w-3 h-3" /> мониторится
-                                                            </span>
-                                                        )}
-                                                    </div>
-                                                    <div className="text-xs text-foreground-secondary">
-                                                        {chat.username ? `@${chat.username}` : chatTypeLabel[chat.chat_type] || '—'}
-                                                    </div>
-                                                    {chat.last_message?.text && (
-                                                        <div className="text-xs text-foreground-muted mt-1 overflow-hidden text-ellipsis max-h-10">
-                                                            {chat.last_message.text}
+                                                            {chat.is_hidden && (
+                                                                <span className="text-[11px] px-2 py-0.5 rounded-full bg-border text-foreground-secondary">
+                                                                    скрыт
+                                                                </span>
+                                                            )}
+                                                            {chat.monitor_enabled && (
+                                                                <span className="inline-flex items-center gap-1 text-[11px] px-2 py-0.5 rounded-full bg-success/10 text-success border border-success/40">
+                                                                    <BadgeCheck className="w-3 h-3" /> мониторится
+                                                                </span>
+                                                            )}
                                                         </div>
-                                                    )}
+                                                        <div className="text-xs text-foreground-secondary">
+                                                            {chat.username ? `@${chat.username}` : chatTypeLabel[chat.chat_type] || '—'}
+                                                        </div>
+                                                        {chat.last_message?.text && (
+                                                            <div className="text-xs text-foreground-muted mt-1 overflow-hidden text-ellipsis max-h-10">
+                                                                {chat.last_message.text}
+                                                            </div>
+                                                        )}
+                                                    </div>
+                                                    <div className="flex flex-col items-end gap-2">
+                                                        <span className="text-[11px] text-foreground-muted text-right">
+                                                            {formatDateTime(chat.last_message?.date || null)}
+                                                        </span>
+                                                        {!chat.is_hidden ? (
+                                                            <button
+                                                                onClick={(e) => {
+                                                                    e.stopPropagation();
+                                                                    hideChatMutation.mutate(chat.chat_id);
+                                                                }}
+                                                                className="text-xs px-2 py-1 rounded-md border border-border text-foreground-secondary hover:bg-surface-2"
+                                                            >
+                                                                Скрыть
+                                                            </button>
+                                                        ) : (
+                                                            <button
+                                                                onClick={(e) => {
+                                                                    e.stopPropagation();
+                                                                    unhideChatMutation.mutate(chat.chat_id);
+                                                                }}
+                                                                className="text-xs px-2 py-1 rounded-md border border-primary text-primary hover:bg-primary-light/40"
+                                                            >
+                                                                Показать
+                                                            </button>
+                                                        )}
+                                                    </div>
                                                 </div>
-                                                <div className="flex flex-col items-end gap-2">
-                                                    <span className="text-[11px] text-foreground-muted text-right">
-                                                        {formatDateTime(chat.last_message?.date || null)}
-                                                    </span>
-                                                    {!chat.is_hidden ? (
-                                                        <button
-                                                            onClick={(e) => {
-                                                                e.stopPropagation();
-                                                                hideChatMutation.mutate(chat.chat_id);
-                                                            }}
-                                                            className="text-xs px-2 py-1 rounded-md border border-border text-foreground-secondary hover:bg-surface-2"
-                                                        >
-                                                            Скрыть
-                                                        </button>
-                                                    ) : (
-                                                        <button
-                                                            onClick={(e) => {
-                                                                e.stopPropagation();
-                                                                unhideChatMutation.mutate(chat.chat_id);
-                                                            }}
-                                                            className="text-xs px-2 py-1 rounded-md border border-primary text-primary hover:bg-primary-light/40"
-                                                        >
-                                                            Показать
-                                                        </button>
-                                                    )}
-                                                </div>
-                                            </div>
-                                        </button>
-                                    ))}
+                                            </button>
+                                        ))}
+                                    </div>
                                 </div>
                             </div>
-                        </div>
 
-                        <div className="lg:col-span-2 bg-surface border border-border rounded-lg shadow-sm grid grid-rows-[auto,1fr,auto] h-full min-h-0">
-                            <div className="p-4 border-b border-border flex items-center justify-between sticky top-0 bg-surface z-10">
-                                <div>
-                                    <div className="flex items-center gap-2">
-                                        <MessageSquare className="w-5 h-5 text-foreground-secondary" />
-                                        <h2 className="text-sm font-semibold text-foreground">
-                                            {currentChat ? currentChat.title : 'Выберите чат'}
-                                        </h2>
+                            <div className="lg:col-span-2 bg-surface border border-border rounded-lg shadow-sm grid grid-rows-[auto,1fr,auto] h-full min-h-0">
+                                <div className="p-4 border-b border-border flex items-center justify-between sticky top-0 bg-surface z-10">
+                                    <div>
+                                        <div className="flex items-center gap-2">
+                                            <MessageSquare className="w-5 h-5 text-foreground-secondary" />
+                                            <h2 className="text-sm font-semibold text-foreground">
+                                                {currentChat ? currentChat.title : 'Выберите чат'}
+                                            </h2>
                                             {currentChat?.monitor_enabled && (
                                                 <span className="text-[11px] px-2 py-0.5 rounded-full bg-success/10 text-success border border-success/30 flex items-center gap-1">
                                                     <BadgeCheck className="w-3 h-3" /> серверный монитор
                                                 </span>
                                             )}
-                                    </div>
-                                    <div className="text-xs text-foreground-secondary">
-                                        {currentChat
-                                            ? currentChat.username
-                                                ? `@${currentChat.username}`
-                                                : chatTypeLabel[currentChat.chat_type] || '—'
-                                            : 'Нет выбранного диалога'}
-                                    </div>
-                                </div>
-                                {currentChat && (
-                                    <div className="flex items-center gap-2 flex-wrap justify-end">
-                                        <button
-                                            onClick={() => {
-                                                if (!currentChat) return;
-                                                const enable = !currentChat.monitor_enabled;
-                                                monitorToggleMutation.mutate({ chatId: currentChat.chat_id, enabled: enable });
-                                            }}
-                                            className={`flex items-center gap-2 px-3 py-2 rounded-md text-xs border ${
-                                                currentChat?.monitor_enabled
-                                                    ? 'border-success text-success bg-success/10'
-                                                    : 'border-border text-foreground-secondary hover:bg-surface-2'
-                                            }`}
-                                        >
-                                            {currentChat?.monitor_enabled ? <Pause className="w-4 h-4" /> : <Play className="w-4 h-4" />}
-                                            {currentChat?.monitor_enabled ? 'Серверный монитор вкл' : 'Включить монитор' }
-                                        </button>
-                                        <button
-                                            onClick={() => messagesQuery.refetch()}
-                                            disabled={messagesQuery.isFetching}
-                                            className="flex items-center gap-1 px-3 py-2 rounded-md border border-border text-foreground-secondary text-xs hover:bg-surface-2 disabled:opacity-60"
-                                        >
-                                            <RefreshCcw className={`w-4 h-4 ${messagesQuery.isFetching ? 'animate-spin' : ''}`} />
-                                            Обновить чат
-                                        </button>
-                                        {currentChat.is_hidden ? (
-                                            <button
-                                                onClick={() => unhideChatMutation.mutate(currentChat.chat_id)}
-                                                className="flex items-center gap-1 px-3 py-2 rounded-md border border-primary text-primary text-xs hover:bg-primary-light/30"
-                                            >
-                                                <Eye className="w-4 h-4" />
-                                                Показать
-                                            </button>
-                                        ) : (
-                                            <button
-                                                onClick={() => hideChatMutation.mutate(currentChat.chat_id)}
-                                                className="flex items-center gap-1 px-3 py-2 rounded-md border border-border text-foreground-secondary text-xs hover:bg-surface-2"
-                                            >
-                                                <EyeOff className="w-4 h-4" />
-                                                Скрыть
-                                            </button>
-                                        )}
-                                    </div>
-                                )}
-                            </div>
-
-                            <div
-                                ref={messagesScrollRef}
-                                className="overflow-auto px-4 py-3 space-y-3 min-h-0"
-                            >
-                                {messagesQuery.isLoading && (
-                                    <div className="flex items-center justify-center h-full text-foreground-secondary gap-2">
-                                        <Loader2 className="w-4 h-4 animate-spin" />
-                                        Загружаем сообщения...
-                                    </div>
-                                )}
-
-                                {!messagesQuery.isLoading && !messagesState.length && (
-                                    <div className="flex flex-col items-center justify-center h-full text-foreground-secondary gap-2 text-sm">
-                                        <AlertCircle className="w-5 h-5" />
-                                        Нет сообщений в этом чате
-                                    </div>
-                                )}
-
-                                {messagesState
-                                    .filter((m) => typeof m.id === 'number')
-                                    .map((message) => {
-                                        const msgId = message.id as number;
-                                        const doc = message.document;
-                                        const isPdf = doc?.mime_type?.toLowerCase().includes('pdf');
-                                        const downloadUrl = doc?.download_url
-                                            ? `${API_BASE_URL}${doc.download_url}`
-                                            : doc?.file_id
-                                                ? `${API_BASE_URL}/api/tg/files/${doc.file_id}`
-                                                : null;
-                                        const sizeLabel = (() => {
-                                            if (doc?.size === undefined) return '';
-                                            const kb = doc.size / 1024;
-                                            return kb > 1024 ? `${(kb / 1024).toFixed(1)} MB` : `${kb.toFixed(0)} KB`;
-                                        })();
-                                        return (
-                                    <div key={`${msgId}-${message.date}`} className="flex items-start gap-2">
-                                        <input
-                                            type="checkbox"
-                                            className="mt-1 w-4 h-4 text-primary border-border rounded focus:ring-primary"
-                                            checked={selectedMessageIds.has(msgId)}
-                                            onChange={() => toggleSelectMessage(msgId)}
-                                        />
-                                        <div
-                                            className={`flex-1 flex ${message.is_outgoing ? 'justify-end' : 'justify-start'}`}
-                                        >
-                                            <div
-                                                className={`max-w-[75%] rounded-lg px-3 py-2 border shadow-sm ${
-                                                    message.is_outgoing
-                                                        ? 'bg-primary text-foreground-inverse border-primary/40'
-                                                        : 'bg-surface-2 text-foreground border-border'
-                                                }`}
-                                            >
-                                                <div className="text-sm whitespace-pre-wrap">
-                                                    {message.text || 'Сообщение без текста'}
-                                                </div>
-                                                {doc && (
-                                                    <div className="mt-2 rounded-md border border-border/60 bg-surface px-2 py-1 text-xs">
-                                                        <div className="font-semibold">Документ</div>
-                                                        <div className="flex flex-wrap gap-2 items-center mt-1">
-                                                            <span className="truncate max-w-[200px]">{doc.file_name || 'файл'}</span>
-                                                            {sizeLabel && <span className="text-foreground-muted">{sizeLabel}</span>}
-                                                            {downloadUrl && (
-                                                                <button
-                                                                    type="button"
-                                                                    className="underline text-primary"
-                                                                    onClick={() => window.open(downloadUrl, '_blank')}
-                                                                >
-                                                                    {isPdf ? 'Открыть PDF' : 'Открыть'}
-                                                                </button>
-                                                            )}
-                                                            {downloadUrl && isPdf && (
-                                                                <button
-                                                                    type="button"
-                                                                    className="underline text-primary"
-                                                                    onClick={() => setPreviewUrl(downloadUrl)}
-                                                                >
-                                                                    Просмотр
-                                                                </button>
-                                                            )}
-                                                        </div>
-                                                    </div>
-                                                )}
-                                                <div className="flex items-center gap-2 text-xs mt-2">
-                                                    {(() => {
-                                                        const s = statuses[msgId]?.status || 'not_processed';
-                                                        const err = statuses[msgId]?.error;
-                                                        if (s === 'done') {
-                                                            return (
-                                                                <span className="flex items-center gap-1 text-success">
-                                                                    <CheckCircle2 className="w-4 h-4" /> Обработан
-                                                                    {statuses[msgId]?.check_id ? ` #${statuses[msgId]?.check_id}` : ''}
-                                                                </span>
-                                                            );
-                                                        }
-                                                        if (s === 'queued') {
-                                                            return (
-                                                                <span className="flex items-center gap-1 text-warning">
-                                                                    <Loader2 className="w-4 h-4 animate-spin" /> В очереди
-                                                                </span>
-                                                            );
-                                                        }
-                                                        if (s === 'processing') {
-                                                            return (
-                                                                <span className="flex items-center gap-1 text-info">
-                                                                    <Loader2 className="w-4 h-4 animate-spin" /> Обработка
-                                                                </span>
-                                                            );
-                                                        }
-                                                        if (s === 'failed') {
-                                                            return (
-                                                                <span className="flex items-center gap-1 text-danger" title={err || 'Ошибка'}>
-                                                                    <XCircle className="w-4 h-4" /> Ошибка {err ? `: ${err}` : ''}
-                                                                </span>
-                                                            );
-                                                        }
-                                                        return (
-                                                            <span className="flex items-center gap-1 text-foreground-secondary">
-                                                                <AlertCircle className="w-4 h-4" /> Не обработан
-                                                            </span>
-                                                        );
-                                                    })()}
-                                                </div>
-                                                <div className="text-[11px] mt-1 text-right opacity-80">
-                                                    {formatDateTime(message.date)}
-                                                </div>
-                                                <div className="flex justify-end mt-2 gap-2">
-                                                    {statuses[msgId]?.status === 'done' ? (
-                                                        <>
-                                                            <button
-                                                                type="button"
-                                                                className="text-xs px-3 py-1 rounded-md border border-success text-success bg-success/10 cursor-default"
-                                                                disabled
-                                                            >
-                                                                Обработано
-                                                            </button>
-                                                            <button
-                                                                type="button"
-                                                                onClick={() => {
-                                                                    if (!currentChat?.chat_id) return;
-                                                                    reprocessMutation.mutate({
-                                                                        chatId: currentChat.chat_id,
-                                                                        messageId: msgId,
-                                                                    });
-                                                                }}
-                                                                className="text-[11px] px-2 py-1 rounded-md border border-border text-foreground-secondary hover:bg-surface-2 disabled:opacity-50"
-                                                                disabled={processingId === msgId}
-                                                            >
-                                                                {processingId === msgId ? (
-                                                                    <Loader2 className="w-3 h-3 animate-spin" />
-                                                                ) : (
-                                                                    'Повторить'
-                                                                )}
-                                                            </button>
-                                                        </>
-                                                    ) : (
-                                                        <button
-                                                            type="button"
-                                                            onClick={() => {
-                                                                if (!currentChat?.chat_id) return;
-                                                                processReceiptMutation.mutate({
-                                                                    chatId: currentChat.chat_id,
-                                                                    messageId: msgId,
-                                                                });
-                                                            }}
-                                                            className={`text-xs px-3 py-1 rounded-md border ${
-                                                                message.is_outgoing
-                                                                    ? 'border-primary/60 text-foreground-inverse/90 hover:bg-primary/90'
-                                                                    : 'border-border text-foreground-secondary hover:bg-surface-2'
-                                                            } transition-colors`}
-                                                            disabled={
-                                                                processingId === msgId ||
-                                                                ['queued', 'processing'].includes(statuses[msgId]?.status || '')
-                                                            }
-                                                        >
-                                                            {processingId === msgId ? (
-                                                                <span className="flex items-center gap-1">
-                                                                    <Loader2 className="w-3 h-3 animate-spin" /> Обработка...
-                                                                </span>
-                                                            ) : (
-                                                                'Обработать'
-                                                            )}
-                                                        </button>
-                                                    )}
-                                                </div>
-                                            </div>
+                                        </div>
+                                        <div className="text-xs text-foreground-secondary">
+                                            {currentChat
+                                                ? currentChat.username
+                                                    ? `@${currentChat.username}`
+                                                    : chatTypeLabel[currentChat.chat_type] || '—'
+                                                : 'Нет выбранного диалога'}
                                         </div>
                                     </div>
-                                        );
-                                    })}
-                            </div>
-
-                            <div className="flex items-center justify-between px-4 py-3 border-t border-border bg-surface flex-shrink-0">
-                                <div className="text-[11px] text-foreground-muted">
-                                    Сообщений: {messagesState.length}
-                                </div>
-                                <button
-                                    onClick={() => {
-                                        if (!currentChat) return;
-                                        const ids = Array.from(selectedMessageIds);
-                                        if (!ids.length) return;
-                                        processBatchMutation.mutate({ chatId: currentChat.chat_id, messageIds: ids });
-                                    }}
-                                    disabled={!selectedMessageIds.size || batchProcessing}
-                                    className="px-4 py-2 rounded-md border border-primary text-primary text-sm hover:bg-primary-light/30 disabled:opacity-50 disabled:cursor-not-allowed"
-                                >
-                                    {batchProcessing ? (
-                                        <span className="flex items-center gap-2">
-                                            <Loader2 className="w-4 h-4 animate-spin" /> Обрабатываем...
-                                        </span>
-                                    ) : (
-                                        <>Обработать выбранные ({selectedMessageIds.size || 0})</>
-                                    )}
-                                </button>
-                            </div>
-
-                            <div className="p-4 border-t border-border bg-surface sticky bottom-0">
-                                <div className="flex gap-3 items-end flex-wrap">
-                                    <textarea
-                                        value={composer}
-                                        onChange={(e) => setComposer(e.target.value)}
-                                        placeholder={
-                                            authStatus?.state === 'ready'
-                                                ? currentChat
-                                                    ? 'Введите сообщение...'
-                                                    : 'Выберите чат'
-                                                : 'Авторизуйтесь, чтобы отправлять сообщения'
-                                        }
-                                        className="flex-1 min-h-[80px] px-3 py-2 border border-border rounded-lg focus:ring-2 focus:ring-primary focus:border-transparent bg-input-bg text-input-text resize-none"
-                                        disabled={!currentChat || authStatus?.state !== 'ready' || sendMessageMutation.isPending}
-                                    />
-                                    <div className="flex flex-col gap-1">
-                                        <label className="flex items-center gap-2 px-3 py-2 border border-border rounded-lg bg-surface-2 text-xs cursor-pointer hover:bg-surface-2/80">
-                                            <span className="text-foreground">Прикрепить PDF</span>
-                                            <input
-                                                type="file"
-                                                accept="application/pdf"
-                                                className="hidden"
-                                                onChange={(e) => {
-                                                    const file = e.target.files?.[0];
-                                                    if (file) setPdfFile(file);
+                                    {currentChat && (
+                                        <div className="flex items-center gap-2 flex-wrap justify-end">
+                                            <button
+                                                onClick={() => {
+                                                    if (!currentChat) return;
+                                                    const enable = !currentChat.monitor_enabled;
+                                                    monitorToggleMutation.mutate({ chatId: currentChat.chat_id, enabled: enable });
                                                 }}
-                                            />
-                                        </label>
-                                        {pdfFile && (
-                                            <div className="text-[11px] text-foreground-muted max-w-[200px] line-clamp-2">
-                                                {pdfFile.name}
-                                            </div>
-                                        )}
+                                                className={`flex items-center gap-2 px-3 py-2 rounded-md text-xs border ${currentChat?.monitor_enabled
+                                                    ? 'border-success text-success bg-success/10'
+                                                    : 'border-border text-foreground-secondary hover:bg-surface-2'
+                                                    }`}
+                                            >
+                                                {currentChat?.monitor_enabled ? <Pause className="w-4 h-4" /> : <Play className="w-4 h-4" />}
+                                                {currentChat?.monitor_enabled ? 'Серверный монитор вкл' : 'Включить монитор'}
+                                            </button>
+                                            <button
+                                                onClick={() => messagesQuery.refetch()}
+                                                disabled={messagesQuery.isFetching}
+                                                className="flex items-center gap-1 px-3 py-2 rounded-md border border-border text-foreground-secondary text-xs hover:bg-surface-2 disabled:opacity-60"
+                                            >
+                                                <RefreshCcw className={`w-4 h-4 ${messagesQuery.isFetching ? 'animate-spin' : ''}`} />
+                                                Обновить чат
+                                            </button>
+                                            {currentChat.is_hidden ? (
+                                                <button
+                                                    onClick={() => unhideChatMutation.mutate(currentChat.chat_id)}
+                                                    className="flex items-center gap-1 px-3 py-2 rounded-md border border-primary text-primary text-xs hover:bg-primary-light/30"
+                                                >
+                                                    <Eye className="w-4 h-4" />
+                                                    Показать
+                                                </button>
+                                            ) : (
+                                                <button
+                                                    onClick={() => hideChatMutation.mutate(currentChat.chat_id)}
+                                                    className="flex items-center gap-1 px-3 py-2 rounded-md border border-border text-foreground-secondary text-xs hover:bg-surface-2"
+                                                >
+                                                    <EyeOff className="w-4 h-4" />
+                                                    Скрыть
+                                                </button>
+                                            )}
+                                        </div>
+                                    )}
+                                </div>
+
+                                <div
+                                    ref={messagesScrollRef}
+                                    className="overflow-auto px-4 py-3 space-y-3 min-h-0"
+                                >
+                                    {messagesQuery.isLoading && (
+                                        <div className="flex items-center justify-center h-full text-foreground-secondary gap-2">
+                                            <Loader2 className="w-4 h-4 animate-spin" />
+                                            Загружаем сообщения...
+                                        </div>
+                                    )}
+
+                                    {!messagesQuery.isLoading && !messagesState.length && (
+                                        <div className="flex flex-col items-center justify-center h-full text-foreground-secondary gap-2 text-sm">
+                                            <AlertCircle className="w-5 h-5" />
+                                            Нет сообщений в этом чате
+                                        </div>
+                                    )}
+
+                                    {messagesState
+                                        .filter((m) => typeof m.id === 'number')
+                                        .map((message) => {
+                                            const msgId = message.id as number;
+                                            const doc = message.document;
+                                            const isPdf = doc?.mime_type?.toLowerCase().includes('pdf');
+                                            const downloadUrl = doc?.download_url
+                                                ? `${API_BASE_URL}${doc.download_url}`
+                                                : doc?.file_id
+                                                    ? `${API_BASE_URL}/api/tg/files/${doc.file_id}`
+                                                    : null;
+                                            const sizeLabel = (() => {
+                                                if (doc?.size === undefined) return '';
+                                                const kb = doc.size / 1024;
+                                                return kb > 1024 ? `${(kb / 1024).toFixed(1)} MB` : `${kb.toFixed(0)} KB`;
+                                            })();
+                                            return (
+                                                <div key={`${msgId}-${message.date}`} className="flex items-start gap-2">
+                                                    <input
+                                                        type="checkbox"
+                                                        className="mt-1 w-4 h-4 text-primary border-border rounded focus:ring-primary"
+                                                        checked={selectedMessageIds.has(msgId)}
+                                                        onChange={() => toggleSelectMessage(msgId)}
+                                                    />
+                                                    <div
+                                                        className={`flex-1 flex ${message.is_outgoing ? 'justify-end' : 'justify-start'}`}
+                                                    >
+                                                        <div
+                                                            className={`max-w-[75%] rounded-lg px-3 py-2 border shadow-sm ${message.is_outgoing
+                                                                ? 'bg-primary text-foreground-inverse border-primary/40'
+                                                                : 'bg-surface-2 text-foreground border-border'
+                                                                }`}
+                                                        >
+                                                            <div className="text-sm whitespace-pre-wrap">
+                                                                {message.text || 'Сообщение без текста'}
+                                                            </div>
+                                                            {doc && (
+                                                                <div className="mt-2 rounded-md border border-border/60 bg-surface px-2 py-1 text-xs">
+                                                                    <div className="font-semibold">Документ</div>
+                                                                    <div className="flex flex-wrap gap-2 items-center mt-1">
+                                                                        <span className="truncate max-w-[200px]">{doc.file_name || 'файл'}</span>
+                                                                        {sizeLabel && <span className="text-foreground-muted">{sizeLabel}</span>}
+                                                                        {downloadUrl && (
+                                                                            <button
+                                                                                type="button"
+                                                                                className="underline text-primary"
+                                                                                onClick={() => window.open(downloadUrl, '_blank')}
+                                                                            >
+                                                                                {isPdf ? 'Открыть PDF' : 'Открыть'}
+                                                                            </button>
+                                                                        )}
+                                                                        {downloadUrl && isPdf && (
+                                                                            <button
+                                                                                type="button"
+                                                                                className="underline text-primary"
+                                                                                onClick={() => setPreviewUrl(downloadUrl)}
+                                                                            >
+                                                                                Просмотр
+                                                                            </button>
+                                                                        )}
+                                                                    </div>
+                                                                </div>
+                                                            )}
+                                                            <div className="flex items-center gap-2 text-xs mt-2">
+                                                                {(() => {
+                                                                    const s = statuses[msgId]?.status || 'not_processed';
+                                                                    const err = statuses[msgId]?.error;
+                                                                    if (s === 'done') {
+                                                                        return (
+                                                                            <span className="flex items-center gap-1 text-success">
+                                                                                <CheckCircle2 className="w-4 h-4" /> Обработан
+                                                                                {statuses[msgId]?.check_id ? ` #${statuses[msgId]?.check_id}` : ''}
+                                                                            </span>
+                                                                        );
+                                                                    }
+                                                                    if (s === 'queued') {
+                                                                        return (
+                                                                            <span className="flex items-center gap-1 text-warning">
+                                                                                <Loader2 className="w-4 h-4 animate-spin" /> В очереди
+                                                                            </span>
+                                                                        );
+                                                                    }
+                                                                    if (s === 'processing') {
+                                                                        return (
+                                                                            <span className="flex items-center gap-1 text-info">
+                                                                                <Loader2 className="w-4 h-4 animate-spin" /> Обработка
+                                                                            </span>
+                                                                        );
+                                                                    }
+                                                                    if (s === 'failed') {
+                                                                        return (
+                                                                            <span className="flex items-center gap-1 text-danger" title={err || 'Ошибка'}>
+                                                                                <XCircle className="w-4 h-4" /> Ошибка {err ? `: ${err}` : ''}
+                                                                            </span>
+                                                                        );
+                                                                    }
+                                                                    return (
+                                                                        <span className="flex items-center gap-1 text-foreground-secondary">
+                                                                            <AlertCircle className="w-4 h-4" /> Не обработан
+                                                                        </span>
+                                                                    );
+                                                                })()}
+                                                            </div>
+                                                            <div className="text-[11px] mt-1 text-right opacity-80">
+                                                                {formatDateTime(message.date)}
+                                                            </div>
+                                                            <div className="flex justify-end mt-2 gap-2">
+                                                                {statuses[msgId]?.status === 'done' ? (
+                                                                    <>
+                                                                        <button
+                                                                            type="button"
+                                                                            className="text-xs px-3 py-1 rounded-md border border-success text-success bg-success/10 cursor-default"
+                                                                            disabled
+                                                                        >
+                                                                            Обработано
+                                                                        </button>
+                                                                        <button
+                                                                            type="button"
+                                                                            onClick={() => {
+                                                                                if (!currentChat?.chat_id) return;
+                                                                                reprocessMutation.mutate({
+                                                                                    chatId: currentChat.chat_id,
+                                                                                    messageId: msgId,
+                                                                                });
+                                                                            }}
+                                                                            className="text-[11px] px-2 py-1 rounded-md border border-border text-foreground-secondary hover:bg-surface-2 disabled:opacity-50"
+                                                                            disabled={processingId === msgId}
+                                                                        >
+                                                                            {processingId === msgId ? (
+                                                                                <Loader2 className="w-3 h-3 animate-spin" />
+                                                                            ) : (
+                                                                                'Повторить'
+                                                                            )}
+                                                                        </button>
+                                                                    </>
+                                                                ) : (
+                                                                    <button
+                                                                        type="button"
+                                                                        onClick={() => {
+                                                                            if (!currentChat?.chat_id) return;
+                                                                            processReceiptMutation.mutate({
+                                                                                chatId: currentChat.chat_id,
+                                                                                messageId: msgId,
+                                                                            });
+                                                                        }}
+                                                                        className={`text-xs px-3 py-1 rounded-md border ${message.is_outgoing
+                                                                            ? 'border-primary/60 text-foreground-inverse/90 hover:bg-primary/90'
+                                                                            : 'border-border text-foreground-secondary hover:bg-surface-2'
+                                                                            } transition-colors`}
+                                                                        disabled={
+                                                                            processingId === msgId ||
+                                                                            ['queued', 'processing'].includes(statuses[msgId]?.status || '')
+                                                                        }
+                                                                    >
+                                                                        {processingId === msgId ? (
+                                                                            <span className="flex items-center gap-1">
+                                                                                <Loader2 className="w-3 h-3 animate-spin" /> Обработка...
+                                                                            </span>
+                                                                        ) : (
+                                                                            'Обработать'
+                                                                        )}
+                                                                    </button>
+                                                                )}
+                                                            </div>
+                                                        </div>
+                                                    </div>
+                                                </div>
+                                            );
+                                        })}
+                                </div>
+
+                                <div className="flex items-center justify-between px-4 py-3 border-t border-border bg-surface flex-shrink-0">
+                                    <div className="text-[11px] text-foreground-muted">
+                                        Сообщений: {messagesState.length}
                                     </div>
                                     <button
                                         onClick={() => {
                                             if (!currentChat) return;
-                                            if (pdfFile) {
-                                                sendPdfMutation.mutate({
-                                                    chatId: currentChat.chat_id,
-                                                    file: pdfFile,
-                                                    caption: composer.trim() || undefined,
-                                                });
-                                            } else {
-                                                if (!composer.trim()) return;
-                                                sendMessageMutation.mutate({ chatId: currentChat.chat_id, text: composer });
-                                            }
+                                            const ids = Array.from(selectedMessageIds);
+                                            if (!ids.length) return;
+                                            processBatchMutation.mutate({ chatId: currentChat.chat_id, messageIds: ids });
                                         }}
-                                        disabled={
-                                            (!pdfFile && !composer.trim()) ||
-                                            !currentChat ||
-                                            authStatus?.state !== 'ready' ||
-                                            sendMessageMutation.isPending ||
-                                            sendPdfMutation.isPending
-                                        }
-                                        className="h-[44px] px-4 bg-primary text-foreground-inverse rounded-lg hover:bg-primary-hover transition-colors flex items-center gap-2 disabled:opacity-50 focus:outline-none focus:ring-2 focus:ring-primary"
+                                        disabled={!selectedMessageIds.size || batchProcessing}
+                                        className="px-4 py-2 rounded-md border border-primary text-primary text-sm hover:bg-primary-light/30 disabled:opacity-50 disabled:cursor-not-allowed"
                                     >
-                                        {sendMessageMutation.isPending || sendPdfMutation.isPending ? (
-                                            <Loader2 className="w-4 h-4 animate-spin" />
+                                        {batchProcessing ? (
+                                            <span className="flex items-center gap-2">
+                                                <Loader2 className="w-4 h-4 animate-spin" /> Обрабатываем...
+                                            </span>
                                         ) : (
-                                            <Send className="w-4 h-4" />
+                                            <>Обработать выбранные ({selectedMessageIds.size || 0})</>
                                         )}
-                                        {pdfFile ? 'Отправить PDF' : 'Отправить'}
                                     </button>
+                                </div>
+
+                                <div className="p-4 border-t border-border bg-surface sticky bottom-0">
+                                    <div className="flex gap-3 items-end flex-wrap">
+                                        <textarea
+                                            value={composer}
+                                            onChange={(e) => setComposer(e.target.value)}
+                                            placeholder={
+                                                authStatus?.state === 'ready'
+                                                    ? currentChat
+                                                        ? 'Введите сообщение...'
+                                                        : 'Выберите чат'
+                                                    : 'Авторизуйтесь, чтобы отправлять сообщения'
+                                            }
+                                            className="flex-1 min-h-[80px] px-3 py-2 border border-border rounded-lg focus:ring-2 focus:ring-primary focus:border-transparent bg-input-bg text-input-text resize-none"
+                                            disabled={!currentChat || authStatus?.state !== 'ready' || sendMessageMutation.isPending}
+                                        />
+                                        <div className="flex flex-col gap-1">
+                                            <label className="flex items-center gap-2 px-3 py-2 border border-border rounded-lg bg-surface-2 text-xs cursor-pointer hover:bg-surface-2/80">
+                                                <span className="text-foreground">Прикрепить PDF</span>
+                                                <input
+                                                    type="file"
+                                                    accept="application/pdf"
+                                                    className="hidden"
+                                                    onChange={(e) => {
+                                                        const file = e.target.files?.[0];
+                                                        if (file) setPdfFile(file);
+                                                    }}
+                                                />
+                                            </label>
+                                            {pdfFile && (
+                                                <div className="text-[11px] text-foreground-muted max-w-[200px] line-clamp-2">
+                                                    {pdfFile.name}
+                                                </div>
+                                            )}
+                                        </div>
+                                        <button
+                                            onClick={() => {
+                                                if (!currentChat) return;
+                                                if (pdfFile) {
+                                                    sendPdfMutation.mutate({
+                                                        chatId: currentChat.chat_id,
+                                                        file: pdfFile,
+                                                        caption: composer.trim() || undefined,
+                                                    });
+                                                } else {
+                                                    if (!composer.trim()) return;
+                                                    sendMessageMutation.mutate({ chatId: currentChat.chat_id, text: composer });
+                                                }
+                                            }}
+                                            disabled={
+                                                (!pdfFile && !composer.trim()) ||
+                                                !currentChat ||
+                                                authStatus?.state !== 'ready' ||
+                                                sendMessageMutation.isPending ||
+                                                sendPdfMutation.isPending
+                                            }
+                                            className="h-[44px] px-4 bg-primary text-foreground-inverse rounded-lg hover:bg-primary-hover transition-colors flex items-center gap-2 disabled:opacity-50 focus:outline-none focus:ring-2 focus:ring-primary"
+                                        >
+                                            {sendMessageMutation.isPending || sendPdfMutation.isPending ? (
+                                                <Loader2 className="w-4 h-4 animate-spin" />
+                                            ) : (
+                                                <Send className="w-4 h-4" />
+                                            )}
+                                            {pdfFile ? 'Отправить PDF' : 'Отправить'}
+                                        </button>
+                                    </div>
                                 </div>
                             </div>
                         </div>
                     </div>
                 </div>
             </div>
-        </div>
-        {previewUrl && (
-            <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50">
-                <div className="bg-white w-11/12 h-[90vh] rounded-lg shadow-lg overflow-hidden relative">
-                    <button
-                        className="absolute top-3 right-3 text-foreground hover:text-danger"
-                        onClick={() => setPreviewUrl(null)}
-                    >
-                        <XCircle className="w-6 h-6" />
-                    </button>
-                    <iframe src={previewUrl} title="PDF preview" className="w-full h-full border-0" />
+            {previewUrl && (
+                <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50">
+                    <div className="bg-white w-11/12 h-[90vh] rounded-lg shadow-lg overflow-hidden relative">
+                        <button
+                            className="absolute top-3 right-3 text-foreground hover:text-danger"
+                            onClick={() => setPreviewUrl(null)}
+                        >
+                            <XCircle className="w-6 h-6" />
+                        </button>
+                        <iframe src={previewUrl} title="PDF preview" className="w-full h-full border-0" />
+                    </div>
                 </div>
-            </div>
-        )}
+            )}
         </>
     );
 };

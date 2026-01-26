@@ -48,6 +48,9 @@ class Transaction(Base):
     parsing_confidence = Column(Float)
     parsing_method = Column(String(20))
     is_p2p = Column(Boolean, default=False)
+    
+    # Fingerprint for duplicate detection (SHA256 of amount|date|card)
+    fingerprint = Column(String(64), index=True)
 
     created_at = Column(DateTime(timezone=False), server_default=func.now(), nullable=False)
     updated_at = Column(DateTime(timezone=False), server_default=func.now(), onupdate=func.now())

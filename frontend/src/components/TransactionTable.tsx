@@ -398,7 +398,7 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
                 accessorFn: (row) => row.transaction_date ? new Date(row.transaction_date) : null,
                 id: 'transaction_date',
                 header: 'Дата',
-                size: 100,
+                size: 120,
                 cell: (info) => {
                     const date = info.getValue();
                     return <div className="font-mono text-table-xs">{formatDate(date)}</div>;
@@ -454,7 +454,7 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
                 accessorKey: 'receiver_name',
                 id: 'receiver_name',
                 header: 'Получатель',
-                size: 200,
+                size: 220,
                 cell: (info) => (
                     <div className="truncate text-table-xs" title={info.getValue() as string}>
                         {info.getValue() as string || '—'}
@@ -465,7 +465,7 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
                 accessorKey: 'receiver_card',
                 id: 'receiver_card',
                 header: 'Карта получателя',
-                size: 140,
+                size: 160,
                 cell: (info) => (
                     <div className="font-mono text-table-xs">
                         {info.getValue() as string || '—'}
@@ -662,7 +662,7 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
         } catch (error) {
             console.warn('Failed to restore table state', error);
         }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+        // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []);
 
     // Manual Global Filter & Advanced Filters
@@ -1228,9 +1228,11 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
             { key: 'Backspace', handler: () => handleDeleteSelected(), description: 'Удалить' },
             { key: 'c', ctrl: true, handler: () => handleCopy(), description: 'Копировать' },
             { key: 'v', ctrl: true, handler: () => handlePaste(), description: 'Вставить' },
-            { key: 'Escape', handler: () => {
-                if (editingCell) cancelEdit();
-            }, description: 'Отмена редактирования' },
+            {
+                key: 'Escape', handler: () => {
+                    if (editingCell) cancelEdit();
+                }, description: 'Отмена редактирования'
+            },
         ],
         enabled: true,
     });
@@ -1684,8 +1686,8 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
                                             return (
                                                 <td
                                                     key={cell.id}
-                                                style={finalStyle}
-                                                className={`cursor-default select-none border border-table-border text-table-text ${cellPadding} ${isSelected ? 'ring-2 ring-inset ring-primary z-10 bg-table-row-selected' : ''}`}
+                                                    style={finalStyle}
+                                                    className={`cursor-default select-none border border-table-border text-table-text ${cellPadding} ${isSelected ? 'ring-2 ring-inset ring-primary z-10 bg-table-row-selected' : ''}`}
                                                     onClick={(e) => handleCellClick(e, cellKey)}
                                                     onMouseDown={(e) => handleCellMouseDown(e, row.id, cell.column.id, virtualRow.index, colIndex)}
                                                     onMouseEnter={() => handleCellMouseEnter(virtualRow.index, colIndex)}
