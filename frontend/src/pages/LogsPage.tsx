@@ -1,8 +1,9 @@
 /**
  * Logs Page - страница логов обработки чеков
+ * С автообновлением и детальным просмотром записей
  */
-import { useState, useEffect, useCallback } from 'react';
-import { AlertCircle, CheckCircle2, Clock, Copy, RefreshCw, Search, Filter, ChevronLeft, ChevronRight } from 'lucide-react';
+import { useState, useEffect, useCallback, useRef } from 'react';
+import { AlertCircle, CheckCircle2, Clock, Copy, RefreshCw, Search, Filter, ChevronLeft, ChevronRight, X, Play, Pause, Eye } from 'lucide-react';
 
 interface LogEntry {
     id: number;
@@ -17,6 +18,9 @@ interface LogEntry {
     is_duplicate: boolean;
     operator_raw: string | null;
     amount: string | null;
+    raw_message?: string | null;
+    fingerprint?: string | null;
+    currency?: string | null;
 }
 
 interface LogStats {
@@ -35,6 +39,7 @@ interface LogsResponse {
 }
 
 const API_BASE = (import.meta as any).env?.VITE_API_URL || 'http://localhost:8000';
+const AUTO_REFRESH_INTERVAL = 10000; // 10 seconds
 
 export const LogsPage = () => {
     const [logs, setLogs] = useState<LogEntry[]>([]);
@@ -46,6 +51,9 @@ export const LogsPage = () => {
     const [statusFilter, setStatusFilter] = useState<string>('');
     const [searchQuery, setSearchQuery] = useState('');
     const [duplicatesOnly, setDuplicatesOnly] = useState(false);
+    const [autoRefresh, setAutoRefresh] = useState(false);
+    const [selectedLog, setSelectedLog] = useState<LogEntry | null>(null);
+    const autoRefreshRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
     const getAuthHeaders = () => {
         const token = localStorage.getItem('token');
@@ -94,6 +102,27 @@ export const LogsPage = () => {
             setLoading(false);
         }
     }, [page, pageSize, statusFilter, searchQuery, duplicatesOnly]);
+
+    // Auto-refresh effect
+    useEffect(() => {
+        if (autoRefresh && !selectedLog) {
+            autoRefreshRef.current = setInterval(() => {
+                fetchLogs();
+                fetchStats();
+            }, AUTO_REFRESH_INTERVAL);
+        } else {
+            if (autoRefreshRef.current) {
+                clearInterval(autoRefreshRef.current);
+                autoRefreshRef.current = null;
+            }
+        }
+
+        return () => {
+            if (autoRefreshRef.current) {
+                clearInterval(autoRefreshRef.current);
+            }
+        };
+    }, [autoRefresh, selectedLog, fetchLogs, fetchStats]);
 
     useEffect(() => {
         fetchStats();
@@ -228,6 +257,30 @@ export const LogsPage = () => {
                     <span className="text-sm text-foreground">Только дубликаты</span>
                 </label>
 
+                {/* Auto-refresh toggle */}
+                <button
+                    onClick={() => setAutoRefresh(!autoRefresh)}
+                    className={`flex items-center gap-2 px-4 py-2 rounded-lg transition-colors ${
+                        autoRefresh
+                            ? 'bg-success/20 text-success border border-success/30'
+                            : 'bg-surface border border-border text-foreground hover:bg-surface-2'
+                    }`}
+                    title={autoRefresh ? 'Остановить автообновление' : 'Включить автообновление (10 сек)'}
+                >
+                    {autoRefresh ? (
+                        <>
+                            <Pause className="w-4 h-4" />
+                            <span className="text-sm">Авто</span>
+                            <span className="w-2 h-2 rounded-full bg-success animate-pulse" />
+                        </>
+                    ) : (
+                        <>
+                            <Play className="w-4 h-4" />
+                            <span className="text-sm">Авто</span>
+                        </>
+                    )}
+                </button>
+
                 <button
                     onClick={() => { fetchLogs(); fetchStats(); }}
                     className="flex items-center gap-2 px-4 py-2 bg-primary text-white rounded-lg hover:bg-primary/90 transition-colors"
@@ -248,25 +301,32 @@ export const LogsPage = () => {
                             <th className="px-4 py-3 text-left text-xs font-medium text-foreground-secondary uppercase tracking-wider">Оператор</th>
                             <th className="px-4 py-3 text-left text-xs font-medium text-foreground-secondary uppercase tracking-wider">Сумма</th>
                             <th className="px-4 py-3 text-left text-xs font-medium text-foreground-secondary uppercase tracking-wider">Ошибка</th>
+                            <th className="px-4 py-3 text-center text-xs font-medium text-foreground-secondary uppercase tracking-wider w-16">
+                                <span className="sr-only">Действия</span>
+                            </th>
                         </tr>
                     </thead>
                     <tbody className="divide-y divide-border">
                         {loading ? (
                             <tr>
-                                <td colSpan={6} className="px-4 py-8 text-center text-foreground-secondary">
+                                <td colSpan={7} className="px-4 py-8 text-center text-foreground-secondary">
                                     <RefreshCw className="w-6 h-6 animate-spin mx-auto mb-2" />
                                     Загрузка...
                                 </td>
                             </tr>
                         ) : logs.length === 0 ? (
                             <tr>
-                                <td colSpan={6} className="px-4 py-8 text-center text-foreground-secondary">
+                                <td colSpan={7} className="px-4 py-8 text-center text-foreground-secondary">
                                     Нет данных для отображения
                                 </td>
                             </tr>
                         ) : (
                             logs.map((log) => (
-                                <tr key={log.id} className="hover:bg-surface-2/50 transition-colors">
+                                <tr
+                                    key={log.id}
+                                    className="hover:bg-surface-2/50 transition-colors cursor-pointer"
+                                    onClick={() => setSelectedLog(log)}
+                                >
                                     <td className="px-4 py-3 text-sm text-foreground whitespace-nowrap">
                                         {formatDate(log.created_at)}
                                     </td>
@@ -282,10 +342,23 @@ export const LogsPage = () => {
                                         {log.operator_raw || '—'}
                                     </td>
                                     <td className="px-4 py-3 text-sm text-foreground whitespace-nowrap">
-                                        {log.amount ? `${Number(log.amount).toLocaleString()} UZS` : '—'}
+                                        {log.amount ? `${Number(log.amount).toLocaleString()} ${log.currency || 'UZS'}` : '—'}
                                     </td>
                                     <td className="px-4 py-3 text-sm text-error max-w-[300px] truncate" title={log.error || ''}>
                                         {log.error || '—'}
+                                    </td>
+                                    <td className="px-4 py-3 text-center">
+                                        <button
+                                            type="button"
+                                            onClick={(e) => {
+                                                e.stopPropagation();
+                                                setSelectedLog(log);
+                                            }}
+                                            className="p-1.5 rounded-lg hover:bg-surface-2 text-foreground-secondary hover:text-foreground transition-colors"
+                                            title="Подробнее"
+                                        >
+                                            <Eye className="w-4 h-4" />
+                                        </button>
                                     </td>
                                 </tr>
                             ))
@@ -321,6 +394,148 @@ export const LogsPage = () => {
                     </div>
                 </div>
             )}
+
+            {/* Detail Modal */}
+            {selectedLog && (
+                <LogDetailModal log={selectedLog} onClose={() => setSelectedLog(null)} />
+            )}
+        </div>
+    );
+};
+
+// Detail Modal Component
+const LogDetailModal: React.FC<{ log: LogEntry; onClose: () => void }> = ({ log, onClose }) => {
+    const formatDate = (dateStr: string | null) => {
+        if (!dateStr) return '—';
+        const date = new Date(dateStr);
+        return date.toLocaleString('ru-RU', {
+            day: '2-digit',
+            month: '2-digit',
+            year: 'numeric',
+            hour: '2-digit',
+            minute: '2-digit',
+            second: '2-digit',
+        });
+    };
+
+    return (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm">
+            <div className="bg-surface w-full max-w-2xl max-h-[90vh] rounded-lg border border-border shadow-xl flex flex-col">
+                {/* Header */}
+                <div className="flex items-center justify-between px-6 py-4 border-b border-border">
+                    <h3 className="text-lg font-semibold text-foreground">
+                        Детали записи #{log.id}
+                    </h3>
+                    <button
+                        type="button"
+                        onClick={onClose}
+                        className="p-2 rounded-lg hover:bg-surface-2 text-foreground-secondary hover:text-foreground transition-colors"
+                        title="Закрыть"
+                    >
+                        <X className="w-5 h-5" />
+                    </button>
+                </div>
+
+                {/* Content */}
+                <div className="flex-1 overflow-auto p-6 space-y-4">
+                    {/* Info Grid */}
+                    <div className="grid grid-cols-2 gap-4">
+                        <div>
+                            <label className="text-xs text-foreground-secondary uppercase tracking-wider">Task ID</label>
+                            <div className="font-mono text-sm text-foreground mt-1">{log.task_id}</div>
+                        </div>
+                        <div>
+                            <label className="text-xs text-foreground-secondary uppercase tracking-wider">Статус</label>
+                            <div className="mt-1">
+                                {log.is_duplicate ? (
+                                    <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-xs font-medium bg-warning/10 text-warning border border-warning/20">
+                                        <Copy className="w-3 h-3" />
+                                        Дубликат
+                                    </span>
+                                ) : (
+                                    <span className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-xs font-medium border ${
+                                        log.status === 'done' ? 'bg-success/10 text-success border-success/20' :
+                                        log.status === 'failed' ? 'bg-error/10 text-error border-error/20' :
+                                        'bg-primary/10 text-primary border-primary/20'
+                                    }`}>
+                                        {log.status === 'done' && <CheckCircle2 className="w-3 h-3" />}
+                                        {log.status === 'failed' && <AlertCircle className="w-3 h-3" />}
+                                        {['processing', 'queued'].includes(log.status) && <Clock className="w-3 h-3" />}
+                                        {log.status}
+                                    </span>
+                                )}
+                            </div>
+                        </div>
+                        <div>
+                            <label className="text-xs text-foreground-secondary uppercase tracking-wider">Chat ID</label>
+                            <div className="font-mono text-sm text-foreground mt-1">{log.chat_id}</div>
+                        </div>
+                        <div>
+                            <label className="text-xs text-foreground-secondary uppercase tracking-wider">Message ID</label>
+                            <div className="font-mono text-sm text-foreground mt-1">{log.message_id}</div>
+                        </div>
+                        <div>
+                            <label className="text-xs text-foreground-secondary uppercase tracking-wider">Transaction ID</label>
+                            <div className="font-mono text-sm text-foreground mt-1">{log.transaction_id || '—'}</div>
+                        </div>
+                        <div>
+                            <label className="text-xs text-foreground-secondary uppercase tracking-wider">Fingerprint</label>
+                            <div className="font-mono text-xs text-foreground mt-1 truncate" title={log.fingerprint || ''}>
+                                {log.fingerprint ? log.fingerprint.substring(0, 16) + '...' : '—'}
+                            </div>
+                        </div>
+                        <div>
+                            <label className="text-xs text-foreground-secondary uppercase tracking-wider">Создано</label>
+                            <div className="text-sm text-foreground mt-1">{formatDate(log.created_at)}</div>
+                        </div>
+                        <div>
+                            <label className="text-xs text-foreground-secondary uppercase tracking-wider">Обновлено</label>
+                            <div className="text-sm text-foreground mt-1">{formatDate(log.updated_at)}</div>
+                        </div>
+                        <div>
+                            <label className="text-xs text-foreground-secondary uppercase tracking-wider">Оператор</label>
+                            <div className="text-sm text-foreground mt-1">{log.operator_raw || '—'}</div>
+                        </div>
+                        <div>
+                            <label className="text-xs text-foreground-secondary uppercase tracking-wider">Сумма</label>
+                            <div className="text-sm text-foreground mt-1">
+                                {log.amount ? `${Number(log.amount).toLocaleString()} ${log.currency || 'UZS'}` : '—'}
+                            </div>
+                        </div>
+                    </div>
+
+                    {/* Error */}
+                    {log.error && (
+                        <div>
+                            <label className="text-xs text-foreground-secondary uppercase tracking-wider">Ошибка</label>
+                            <div className="mt-2 p-3 bg-error/10 border border-error/20 rounded-lg">
+                                <pre className="text-sm text-error whitespace-pre-wrap font-mono">{log.error}</pre>
+                            </div>
+                        </div>
+                    )}
+
+                    {/* Raw Message */}
+                    {log.raw_message && (
+                        <div>
+                            <label className="text-xs text-foreground-secondary uppercase tracking-wider">Исходное сообщение</label>
+                            <div className="mt-2 p-3 bg-surface-2 border border-border rounded-lg max-h-[200px] overflow-auto">
+                                <pre className="text-sm text-foreground whitespace-pre-wrap font-mono">{log.raw_message}</pre>
+                            </div>
+                        </div>
+                    )}
+                </div>
+
+                {/* Footer */}
+                <div className="flex justify-end px-6 py-4 border-t border-border bg-surface-2">
+                    <button
+                        type="button"
+                        onClick={onClose}
+                        className="px-4 py-2 rounded-lg bg-primary text-white hover:bg-primary/90 transition-colors"
+                    >
+                        Закрыть
+                    </button>
+                </div>
+            </div>
         </div>
     );
 };
