@@ -50,22 +50,150 @@ class RegexParser:
             }
         }
     
+    def parse_sender_receiver_transfer(self, text: str) -> Optional[Dict[str, Any]]:
+        """
+        Parse P2P transfer style:
+        Sender 986001******7466
+        Sender name LEE SVYATOSLAV
+        Receiver 491699******1116
+        Receiver name SVYATOSLAV LI
+        Transaction date 09.01.2026 02:05:05
+        Receiver amount 1,450,000.00 UZS
+        """
+        lines_lower = text.lower()
+        if "sender" not in lines_lower or "receiver" not in lines_lower:
+            return None
+
+        amount = None
+        currency = "UZS"
+        amount_match = re.search(r'Receiver amount\s+([\d\s\.,]+)\s*(UZS|USD)?', text, re.IGNORECASE)
+        if not amount_match:
+            amount_match = re.search(r'Sender amount\s+([\d\s\.,]+)\s*(UZS|USD)?', text, re.IGNORECASE)
+        if amount_match:
+            try:
+                amount = self.normalize_amount(amount_match.group(1))
+            except Exception:
+                pass
+            if amount_match.lastindex and amount_match.group(2):
+                currency = amount_match.group(2).upper()
+
+        date_match = re.search(r'Transaction date\s+(\d{2}\.\d{2}\.\d{4})\s+(\d{2}:\d{2}:\d{2})', text, re.IGNORECASE)
+        transaction_date = None
+        if date_match:
+            try:
+                dt_str = f"{date_match.group(1)} {date_match.group(2)}"
+                transaction_date = self.tz.localize(datetime.strptime(dt_str, "%d.%m.%Y %H:%M:%S"))
+            except Exception:
+                pass
+
+        sender_mask = re.search(r'Sender\s+([0-9\*]{6,})', text, re.IGNORECASE)
+        receiver_mask = re.search(r'Receiver\s+([0-9\*]{6,})', text, re.IGNORECASE)
+        card_last_4 = self.extract_card_last4(sender_mask.group(1)) if sender_mask else None
+        receiver_card = receiver_mask.group(1).strip() if receiver_mask else None
+
+        sender_name_match = re.search(r'Sender name\s+([^\n\r]+)', text, re.IGNORECASE)
+        receiver_name_match = re.search(r'Receiver name\s+([^\n\r]+)', text, re.IGNORECASE)
+        receiver_name = receiver_name_match.group(1).strip() if receiver_name_match else None
+
+        if not amount or not transaction_date:
+            return None
+
+        return {
+            'amount': amount,
+            'currency': currency,
+            'transaction_type': 'DEBIT',
+            'card_last_4': card_last_4,
+            'receiver_card': receiver_card,
+            'receiver_name': receiver_name,
+            'operator_raw': 'Uzum Bank',
+            'transaction_date': transaction_date,
+            'balance_after': None,
+            'parsing_method': 'REGEX_TRANSFER',
+            'parsing_confidence': 0.9,
+            'is_p2p': True,
+        }
+
+    def parse_ru_transfer(self, text: str) -> Optional[Dict[str, Any]]:
+        """
+        Parse Russian P2P receipts with labels "Отправителя", "Имя отправителя", "Название", "Сумма отправителя".
+        """
+        lower = text.lower()
+        if "отправител" not in lower or "сумма" not in lower:
+            return None
+
+        sender_mask = re.search(r'Отправителя\s+([0-9\*]{6,})', text, re.IGNORECASE)
+        receiver_mask = re.search(r'Получател[ьяя]?\s+([0-9\*]{6,})', text, re.IGNORECASE)
+
+        amount_match = re.search(r'Сумма(?:\s+отправителя)?\s+([\d\s\.,]+)\s*(UZS|USD)?', text, re.IGNORECASE)
+        amount = None
+        currency = "UZS"
+        if amount_match:
+            try:
+                amount = self.normalize_amount(amount_match.group(1))
+            except Exception:
+                amount = None
+            if amount_match.lastindex and amount_match.group(2):
+                currency = amount_match.group(2).upper()
+
+        date_match = re.search(r'Дата(?:\s+транзакции)?\s+(\d{2}\.\d{2}\.\d{4})\s+(\d{2}:\d{2}:\d{2})', text, re.IGNORECASE)
+        transaction_date = None
+        if date_match:
+            try:
+                dt_str = f"{date_match.group(1)} {date_match.group(2)}"
+                transaction_date = self.tz.localize(datetime.strptime(dt_str, "%d.%m.%Y %H:%M:%S"))
+            except Exception:
+                transaction_date = None
+
+        operator_raw = "Uzum Bank"
+
+        receiver_name_match = re.search(r'(?:Receiver name|Имя\s+получател[ьяя]?|Имя\s+отправителя|Имя)\s+([^\n\r]+)', text, re.IGNORECASE)
+        receiver_name = receiver_name_match.group(1).strip() if receiver_name_match else None
+
+        card_last_4 = self.extract_card_last4(sender_mask.group(1)) if sender_mask else None
+        receiver_card = receiver_mask.group(1).strip() if receiver_mask else None
+
+        if amount is None or transaction_date is None:
+            return None
+
+        return {
+            'amount': amount,
+            'currency': currency,
+            'transaction_type': 'DEBIT',
+            'card_last_4': card_last_4,
+            'receiver_card': receiver_card,
+            'receiver_name': receiver_name,
+            'operator_raw': operator_raw,
+            'transaction_date': transaction_date,
+            'balance_after': None,
+            'parsing_method': 'REGEX_TRANSFER',
+            'parsing_confidence': 0.9,
+            'is_p2p': True,
+        }
+    
     def normalize_amount(self, amount_str: str) -> Decimal:
         """Normalize amount string to Decimal with robust thousand/decimal handling."""
         if amount_str is None:
             raise ValueError("Amount string is None")
-        cleaned = amount_str.strip().replace("\u00a0", "")
-        cleaned = cleaned.replace(" ", "")
+        cleaned = amount_str.strip().replace("\u00a0", "").replace(" ", "")
 
         has_dot = "." in cleaned
         has_comma = "," in cleaned
 
         if has_dot and has_comma:
-            cleaned = cleaned.replace(".", "")
-            cleaned = cleaned.replace(",", ".")
-        elif has_comma:
+            # Decide decimal separator by last occurrence
+            last_dot = cleaned.rfind(".")
+            last_comma = cleaned.rfind(",")
+            if last_dot > last_comma:
+                # dot is decimal, remove commas
+                cleaned = cleaned.replace(",", "")
+            else:
+                # comma is decimal, remove dots then swap comma to dot
+                cleaned = cleaned.replace(".", "")
+                cleaned = cleaned.replace(",", ".")
+        elif has_comma and not has_dot:
             cleaned = cleaned.replace(",", ".")
 
+        # Strip all except digits and dot
         cleaned = re.sub(r"[^0-9\.]", "", cleaned)
 
         if cleaned.count(".") > 1:
@@ -359,6 +487,14 @@ class RegexParser:
                 return result
 
         # Try Humo notification format first (most common)
+        result = self.parse_ru_transfer(text)
+        if result:
+            return result
+
+        result = self.parse_sender_receiver_transfer(text)
+        if result:
+            return result
+
         if any(emoji in text for emoji in ['💸', '💳', '📍', '🕓', '🕘']):
             result = self.parse_humo_notification(text)
             if result:

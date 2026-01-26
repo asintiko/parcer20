@@ -2,9 +2,9 @@
 PDF extraction utilities with OCR cascade support.
 
 Supports multiple extraction methods with fallback:
-1. PyMuPDF (fast, for text-layer PDFs)
-2. pdfplumber (better extraction for complex layouts)
-3. OCR via Tesseract (for scanned documents)
+1. pdfplumber (preferred for text-layer PDFs)
+2. PyMuPDF (backup text extraction)
+3. OCR via Tesseract (for scanned documents or sparse text)
 """
 import base64
 import logging
@@ -26,74 +26,56 @@ try:
     PDFPLUMBER_AVAILABLE = True
 except ImportError:
     PDFPLUMBER_AVAILABLE = False
-    logger.warning("pdfplumber not installed - OCR cascade limited")
+    logger.warning("pdfplumber not installed - text extraction limited")
 
 try:
-    from pdf2image import convert_from_path, convert_from_bytes
+    from pdf2image import convert_from_path
     import pytesseract
     OCR_AVAILABLE = True
 except ImportError:
     OCR_AVAILABLE = False
     logger.warning("pdf2image/pytesseract not installed - OCR disabled")
 
+MIN_TEXT_LENGTH = 80
+
 
 def extract_text_from_pdf(path: str, max_pages: int = 2, use_ocr: bool = True) -> str:
     """
     Extract text from PDF using cascade approach with multiple fallback methods.
 
-    Cascade order:
-    1. PyMuPDF (fastest, works with text-layer PDFs)
-    2. pdfplumber (better for complex layouts)
-    3. OCR via Tesseract (for scanned documents)
-
-    Args:
-        path: Path to PDF file
-        max_pages: Maximum pages to process (default: 2)
-        use_ocr: Enable OCR fallback for scanned documents (default: True)
-
-    Returns:
-        Extracted text or empty string if extraction failed
+    Cascade:
+    1. pdfplumber (preferred where text layer exists)
+    2. PyMuPDF
+    3. OCR via Tesseract if text is sparse or missing
     """
-    # Step 1: Try PyMuPDF (fastest method)
-    text = _extract_with_pymupdf(path, max_pages)
-    if text and len(text.strip()) >= 50:
-        logger.info(f"PDF text extracted via PyMuPDF: {len(text)} chars")
-        return text
+    text = ""
 
-    # Step 2: Try pdfplumber (better for complex layouts)
     if PDFPLUMBER_AVAILABLE:
         text = _extract_with_pdfplumber(path, max_pages)
-        if text and len(text.strip()) >= 50:
+        if text and len(text.strip()) >= MIN_TEXT_LENGTH:
             logger.info(f"PDF text extracted via pdfplumber: {len(text)} chars")
             return text
 
-    # Step 3: OCR fallback for scanned documents
-    if use_ocr and OCR_AVAILABLE:
-        text = _extract_with_ocr(path, max_pages, lang='rus+eng')
-        if text and len(text.strip()) >= 30:
-            logger.info(f"PDF text extracted via OCR: {len(text)} chars")
+    if not text:
+        text = _extract_with_pymupdf(path, max_pages)
+        if text and len(text.strip()) >= MIN_TEXT_LENGTH:
+            logger.info(f"PDF text extracted via PyMuPDF: {len(text)} chars")
             return text
 
-    # Return whatever we have (may be empty)
+    if use_ocr and OCR_AVAILABLE and len(text.strip()) < MIN_TEXT_LENGTH:
+        ocr_text = _extract_with_ocr(path, max_pages, lang='rus+eng')
+        if ocr_text:
+            logger.info(f"PDF text extracted via OCR: {len(ocr_text)} chars")
+            return ocr_text
+
+    if text and text.strip():
+        return text
+
     logger.warning(f"Failed to extract meaningful text from PDF: {path}")
-    return text or ""
+    return ""
 
 
 def _extract_with_pymupdf(path: str, max_pages: int) -> str:
-    """
-    Extract text using PyMuPDF (fitz) - fastest method.
-
-    Works well with:
-    - Text-layer PDFs (documents with selectable text)
-    - Simple layouts
-
-    Args:
-        path: Path to PDF file
-        max_pages: Maximum pages to process
-
-    Returns:
-        Extracted text or empty string
-    """
     try:
         doc = fitz.open(path)
         texts: List[str] = []
@@ -104,27 +86,14 @@ def _extract_with_pymupdf(path: str, max_pages: int) -> str:
                 texts.append(page_text)
         doc.close()
         return "\n".join(texts).strip()
-    except Exception as e:
-        logger.error(f"PyMuPDF extraction failed: {e}")
+    except Exception as err:
+        logger.debug("PyMuPDF extraction failed: %s", err)
         return ""
 
 
 def _extract_with_pdfplumber(path: str, max_pages: int) -> str:
-    """
-    Extract text using pdfplumber - better for complex layouts.
-
-    Works well with:
-    - Complex table layouts
-    - Multi-column documents
-    - Forms with structured data
-
-    Args:
-        path: Path to PDF file
-        max_pages: Maximum pages to process
-
-    Returns:
-        Extracted text or empty string
-    """
+    if not PDFPLUMBER_AVAILABLE:
+        return ""
     try:
         texts: List[str] = []
         with pdfplumber.open(path) as pdf:
@@ -133,31 +102,15 @@ def _extract_with_pdfplumber(path: str, max_pages: int) -> str:
                 if page_text and page_text.strip():
                     texts.append(page_text)
         return "\n".join(texts).strip()
-    except Exception as e:
-        logger.error(f"pdfplumber extraction failed: {e}")
+    except Exception as err:
+        logger.debug("pdfplumber extraction failed (%s); falling back", err)
         return ""
 
 
 def _extract_with_ocr(path: str, max_pages: int, lang: str = 'rus+eng', dpi: int = 300) -> str:
-    """
-    Extract text using OCR (Optical Character Recognition) via Tesseract.
-
-    Works well with:
-    - Scanned documents
-    - Images embedded in PDFs
-    - Documents without text layer
-
-    Args:
-        path: Path to PDF file
-        max_pages: Maximum pages to process
-        lang: Tesseract language code (default: 'rus+eng' for Russian and English)
-        dpi: DPI for image conversion (default: 300 for good quality)
-
-    Returns:
-        Extracted text or empty string
-    """
+    if not OCR_AVAILABLE:
+        return ""
     try:
-        # Convert PDF pages to images
         images = convert_from_path(
             path,
             dpi=dpi,
@@ -167,61 +120,34 @@ def _extract_with_ocr(path: str, max_pages: int, lang: str = 'rus+eng', dpi: int
 
         texts: List[str] = []
         for i, image in enumerate(images):
-            # Apply OCR to each image
             text = pytesseract.image_to_string(image, lang=lang)
             if text.strip():
                 texts.append(text)
-                logger.debug(f"OCR extracted {len(text)} chars from page {i+1}")
+                logger.debug("OCR extracted %s chars from page %s", len(text), i + 1)
 
         return "\n".join(texts).strip()
-    except Exception as e:
-        logger.error(f"OCR extraction failed: {e}")
+    except Exception as err:
+        logger.debug("OCR extraction failed: %s", err)
         return ""
 
 
 def extract_text_from_pdf_bytes(pdf_bytes: bytes, max_pages: int = 2, use_ocr: bool = True) -> str:
-    """
-    Extract text from PDF bytes (for Celery worker and API uploads).
-
-    Saves bytes to temporary file, extracts text, then deletes file.
-
-    Args:
-        pdf_bytes: PDF file content as bytes
-        max_pages: Maximum pages to process (default: 2)
-        use_ocr: Enable OCR fallback (default: True)
-
-    Returns:
-        Extracted text or empty string
-    """
-    # Create temporary file
     with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp:
         tmp.write(pdf_bytes)
         tmp_path = tmp.name
 
     try:
-        # Extract text using cascade
         return extract_text_from_pdf(tmp_path, max_pages, use_ocr)
     finally:
-        # Clean up temporary file
         try:
             os.unlink(tmp_path)
-        except Exception as e:
-            logger.warning(f"Failed to delete temp file {tmp_path}: {e}")
+        except Exception as err:
+            logger.warning("Failed to delete temp file %s: %s", tmp_path, err)
 
 
 def render_pdf_pages_to_png_base64(path: str, max_pages: int = 2, dpi: int = 150) -> List[str]:
     """
-    Render first `max_pages` pages of PDF to PNG and return base64 strings (no prefix).
-
-    Used for Vision API fallback when text extraction fails.
-
-    Args:
-        path: Path to PDF file
-        max_pages: Maximum pages to render (default: 2)
-        dpi: DPI for rendering (default: 150, lower quality for API efficiency)
-
-    Returns:
-        List of base64-encoded PNG images (without data URI prefix)
+    Render first `max_pages` pages of a PDF to PNG and return base64-encoded strings.
     """
     doc = fitz.open(path)
     images: List[str] = []
@@ -236,3 +162,20 @@ def render_pdf_pages_to_png_base64(path: str, max_pages: int = 2, dpi: int = 150
     finally:
         doc.close()
     return images
+
+
+def render_pdf_bytes_to_png_base64(pdf_bytes: bytes, max_pages: int = 2, dpi: int = 150) -> List[str]:
+    """
+    Convenience helper: render PDF bytes to PNG (base64) without exposing temp files to callers.
+    """
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+        tmp.write(pdf_bytes)
+        tmp_path = tmp.name
+
+    try:
+        return render_pdf_pages_to_png_base64(tmp_path, max_pages=max_pages, dpi=dpi)
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except Exception as err:  # pragma: no cover - best effort cleanup
+            logger.debug("Failed to cleanup temp PDF %s: %s", tmp_path, err)

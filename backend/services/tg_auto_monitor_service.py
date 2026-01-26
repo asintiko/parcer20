@@ -2,8 +2,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
-from typing import Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from sqlalchemy import func
 from sqlalchemy.orm import Session
@@ -15,6 +16,30 @@ from services.telegram_tdlib_manager import TelegramTDLibManager
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
+
+DEFAULT_RECEIPT_KEYWORDS = {
+    "uzs",
+    "usd",
+    "humo",
+    "uzcard",
+    "oplata",
+    "оплата",
+    "пополнение",
+    "balans",
+    "баланс",
+    "receipt",
+    "chek",
+    "чек",
+    "transfer",
+    "перевод",
+    "payme",
+    "click",
+    "apelsin",
+    "terminal",
+}
+
+MIN_RECEIPT_TEXT_LENGTH = 20
+GROUP_CHAT_TYPES = {"group", "supergroup", "channel"}
 
 
 class TgAutoMonitorService:
@@ -35,6 +60,79 @@ class TgAutoMonitorService:
         self._running = False
         self._tasks: List[asyncio.Task] = []
         self._inflight: Set[Tuple[int, int]] = set()
+
+    def _should_process_message(
+        self,
+        monitor: MonitoredBotChat,
+        message: Dict[str, Any]
+    ) -> bool:
+        """
+        Check if a message passes the PDF/keyword filters before enqueueing.
+        """
+        # Formatted messages (from TDLib manager) already include "document"/"text"
+        doc = message.get("document") or {}
+        if doc.get("mime_type") == "application/pdf":
+            return True
+
+        text = (message.get("text") or "").strip()
+
+        # Fallback for raw TDLib updates (should rarely occur)
+        if not text and "content" in message:
+            content = message.get("content") or {}
+            content_type = content.get("@type", "")
+            if content_type == "messageText":
+                text = content.get("text", {}).get("text", "") or ""
+            elif content_type == "messageDocument":
+                caption = content.get("caption", {}).get("text", "") or ""
+                text = caption
+                doc_obj = content.get("document") or {}
+                if (doc_obj or {}).get("mime_type") == "application/pdf":
+                    return True
+
+        if not text:
+            return False
+
+        text_lower = text.lower()
+        chat_id_val = message.get("chat_id")
+        is_group_chat = (monitor.chat_type or "private") in GROUP_CHAT_TYPES or (chat_id_val is not None and chat_id_val < 0)
+
+        default_hit = len(text_lower) >= MIN_RECEIPT_TEXT_LENGTH and any(
+            kw in text_lower for kw in DEFAULT_RECEIPT_KEYWORDS
+        )
+        if is_group_chat and not default_hit:
+            # Groups can be noisy; require default receipt keywords or PDF
+            return False
+
+        keywords = self._parse_keywords(monitor.filter_keywords)
+        has_keyword = any(kw.lower() in text_lower for kw in keywords) if keywords else False
+
+        if monitor.filter_mode == "blacklist":
+            if not keywords:
+                return default_hit or not is_group_chat
+            return not has_keyword
+
+        if monitor.filter_mode == "whitelist":
+            return has_keyword and (default_hit or not is_group_chat)
+
+        # 'all' mode: allow if either default keywords triggered (for groups) or custom keywords match
+        if not keywords:
+            return True if (default_hit or not is_group_chat) else False
+        return has_keyword
+
+    def _parse_keywords(self, raw_value: Optional[str]) -> List[str]:
+        """Safely parse keywords from JSON or comma-separated strings."""
+        if not raw_value:
+            return []
+        try:
+            payload = json.loads(raw_value)
+            if isinstance(payload, list):
+                return [str(item).strip() for item in payload if str(item).strip()]
+            if isinstance(payload, str):
+                cleaned = payload.strip()
+                return [cleaned] if cleaned else []
+        except Exception:
+            pass
+        return [part.strip() for part in raw_value.split(",") if part.strip()]
 
     async def start(self) -> None:
         if self._running:
@@ -65,6 +163,11 @@ class TgAutoMonitorService:
             with self.session_factory() as db:
                 monitored = db.get(MonitoredBotChat, chat_id)
                 if not monitored or not monitored.enabled:
+                    return
+
+                # Check filters
+                if not self._should_process_message(monitored, message):
+                    logger.debug("Message %s:%s filtered out by %s", chat_id, message_id, monitored.filter_mode)
                     return
         except Exception:
             logger.exception("Monitor check failed for chat %s", chat_id)
@@ -131,27 +234,54 @@ class TgAutoMonitorService:
             await self._catchup_chat(chat.chat_id, chat.last_processed_message_id or 0)
 
     async def _catchup_chat(self, chat_id: int, last_processed_id: int) -> None:
+        """
+        Catch up on missed messages for a chat, applying filters.
+
+        Args:
+            chat_id: Telegram chat ID
+            last_processed_id: Last message ID that was processed
+        """
+        # Get monitor settings for filtering
+        with self.session_factory() as db:
+            monitor = db.get(MonitoredBotChat, chat_id)
+            if not monitor or not monitor.enabled:
+                return
+
         batch = 100
         from_message_id = 0
         collected: List[int] = []
         max_batches = 50
+
         for _ in range(max_batches):
             resp = await self.manager.get_messages(chat_id=chat_id, limit=batch, from_message_id=from_message_id)
             items = resp.get("items") or []
             if not items:
                 break
+
             ids = [m.get("id") for m in items if m and m.get("id")]
             if not ids:
                 break
-            for mid in ids:
-                if mid > last_processed_id:
+
+            # Filter messages and collect IDs that should be processed
+            for msg in items:
+                mid = msg.get("id")
+                if not mid or mid <= last_processed_id:
+                    continue
+
+                # Check filters before adding to queue
+                if self._should_process_message(monitor, msg):
                     collected.append(mid)
+                else:
+                    logger.debug("Catchup: Message %s:%s filtered out by %s", chat_id, mid, monitor.filter_mode)
+
             oldest_id = min(ids)
             if oldest_id <= last_processed_id or len(items) < batch:
                 break
             from_message_id = oldest_id
+
         if not collected:
             return
+
         for mid in sorted(set(collected)):
             if mid > last_processed_id:
                 self._enqueue(chat_id, mid)

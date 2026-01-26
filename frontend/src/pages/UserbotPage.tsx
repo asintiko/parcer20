@@ -24,7 +24,7 @@ import {
 import {
     telegramClientApi,
     TelegramAuthStatus,
-    TelegramBotChat,
+    TelegramChat,
     TelegramChatMessage,
     TelegramProcessResult,
     API_BASE_URL,
@@ -80,17 +80,42 @@ export const UserbotPage: React.FC = () => {
     const [selectedChatId, setSelectedChatId] = useState<number | null>(null);
     const [search, setSearch] = useState('');
     const [showHidden, setShowHidden] = useState(false);
+    // Backend expects TDLib types: private, group, supergroup, channel
+    const [selectedTypes, setSelectedTypes] = useState<Set<string>>(new Set(['private', 'group', 'supergroup', 'channel']));
+    const [keepSelection, setKeepSelection] = useState<Set<number>>(new Set());
     const [composer, setComposer] = useState('');
     const [pdfFile, setPdfFile] = useState<File | null>(null);
     const [authForm, setAuthForm] = useState({ phone: '', code: '', password: '' });
     const [messagesState, setMessagesState] = useState<TelegramChatMessage[]>([]);
     const [selectedMessageIds, setSelectedMessageIds] = useState<Set<number>>(new Set());
     const [statuses, setStatuses] = useState<Record<number, TelegramProcessResult>>({});
-    const [liveRefresh, setLiveRefresh] = useState(false);
+    // Deprecated local polling toggle; server monitor toggle is used now.
+    const [liveRefresh] = useState(true);
     const [previewUrl, setPreviewUrl] = useState<string | null>(null);
     const [processingId, setProcessingId] = useState<number | null>(null);
     const [batchProcessing, setBatchProcessing] = useState(false);
     const messagesScrollRef = useRef<HTMLDivElement | null>(null);
+
+    const chatTypeLabel: Record<string, string> = useMemo(
+        () => ({
+            bot: 'Бот',
+            user: 'Пользователь',
+            group: 'Группа',
+            supergroup: 'Супергруппа',
+            channel: 'Канал',
+        }),
+        []
+    );
+
+    const chatTypeOptions = useMemo(
+        () => [
+            { id: 'private', label: 'Боты' },
+            { id: 'group', label: 'Группы' },
+            { id: 'supergroup', label: 'Супергруппы' },
+            { id: 'channel', label: 'Каналы' },
+        ],
+        []
+    );
 
     const { data: authStatus, isLoading: authLoading, refetch: refetchStatus } = useQuery<TelegramAuthStatus>({
         queryKey: ['tg-status'],
@@ -99,13 +124,14 @@ export const UserbotPage: React.FC = () => {
     });
 
     const chatsQuery = useQuery({
-        queryKey: ['tg-chats', search, showHidden],
+        queryKey: ['tg-chats', search, showHidden, Array.from(selectedTypes).sort().join(',')],
         queryFn: () =>
             telegramClientApi.getChats({
                 search: search || undefined,
                 include_hidden: showHidden,
-                limit: 50,
+                limit: 200,
                 offset: 0,
+                chat_types: Array.from(selectedTypes).join(','),
             }),
         enabled: authStatus?.state === 'ready',
     });
@@ -122,6 +148,19 @@ export const UserbotPage: React.FC = () => {
         queryFn: telegramClientApi.getMonitorStatus,
         enabled: authStatus?.state === 'ready',
         refetchInterval: (query) => (query.state.data?.running ? 7000 : 12000),
+    });
+
+    const monitorToggleMutation = useMutation({
+        mutationFn: (payload: { chatId: number; enabled: boolean }) =>
+            telegramClientApi.setMonitor(payload.chatId, payload.enabled, !payload.enabled ? false : true),
+        onSuccess: async () => {
+            await Promise.all([
+                queryClient.invalidateQueries({ queryKey: ['tg-chats'] }),
+                queryClient.invalidateQueries({ queryKey: ['tg-monitor-status'] }),
+            ]);
+            showToast('success', 'Статус серверного монитора обновлён');
+        },
+        onError: () => showToast('error', 'Не удалось изменить мониторинг чата'),
     });
 
     useEffect(() => {
@@ -231,6 +270,30 @@ export const UserbotPage: React.FC = () => {
         el.scrollTop = el.scrollHeight;
     }, [messagesState.length, selectedChatId]);
 
+    const toggleType = (typeId: string) => {
+        setSelectedTypes((prev) => {
+            const next = new Set(prev);
+            if (next.has(typeId)) {
+                next.delete(typeId);
+            } else {
+                next.add(typeId);
+            }
+            return next.size === 0 ? prev : next;
+        });
+    };
+
+    const toggleKeepChat = (chatId: number) => {
+        setKeepSelection((prev) => {
+            const next = new Set(prev);
+            if (next.has(chatId)) {
+                next.delete(chatId);
+            } else {
+                next.add(chatId);
+            }
+            return next;
+        });
+    };
+
     const toggleSelectMessage = (id?: number) => {
         if (id === undefined || id === null) return;
         setSelectedMessageIds((prev) => {
@@ -269,6 +332,21 @@ export const UserbotPage: React.FC = () => {
             showToast('success', 'Пароль принят');
         },
         onError: () => showToast('error', 'Пароль не принят'),
+    });
+
+    const bulkKeepMutation = useMutation({
+        mutationFn: async (keepIds: number[]) => {
+            const allIds = (chatsQuery.data?.items || []).map((c) => c.chat_id);
+            const toHide = allIds.filter((id) => !keepIds.includes(id));
+            if (!toHide.length) return;
+            await Promise.all(toHide.map((id) => telegramClientApi.hideChat(id)));
+        },
+        onSuccess: async () => {
+            setKeepSelection(new Set());
+            await queryClient.invalidateQueries({ queryKey: ['tg-chats'] });
+            showToast('success', 'Оставили выбранные, остальные скрыты');
+        },
+        onError: () => showToast('error', 'Не удалось применить выбор'),
     });
 
     const hideChatMutation = useMutation({
@@ -573,9 +651,9 @@ export const UserbotPage: React.FC = () => {
                             <Bot className="w-6 h-6" />
                         </div>
                         <div>
-                            <h1 className="text-2xl font-semibold text-foreground">Telegram Bots</h1>
+                            <h1 className="text-2xl font-semibold text-foreground">Telegram Chats</h1>
                             <p className="text-sm text-foreground-secondary">
-                                TDLib-клиент для ботов: авторизация, список чатов, сообщения и скрытие диалогов.
+                                TDLib-клиент для ботов и групп: авторизация, список чатов, сообщения и скрытие диалогов.
                             </p>
                         </div>
                     </div>
@@ -622,7 +700,7 @@ export const UserbotPage: React.FC = () => {
                                 <div className="flex items-center justify-between">
                                     <div className="flex items-center gap-2">
                                         <MessageSquare className="w-5 h-5 text-foreground-secondary" />
-                                        <h2 className="text-sm font-semibold text-foreground">Боты</h2>
+                                        <h2 className="text-sm font-semibold text-foreground">Чаты (боты и группы)</h2>
                                     </div>
                                     <label className="flex items-center gap-2 text-xs text-foreground-secondary cursor-pointer">
                                         <input
@@ -640,9 +718,45 @@ export const UserbotPage: React.FC = () => {
                                         type="text"
                                         value={search}
                                         onChange={(e) => setSearch(e.target.value)}
-                                        placeholder="Поиск ботов"
+                                        placeholder="Поиск чатов"
                                         className="w-full pl-9 pr-3 py-2 border border-border rounded-lg focus:ring-2 focus:ring-primary focus:border-transparent bg-input-bg text-input-text"
                                     />
+                                </div>
+                                <div className="flex flex-wrap gap-2">
+                                    {chatTypeOptions.map((opt) => {
+                                        const active = selectedTypes.has(opt.id);
+                                        return (
+                                            <button
+                                                key={opt.id}
+                                                onClick={() => toggleType(opt.id)}
+                                                className={`px-3 py-1.5 rounded-md text-xs border transition-colors ${
+                                                    active
+                                                        ? 'border-primary bg-primary/10 text-primary'
+                                                        : 'border-border text-foreground-secondary hover:bg-surface-2'
+                                                }`}
+                                            >
+                                                {opt.label}
+                                            </button>
+                                        );
+                                    })}
+                                </div>
+                                <div className="flex items-center gap-2 flex-wrap">
+                                    <button
+                                        onClick={() => bulkKeepMutation.mutate(Array.from(keepSelection))}
+                                        disabled={!keepSelection.size || bulkKeepMutation.isPending}
+                                        className={`px-3 py-1.5 rounded-md text-xs border transition-colors ${
+                                            keepSelection.size
+                                                ? 'border-primary bg-primary/10 text-primary hover:bg-primary/15'
+                                                : 'border-border text-foreground-secondary bg-surface-2 cursor-not-allowed'
+                                        }`}
+                                    >
+                                        {bulkKeepMutation.isPending ? 'Применяем...' : 'Оставить выбранные (скрыть остальные)'}
+                                    </button>
+                                    {keepSelection.size > 0 && (
+                                        <span className="text-xs text-foreground-secondary">
+                                            Выбрано {keepSelection.size}
+                                        </span>
+                                    )}
                                 </div>
                             </div>
 
@@ -662,7 +776,7 @@ export const UserbotPage: React.FC = () => {
                                 )}
 
                                 <div className="divide-y divide-border">
-                                    {chatsQuery.data?.items.map((chat: TelegramBotChat) => (
+                                    {chatsQuery.data?.items.map((chat: TelegramChat) => (
                                         <button
                                             key={chat.chat_id}
                                             onClick={() => setSelectedChatId(chat.chat_id)}
@@ -675,7 +789,19 @@ export const UserbotPage: React.FC = () => {
                                             <div className="flex items-start justify-between gap-2">
                                                 <div className="flex-1">
                                                     <div className="flex items-center gap-2">
+                                                        <input
+                                                            type="checkbox"
+                                                            checked={keepSelection.has(chat.chat_id)}
+                                                            onChange={(e) => {
+                                                                e.stopPropagation();
+                                                                toggleKeepChat(chat.chat_id);
+                                                            }}
+                                                            className="w-4 h-4 text-primary border-border rounded focus:ring-primary"
+                                                        />
                                                         <span className="text-sm font-semibold text-foreground">{chat.title}</span>
+                                                        <span className="text-[11px] px-2 py-0.5 rounded-full bg-surface-2 border border-border text-foreground-secondary">
+                                                            {chatTypeLabel[chat.chat_type] || chat.chat_type}
+                                                        </span>
                                                         {chat.is_hidden && (
                                                             <span className="text-[11px] px-2 py-0.5 rounded-full bg-border text-foreground-secondary">
                                                                 скрыт
@@ -688,7 +814,7 @@ export const UserbotPage: React.FC = () => {
                                                         )}
                                                     </div>
                                                     <div className="text-xs text-foreground-secondary">
-                                                        @{chat.username || 'bot'}
+                                                        {chat.username ? `@${chat.username}` : chatTypeLabel[chat.chat_type] || '—'}
                                                     </div>
                                                     {chat.last_message?.text && (
                                                         <div className="text-xs text-foreground-muted mt-1 overflow-hidden text-ellipsis max-h-10">
@@ -737,28 +863,36 @@ export const UserbotPage: React.FC = () => {
                                         <h2 className="text-sm font-semibold text-foreground">
                                             {currentChat ? currentChat.title : 'Выберите чат'}
                                         </h2>
-                                        {currentChat?.monitor_enabled && (
-                                            <span className="text-[11px] px-2 py-0.5 rounded-full bg-success/10 text-success border border-success/30 flex items-center gap-1">
-                                                <BadgeCheck className="w-3 h-3" /> серверный монитор
-                                            </span>
-                                        )}
+                                            {currentChat?.monitor_enabled && (
+                                                <span className="text-[11px] px-2 py-0.5 rounded-full bg-success/10 text-success border border-success/30 flex items-center gap-1">
+                                                    <BadgeCheck className="w-3 h-3" /> серверный монитор
+                                                </span>
+                                            )}
                                     </div>
                                     <div className="text-xs text-foreground-secondary">
-                                        {currentChat ? `@${currentChat.username || 'bot'}` : 'Нет выбранного диалога'}
+                                        {currentChat
+                                            ? currentChat.username
+                                                ? `@${currentChat.username}`
+                                                : chatTypeLabel[currentChat.chat_type] || '—'
+                                            : 'Нет выбранного диалога'}
                                     </div>
                                 </div>
                                 {currentChat && (
                                     <div className="flex items-center gap-2 flex-wrap justify-end">
                                         <button
-                                            onClick={() => setLiveRefresh((v) => !v)}
+                                            onClick={() => {
+                                                if (!currentChat) return;
+                                                const enable = !currentChat.monitor_enabled;
+                                                monitorToggleMutation.mutate({ chatId: currentChat.chat_id, enabled: enable });
+                                            }}
                                             className={`flex items-center gap-2 px-3 py-2 rounded-md text-xs border ${
-                                                liveRefresh
-                                                    ? 'border-primary text-primary bg-primary/10'
+                                                currentChat?.monitor_enabled
+                                                    ? 'border-success text-success bg-success/10'
                                                     : 'border-border text-foreground-secondary hover:bg-surface-2'
                                             }`}
                                         >
-                                            {liveRefresh ? <Pause className="w-4 h-4" /> : <Play className="w-4 h-4" />}
-                                            {liveRefresh ? 'Live обновление вкл' : 'Live обновление'}
+                                            {currentChat?.monitor_enabled ? <Pause className="w-4 h-4" /> : <Play className="w-4 h-4" />}
+                                            {currentChat?.monitor_enabled ? 'Серверный монитор вкл' : 'Включить монитор' }
                                         </button>
                                         <button
                                             onClick={() => messagesQuery.refetch()}

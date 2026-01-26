@@ -213,12 +213,16 @@ class ParserOrchestrator:
     def _extract_receiver_card(self, text: str) -> Optional[str]:
         """Extract receiver card last 4 digits from receipt text"""
         patterns = [
-            r'(?:Receiver\s+card|Receiver|Получатель|Карта\s+получателя)\s*:?\s*\**(\d{4})',
-            r'(?:на\s+карту|to\s+card)\s*:?\s*\**(\d{4})',
-            r'(?:Receiver)\s*[:\s]+\**(\d{4})',
+            r'(?:Receiver\s+card|Receiver|Получатель|Карта\s+получателя)\s*:?\s*([^\n\r]+)',
+            r'(?:на\s+карту|to\s+card)\s*:?\s*([^\n\r]+)',
         ]
         for pattern in patterns:
             match = re.search(pattern, text, re.IGNORECASE)
             if match:
-                return match.group(1)
+                raw_value = match.group(1).strip()
+                digits = re.sub(r'\D', '', raw_value)
+                if digits:
+                    return digits[-4:]
+                if raw_value:
+                    return raw_value[:4]
         return None

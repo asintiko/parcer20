@@ -216,6 +216,8 @@ async def process_tdlib_message(
         is_p2p=parsed_is_p2p if parsed_is_p2p is not None else "P2P" in operator_raw.upper(),
         transaction_type=txn_type,
         currency=currency,
+        receiver_name=parsed.get("receiver_name"),
+        receiver_card=parsed.get("receiver_card"),
         source_type="AUTO",
         raw_message=raw_text_for_parser,
         parsing_method=parsed.get("parsing_method"),

@@ -398,17 +398,17 @@ class TelegramTDLibManager:
             "is_bot": user.get("type", {}).get("@type") == "userTypeBot",
         }
 
-    async def list_bot_chats(
+    async def list_chats(
         self,
         db: Session,
         include_hidden: bool = False,
         search: Optional[str] = None,
         limit: int = 50,
         offset: int = 0,
-        chat_types: Optional[List[str]] = None,  # NEW: ['private', 'group', 'supergroup']
+        chat_types: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """
-        List Telegram chats (bots and/or groups).
+        List Telegram chats (bots, groups, supergroups, channels).
 
         Args:
             db: Database session
@@ -416,13 +416,12 @@ class TelegramTDLibManager:
             search: Search query for chat titles
             limit: Maximum number of chats to return
             offset: Number of chats to skip
-            chat_types: List of chat types to include: ['private', 'group', 'supergroup', 'channel']
-                        If None, defaults to ['private'] (only bots, backward compatible)
+            chat_types: List of chat types to include; defaults to ['private', 'group', 'supergroup', 'channel']
 
         Returns:
             Dict with 'total' count and 'items' list of chat info
         """
-        limit = min(max(limit, 1), 200)
+        limit = min(max(limit, 1), 500)
         offset = max(offset, 0)
 
         hidden_ids = {row[0] for row in db.query(HiddenBotChat.chat_id).all()}
@@ -430,7 +429,7 @@ class TelegramTDLibManager:
         chats = await self._fetch_bot_chats(
             search=search,
             limit=limit + offset,
-            allowed_types=chat_types
+            allowed_types=chat_types or ["private", "group", "supergroup", "channel"]
         )
 
         filtered: List[Dict[str, Any]] = []
@@ -445,6 +444,36 @@ class TelegramTDLibManager:
         total = len(filtered)
         sliced = filtered[offset : offset + limit]
         return {"total": total, "items": sliced}
+
+    async def list_bot_chats(
+        self,
+        db: Session,
+        include_hidden: bool = False,
+        search: Optional[str] = None,
+        limit: int = 50,
+        offset: int = 0,
+        chat_types: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Legacy helper that restricts to private chats (bots) only.
+        """
+        return await self.list_chats(
+            db=db,
+            include_hidden=include_hidden,
+            search=search,
+            limit=limit,
+            offset=offset,
+            chat_types=chat_types or ["private"]
+        )
+
+    async def get_chat_info(self, chat_id: int, allowed_types: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
+        """
+        Public wrapper around internal chat fetcher to reuse type-mapping logic.
+        """
+        return await self._get_chat_info(
+            chat_id=chat_id,
+            allowed_types=allowed_types or ["private", "group", "supergroup", "channel"]
+        )
 
     async def _fetch_bot_chats(
         self,

@@ -73,7 +73,7 @@ class ChatMessage(BaseModel):
     document: Optional[Dict[str, Any]] = None
 
 
-class BotChat(BaseModel):
+class ChatItem(BaseModel):
     chat_id: int
     title: str
     username: Optional[str] = None
@@ -87,7 +87,7 @@ class BotChat(BaseModel):
 
 class ChatListResponse(BaseModel):
     total: int
-    items: List[BotChat]
+    items: List[ChatItem]
 
 
 class MonitoredChat(BaseModel):
@@ -234,11 +234,40 @@ async def update_monitor(
     manager: TelegramTDLibManager = Depends(tdlib_manager_dep),
     current_user: dict = Depends(get_current_user),
 ):
+    """
+    Create or update monitor settings for a chat.
+
+    Args:
+        chat_id: Telegram chat ID
+        payload: Monitor configuration including filtering rules
+    """
+    import json
+
     row = db.get(MonitoredBotChat, chat_id)
     if row is None:
         row = MonitoredBotChat(chat_id=chat_id)
         db.add(row)
+
     row.enabled = payload.enabled
+
+    # Update filter settings
+    row.filter_mode = payload.filter_mode
+    if payload.filter_keywords:
+        row.filter_keywords = json.dumps(payload.filter_keywords, ensure_ascii=False)
+    else:
+        row.filter_keywords = None
+
+    # Cache chat type/title for downstream filtering (groups vs bots)
+    if payload.enabled:
+        try:
+            info = await manager.get_chat_info(chat_id)
+            if info:
+                row.chat_type = info.get("chat_type", row.chat_type)
+                row.chat_title = info.get("title", row.chat_title)
+        except Exception as exc:  # noqa: BLE001
+            # Non-fatal; just log for debugging
+            print(f"Failed to fetch chat info for monitor {chat_id}: {exc}")
+
     if payload.enabled and payload.start_from_latest:
         try:
             msgs = await manager.get_messages(chat_id=chat_id, limit=1, from_message_id=0)
@@ -247,6 +276,7 @@ async def update_monitor(
                 row.last_processed_message_id = latest[0].get("id") or row.last_processed_message_id or 0
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(status_code=400, detail=f"Failed to fetch latest message: {exc}")
+
     db.commit()
     db.refresh(row)
     return MonitoredChat(
@@ -337,9 +367,9 @@ async def check_password(
 async def list_chats(
     search: Optional[str] = Query(None, description="Server-side search term"),
     include_hidden: bool = Query(False, description="Include hidden chats"),
-    limit: int = Query(50, ge=1, le=200),
+    limit: int = Query(200, ge=1, le=500),
     offset: int = Query(0, ge=0),
-    chat_types: str = Query("private", description="Comma-separated chat types: private,group,supergroup,channel"),
+    chat_types: str = Query("private,group,supergroup,channel", description="Comma-separated chat types: private,group,supergroup,channel"),
     db: Session = Depends(get_db_session),
     manager: TelegramTDLibManager = Depends(tdlib_manager_dep),
     current_user: dict = Depends(get_current_user),
@@ -359,7 +389,7 @@ async def list_chats(
 
     monitors = {row.chat_id: row for row in db.query(MonitoredBotChat).all()}
     try:
-        result = await manager.list_bot_chats(
+        result = await manager.list_chats(
             db=db,
             include_hidden=include_hidden,
             search=search,
@@ -374,7 +404,7 @@ async def list_chats(
     return ChatListResponse(
         total=result.get("total", 0),
         items=[
-            BotChat(
+            ChatItem(
                 chat_id=item.get("chat_id"),
                 title=item.get("title", ""),
                 username=item.get("username"),

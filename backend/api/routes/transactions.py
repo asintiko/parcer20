@@ -401,7 +401,7 @@ class TransactionUpdateRequest(BaseModel):
     balance_after: Optional[Decimal] = None
     card_last_4: Optional[str] = Field(None, pattern=r'^\d{4}$')
     receiver_name: Optional[str] = Field(None, max_length=255)
-    receiver_card: Optional[str] = Field(None, pattern=r'^\d{4}$')
+    receiver_card: Optional[str] = Field(None, pattern=r'^\d{4,32}$')
     transaction_type: Optional[str] = Field(None, pattern=r'^(DEBIT|CREDIT|CONVERSION|REVERSAL)$')
     currency: Optional[str] = Field(None, pattern=r'^(UZS|USD)$')
     source_type: Optional[str] = Field(None, pattern=r'^(AUTO|MANUAL)$')
@@ -475,7 +475,7 @@ class TransactionCreateRequest(BaseModel):
     balance: Optional[Decimal] = None
     is_p2p: Optional[bool] = False
     receiver_name: Optional[str] = Field(None, max_length=255)
-    receiver_card: Optional[str] = Field(None, pattern=r'^\d{4}$')
+    receiver_card: Optional[str] = Field(None, pattern=r'^\d{4,32}$')
     raw_text: Optional[str] = None
 
 

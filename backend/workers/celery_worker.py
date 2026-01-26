@@ -3,17 +3,19 @@ Celery worker for async receipt processing (checks table)
 """
 import os
 import json
+import logging
 import re
 from datetime import datetime
 from decimal import Decimal
 
 import pytz
 import httpx
-import fitz  # PyMuPDF
 from celery import Celery
 from dotenv import load_dotenv
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 # Celery configuration
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
@@ -89,7 +91,7 @@ def normalize_amount_positive(value) -> Decimal:
     return abs(Decimal(value))
 
 
-def download_pdf_text(file_id: int) -> str:
+def download_pdf_text(file_id: int, return_bytes: bool = False):
     """
     Download PDF via internal backend endpoint and extract text with OCR fallback.
     Uses cascade: PyMuPDF → pdfplumber → OCR (Tesseract).
@@ -110,7 +112,11 @@ def download_pdf_text(file_id: int) -> str:
         # Return what we have - don't fail, Vision API can handle images later if needed
 
     # Limit to 20k chars for API efficiency
-    return text[:20000] if len(text) > 20000 else text
+    text = text[:20000] if len(text) > 20000 else text
+
+    if return_bytes:
+        return text, pdf_bytes
+    return text
 
 
 def queue_receipt_task(task_data: dict) -> str:
@@ -248,34 +254,48 @@ def process_receipt_task(self, task_data_json: str):
                         }
 
             orchestrator = ParserOrchestrator(db)
+            gpt_parser = orchestrator.gpt_parser
+            raw_text = raw_text_original or ""
+            parsed_data = None
+            pdf_bytes = b""
+
             # Handle PDF documents
-            raw_text = raw_text_original
-            if document and document.get('mime_type') == 'application/pdf' and document.get('file_id'):
+            is_pdf = document and document.get('mime_type') == 'application/pdf' and document.get('file_id')
+            if is_pdf:
                 try:
-                    pdf_text = download_pdf_text(int(document['file_id']))
+                    pdf_text, pdf_bytes = download_pdf_text(int(document['file_id']), return_bytes=True)
                 except Exception as e:
                     if tracking:
                         tracking.status = 'failed'
                         tracking.error = f"PDF download/extract failed: {e}"
                         db.commit()
                     raise
-                if not pdf_text:
-                    if tracking:
-                        tracking.status = 'failed'
-                        tracking.error = "PDF has no text layer"
-                        db.commit()
-                    log = ParsingLog(
-                        raw_message=raw_text_original,
-                        success=False,
-                        error_message="PDF has no text layer",
-                        processing_time_ms=int((datetime.now() - start_time).total_seconds() * 1000)
-                    )
-                    db.add(log)
-                    db.commit()
-                    return {'success': False, 'error': 'PDF has no text layer'}
-                raw_text = (raw_text_original + "\n\n" + pdf_text).strip()
 
-            parsed_data = orchestrator.process(raw_text)
+                raw_text_parts = [part for part in [raw_text_original, pdf_text] if part]
+                raw_text = "\n\n".join(raw_text_parts).strip()
+
+            # Text-first parsing
+            if raw_text:
+                parsed_data = orchestrator.process(raw_text)
+
+            # Vision fallback for PDFs when text parsing failed or text is too weak
+            if is_pdf and (not parsed_data or len(raw_text.strip()) < 40):
+                if gpt_parser and getattr(gpt_parser, "enabled", False) and pdf_bytes:
+                    try:
+                        from parsers.pdf_extractor import render_pdf_bytes_to_png_base64
+
+                        images_b64 = render_pdf_bytes_to_png_base64(pdf_bytes, max_pages=2, dpi=170)
+                        caption_text = (document.get("caption") or raw_text_original or "").strip()
+                        parsed_data = gpt_parser.parse_from_images(images_b64, caption_text)
+                        if parsed_data:
+                            parsed_data.setdefault("parsing_method", "GPT_VISION")
+                            parsed_data["is_gpt_parsed"] = True
+                            if not raw_text:
+                                raw_text = caption_text or "[vision parsed PDF]"
+                    except Exception as vision_err:
+                        logger.warning("Vision fallback failed for PDF %s: %s", document.get("file_id"), vision_err)
+                else:
+                    logger.info("Vision fallback skipped: GPT parser unavailable or pdf bytes missing")
 
             processing_time = int((datetime.now() - start_time).total_seconds() * 1000)
             
@@ -374,6 +394,8 @@ def process_receipt_task(self, task_data_json: str):
                 card_last_4=str(card_last4)[-4:] if card_last4 else None,
                 operator_raw=operator,
                 application_mapped=app_name,
+                receiver_name=parsed_data.get('receiver_name'),
+                receiver_card=parsed_data.get('receiver_card'),
                 transaction_type=transaction_type,
                 balance_after=balance,
                 is_p2p=is_p2p,

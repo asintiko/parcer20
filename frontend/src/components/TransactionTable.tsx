@@ -454,7 +454,7 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
                 accessorKey: 'receiver_name',
                 id: 'receiver_name',
                 header: 'Получатель',
-                size: 180,
+                size: 200,
                 cell: (info) => (
                     <div className="truncate text-table-xs" title={info.getValue() as string}>
                         {info.getValue() as string || '—'}
@@ -465,7 +465,7 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
                 accessorKey: 'receiver_card',
                 id: 'receiver_card',
                 header: 'Карта получателя',
-                size: 60,
+                size: 140,
                 cell: (info) => (
                     <div className="font-mono text-table-xs">
                         {info.getValue() as string || '—'}
@@ -605,12 +605,21 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
         ],
     }), []);
 
+    const ensureColumnOrderComplete = useCallback((order: string[]) => {
+        const allIds = columns.map(c => c.id as string);
+        const filtered = order.filter((id) => allIds.includes(id));
+        const missing = allIds.filter((id) => !filtered.includes(id));
+        return [...filtered, ...missing];
+    }, [columns]);
+
     // Initial load column order
     React.useEffect(() => {
         if (columnOrder.length === 0) {
             setColumnOrder(columns.map(c => c.id as string));
+        } else {
+            setColumnOrder(prev => ensureColumnOrderComplete(prev));
         }
-    }, [columns, columnOrder.length]);
+    }, [columns, columnOrder.length, ensureColumnOrderComplete]);
 
     // Apply default preset on mount
     React.useEffect(() => {
@@ -628,7 +637,7 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
             if (!raw) return;
             const stored = JSON.parse(raw);
             if (stored.sorting) setSorting(stored.sorting);
-            if (stored.columnOrder) setColumnOrder(stored.columnOrder);
+            if (stored.columnOrder) setColumnOrder(ensureColumnOrderComplete(stored.columnOrder));
             if (stored.columnVisibility) setColumnVisibility(ensureLockedVisibility(stored.columnVisibility));
             if (stored.columnSizing) setColumnSizing(stored.columnSizing);
             if (stored.density) setDensity(stored.density);
@@ -677,7 +686,14 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
         columnResizeMode: 'onChange',
         onSortingChange: setSorting,
         onColumnFiltersChange: setColumnFilters,
-        onColumnOrderChange: setColumnOrder,
+        onColumnOrderChange: (updater) => {
+            setColumnOrder((prev) => {
+                const next = typeof updater === 'function'
+                    ? (updater as (old: string[]) => string[])(prev)
+                    : updater;
+                return ensureColumnOrderComplete(next);
+            });
+        },
         onColumnVisibilityChange: setColumnVisibility,
         onColumnSizingChange: setColumnSizing,
         onPaginationChange: (updater) => {

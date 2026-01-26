@@ -94,13 +94,14 @@ npm run dev
 - Overscan is set to `10` rows; tune `overscan` in the `useVirtualizer` config for smoother scroll on slow machines (higher = fewer reflows, lower = less work per scroll).
 - A dev-only guard logs a warning if a large dataset (>2000 rows) ever renders without virtualization.
 
-### Telegram TDLib Client (bots-only)
+### Telegram TDLib Client (bots + groups)
 
 The `/userbot` page is now a native React UI powered by a server-side TDLib client. No iframe/WebK is used.
 
-- Backend exposes `/api/tg/*` for auth (phone → code → password), bot-only chats, hide/unhide, history, and send.
+- Backend exposes `/api/tg/*` for auth (phone → code → password), chat listing (bots + groups/channels), hide/unhide, history, and send.
 - TDLib session is stored under `sessions/tdlib` (see `docs/telegram-tdlib-deploy.md`).
 - Frontend relies on the new API; hidden chats are persisted in Postgres.
+- PDF чеки из групп обрабатываются через общий каскад `pdfplumber → PyMuPDF → Tesseract` с GPT Vision fallback; системные зависимости (tesseract-ocr, poppler-utils) уже установлены в `backend/Dockerfile`.
 
 ## Configuration
 

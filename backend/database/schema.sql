@@ -23,6 +23,8 @@ CREATE TABLE IF NOT EXISTS transactions (
     card_last_4 VARCHAR(4),
     operator_raw TEXT,
     application_mapped VARCHAR(100),
+    receiver_name VARCHAR(255),
+    receiver_card VARCHAR(32),
     transaction_type VARCHAR(20) CHECK (transaction_type IN ('DEBIT', 'CREDIT', 'CONVERSION', 'REVERSAL')) NOT NULL,
     balance_after NUMERIC(18, 2),
     
@@ -30,7 +32,7 @@ CREATE TABLE IF NOT EXISTS transactions (
     parsed_at TIMESTAMPTZ DEFAULT NOW() NOT NULL,
     is_gpt_parsed BOOLEAN DEFAULT FALSE,
     parsing_confidence FLOAT CHECK (parsing_confidence >= 0 AND parsing_confidence <= 1),
-    parsing_method VARCHAR(20) CHECK (parsing_method IN ('REGEX_HUMO', 'REGEX_SMS', 'REGEX_SEMICOLON', 'GPT')),
+    parsing_method VARCHAR(20) CHECK (parsing_method IN ('REGEX_HUMO', 'REGEX_SMS', 'REGEX_SEMICOLON', 'REGEX_CARDXABAR', 'REGEX_TRANSFER', 'GPT', 'GPT_VISION')),
     
     -- Indexing for common queries
     created_at TIMESTAMPTZ DEFAULT NOW() NOT NULL,
@@ -43,6 +45,8 @@ CREATE INDEX idx_transactions_card ON transactions(card_last_4) WHERE card_last_
 CREATE INDEX idx_transactions_app ON transactions(application_mapped) WHERE application_mapped IS NOT NULL;
 CREATE INDEX idx_transactions_source ON transactions(source_type, source_chat_id);
 CREATE INDEX idx_transactions_parsed_at ON transactions(parsed_at DESC);
+CREATE INDEX idx_transactions_receiver_card ON transactions(receiver_card) WHERE receiver_card IS NOT NULL;
+CREATE INDEX idx_transactions_receiver_name ON transactions(receiver_name) WHERE receiver_name IS NOT NULL;
 
 -- Table: operator_mappings
 -- Stores mapping rules from raw operator names to application names

@@ -610,10 +610,12 @@ export interface TelegramChatMessage {
     } | null;
 }
 
-export interface TelegramBotChat {
+export interface TelegramChat {
     chat_id: number;
     title: string;
     username?: string;
+    chat_type: string; // 'bot', 'user', 'group', 'supergroup', 'channel'
+    member_count?: number; // For groups and channels
     is_hidden: boolean;
     is_monitored?: boolean;
     monitor_enabled?: boolean;
@@ -622,7 +624,7 @@ export interface TelegramBotChat {
 
 export interface TelegramChatListResponse {
     total: number;
-    items: TelegramBotChat[];
+    items: TelegramChat[];
 }
 
 export interface TelegramMessagesResponse {
@@ -680,7 +682,7 @@ export const telegramClientApi = {
         return response.data;
     },
 
-    getChats: async (params: { search?: string; include_hidden?: boolean; limit?: number; offset?: number }): Promise<TelegramChatListResponse> => {
+    getChats: async (params: { search?: string; include_hidden?: boolean; limit?: number; offset?: number; chat_types?: string }): Promise<TelegramChatListResponse> => {
         const response = await apiClient.get<TelegramChatListResponse>('/api/tg/chats', { params });
         return response.data;
     },

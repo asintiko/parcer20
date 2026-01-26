@@ -1,3 +1,17 @@
+# Implementation Summary (2026-01-26) — OCR pipeline & TG groups
+
+## Что сделано
+- **PDF → текст с OCR:** общий модуль `backend/parsers/pdf_extractor.py` теперь умеет извлекать текст через pdfplumber → PyMuPDF → Tesseract (pdf2image) и рендерить страницы из байт. Celery-worker использует тот же каскад и больше не падает из-за отсутствия текстового слоя; при пустом тексте пробует GPT Vision на скриншотах PDF (если ключ настроен).
+- **Автомониторинг групп:** фильтрует шум в группах — пропускает только PDF или сообщения с ключевыми словами (UZS/USD/HUMO/оплата/баланс/пополнение и т.д., длина > 20). Тип чата сохраняется при включении мониторинга.
+- **Список чатов:** `/api/tg/chats` возвращает ботов и группы (chat_type, username). В UI страница userbot показывает тип чата, добавлен фильтр по типам (бот/группа/канал) и поиск по названию.
+- **Получатель в транзакциях:** поля `receiver_name` и `receiver_card` прокинуты во все ответы/таблицу/экспорт (см. `TransactionTable`, `excelExport`, API).
+
+## Как включить OCR локально
+- Python зависимости: `pdfplumber`, `pdf2image`, `pytesseract`, `PyMuPDF` (есть в `backend/requirements.txt`).
+- Системные пакеты: `tesseract-ocr`, языковые модели `tesseract-ocr-rus`, `tesseract-ocr-eng`, и `poppler-utils` для `pdf2image` (добавлены в `backend/Dockerfile`). На локальной машине установите аналоги через пакетный менеджер OS.
+
+---
+
 # Telegram Web K - Отчёт по реализации
 
 ## Задача 1: Полное удаление поисковой строки ✅
@@ -212,4 +226,3 @@ appImManager.managers.appUsersManager.isBot(userId)
 
 Дата создания: 8 января 2026
 Версия: 1.0
-

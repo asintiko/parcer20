@@ -40,7 +40,7 @@ class Transaction(Base):
 
     # Receiver fields (for P2P transfers)
     receiver_name = Column(String(255))
-    receiver_card = Column(String(4))
+    receiver_card = Column(String(32))
 
     # Metadata
     parsed_at = Column(DateTime(timezone=False), server_default=func.now(), nullable=False)
@@ -63,7 +63,7 @@ class Transaction(Base):
             name='check_confidence_range'
         ),
         CheckConstraint(
-            "parsing_method IN ('REGEX_HUMO', 'REGEX_SMS', 'REGEX_SEMICOLON', 'REGEX_CARDXABAR', 'GPT')",
+            "parsing_method IN ('REGEX_HUMO', 'REGEX_SMS', 'REGEX_SEMICOLON', 'REGEX_CARDXABAR', 'REGEX_TRANSFER', 'GPT', 'GPT_VISION')",
             name='check_parsing_method'
         ),
         UniqueConstraint('source_chat_id', 'source_message_id', name='uq_transactions_source_msg'),
