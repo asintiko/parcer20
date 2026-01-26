@@ -130,13 +130,14 @@ def download_pdf_text(file_id: int, return_bytes: bool = False):
     return text
 
 
-def queue_receipt_task(task_data: dict) -> str:
+def queue_receipt_task(task_data: dict, force: bool = False) -> str:
     """
     Enqueue Celery task with persistent tracking.
     Returns task_id (existing for in-flight tasks).
+    If force=False (default), checks for existing transaction and skips if found.
     """
     from database.connection import get_db
-    from database.models import ReceiptProcessingTask
+    from database.models import ReceiptProcessingTask, Transaction
 
     chat_id = task_data.get('source_chat_id')
     msg_id = task_data.get('source_message_id')
@@ -150,9 +151,10 @@ def queue_receipt_task(task_data: dict) -> str:
         msg_id = None
 
     with get_db() as db:
-        existing = None
+        existing_task = None
         if chat_id is not None and msg_id is not None:
-            existing = (
+            # Check if already in processing queue
+            existing_task = (
                 db.query(ReceiptProcessingTask)
                 .filter(
                     ReceiptProcessingTask.chat_id == chat_id,
@@ -160,8 +162,25 @@ def queue_receipt_task(task_data: dict) -> str:
                 )
                 .first()
             )
-            if existing and existing.status in ('queued', 'processing'):
-                return existing.task_id
+            if existing_task and existing_task.status in ('queued', 'processing'):
+                return existing_task.task_id
+
+            # STRICT DUPLICATE CHECK: Check if transaction already exists
+            if not force:
+                existing_txn = (
+                    db.query(Transaction)
+                    .filter(
+                        Transaction.source_chat_id == chat_id,
+                        Transaction.source_message_id == msg_id
+                    )
+                    .first()
+                )
+                if existing_txn:
+                    # Return existing task_id or create a dummy response
+                    if existing_task:
+                        return existing_task.task_id
+                    # Message already processed, return a marker
+                    raise ValueError(f"Сообщение уже обработано (транзакция #{existing_txn.id})")
 
         # Dispatch new Celery task
         result = process_receipt_task.delay(json.dumps(task_data))
@@ -169,11 +188,11 @@ def queue_receipt_task(task_data: dict) -> str:
         if chat_id is None or msg_id is None:
             return result.id
 
-        if existing:
-            existing.task_id = result.id
-            existing.status = 'queued'
-            existing.error = None
-            existing.transaction_id = None
+        if existing_task:
+            existing_task.task_id = result.id
+            existing_task.status = 'queued'
+            existing_task.error = None
+            existing_task.transaction_id = None
         else:
             tracking = ReceiptProcessingTask(
                 task_id=result.id,

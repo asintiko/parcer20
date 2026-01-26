@@ -539,7 +539,10 @@ async def process_message(
     task_data = _build_task_data_from_message(chat_id, message_id, message)
 
     try:
-        task_id = queue_receipt_task(task_data)
+        task_id = queue_receipt_task(task_data, force=False)
+    except ValueError as exc:
+        # Message already processed - return info about existing transaction
+        raise HTTPException(status_code=409, detail=str(exc))
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"Failed to enqueue task: {exc}")
 
@@ -589,7 +592,19 @@ async def process_batch(
                 )
                 continue
             task_data = _build_task_data_from_message(chat_id, msg_id, message)
-            task_id = queue_receipt_task(task_data)
+            try:
+                task_id = queue_receipt_task(task_data, force=False)
+            except ValueError as exc:
+                # Already processed - skip this message
+                results.append(
+                    {
+                        "chat_id": chat_id,
+                        "message_id": msg_id,
+                        "status": "duplicate",
+                        "error": str(exc),
+                    }
+                )
+                continue
             db.expire_all()
             tracking = (
                 db.query(ReceiptProcessingTask)

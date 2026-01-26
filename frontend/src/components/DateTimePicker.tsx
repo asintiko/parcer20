@@ -161,7 +161,6 @@ export const DateTimePicker: React.FC<DateTimePickerProps> = ({
     value,
     onChange,
     label,
-    required,
     disabled,
     zIndex = 1400,
 }) => {

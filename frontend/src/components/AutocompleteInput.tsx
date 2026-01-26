@@ -17,7 +17,7 @@ interface AutocompleteInputProps {
 }
 
 // Custom styled Autocomplete for dark theme compatibility
-const StyledAutocomplete = styled(Autocomplete)(({ theme }) => ({
+const StyledAutocomplete = styled(Autocomplete)(() => ({
     '& .MuiOutlinedInput-root': {
         backgroundColor: 'var(--color-surface)',
         color: 'var(--color-foreground)',
@@ -66,7 +66,8 @@ export const AutocompleteInput: React.FC<AutocompleteInputProps> = ({
             options={options}
             value={value}
             onChange={(_, newValue) => {
-                onChange(typeof newValue === 'string' ? newValue : newValue || '');
+                const nextVal = typeof newValue === 'string' ? newValue : (newValue as string | null);
+                onChange(nextVal || '');
             }}
             onInputChange={(_, newInputValue) => {
                 onChange(newInputValue);

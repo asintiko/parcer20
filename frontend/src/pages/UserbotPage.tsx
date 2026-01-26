@@ -415,9 +415,26 @@ export const UserbotPage: React.FC = () => {
             showToast('success', `Задача ${data.task_id || ''} → ${data.status}`);
             queryClient.invalidateQueries({ queryKey: ['tg-messages', variables.chatId] });
         },
-        onError: (err: any) => {
+        onError: (err: any, variables) => {
+            const status = err?.response?.status;
             const detail = err?.response?.data?.detail || 'Ошибка обработки';
-            showToast('error', detail);
+
+            // 409 = Already processed (duplicate)
+            if (status === 409) {
+                showToast('warning', detail);
+                // Update status to show it's already done
+                setStatuses((prev) => ({
+                    ...prev,
+                    [variables.messageId]: {
+                        chat_id: variables.chatId,
+                        message_id: variables.messageId,
+                        status: 'done',
+                        error: detail,
+                    } as TelegramProcessResult,
+                }));
+            } else {
+                showToast('error', detail);
+            }
         },
     });
 
