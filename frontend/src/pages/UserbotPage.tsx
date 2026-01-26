@@ -14,7 +14,6 @@ import {
     Loader2,
     RefreshCcw,
     AlertCircle,
-    CheckCircle2,
     XCircle,
     Play,
     Pause,
@@ -30,7 +29,6 @@ import {
     TelegramChat,
     TelegramChatMessage,
     TelegramProcessResult,
-    API_BASE_URL,
     TelegramMonitorStatus,
 } from '../services/api';
 import { useToast } from '../components/Toast';
@@ -984,169 +982,24 @@ export const UserbotPage: React.FC = () => {
                                         .filter((m) => typeof m.id === 'number')
                                         .map((message) => {
                                             const msgId = message.id as number;
-                                            const doc = message.document;
-                                            const isPdf = doc?.mime_type?.toLowerCase().includes('pdf');
-                                            const downloadUrl = doc?.download_url
-                                                ? `${API_BASE_URL}${doc.download_url}`
-                                                : doc?.file_id
-                                                    ? `${API_BASE_URL}/api/tg/files/${doc.file_id}`
-                                                    : null;
-                                            const sizeLabel = (() => {
-                                                if (doc?.size === undefined) return '';
-                                                const kb = doc.size / 1024;
-                                                return kb > 1024 ? `${(kb / 1024).toFixed(1)} MB` : `${kb.toFixed(0)} KB`;
-                                            })();
                                             return (
-                                                <div key={`${msgId}-${message.date}`} className="flex items-start gap-2">
-                                                    <input
-                                                        type="checkbox"
-                                                        className="mt-1 w-4 h-4 text-primary border-border rounded focus:ring-primary"
-                                                        checked={selectedMessageIds.has(msgId)}
-                                                        onChange={() => toggleSelectMessage(msgId)}
-                                                    />
-                                                    <div
-                                                        className={`flex-1 flex ${message.is_outgoing ? 'justify-end' : 'justify-start'}`}
-                                                    >
-                                                        <div
-                                                            className={`max-w-[75%] rounded-lg px-3 py-2 border shadow-sm ${message.is_outgoing
-                                                                ? 'bg-primary text-foreground-inverse border-primary/40'
-                                                                : 'bg-surface-2 text-foreground border-border'
-                                                                }`}
-                                                        >
-                                                            <div className="text-sm whitespace-pre-wrap">
-                                                                {message.text || 'Сообщение без текста'}
-                                                            </div>
-                                                            {doc && (
-                                                                <div className="mt-2 rounded-md border border-border/60 bg-surface px-2 py-1 text-xs">
-                                                                    <div className="font-semibold">Документ</div>
-                                                                    <div className="flex flex-wrap gap-2 items-center mt-1">
-                                                                        <span className="truncate max-w-[200px]">{doc.file_name || 'файл'}</span>
-                                                                        {sizeLabel && <span className="text-foreground-muted">{sizeLabel}</span>}
-                                                                        {downloadUrl && (
-                                                                            <button
-                                                                                type="button"
-                                                                                className="underline text-primary"
-                                                                                onClick={() => window.open(downloadUrl, '_blank')}
-                                                                            >
-                                                                                {isPdf ? 'Открыть PDF' : 'Открыть'}
-                                                                            </button>
-                                                                        )}
-                                                                        {downloadUrl && isPdf && (
-                                                                            <button
-                                                                                type="button"
-                                                                                className="underline text-primary"
-                                                                                onClick={() => setPreviewUrl(downloadUrl)}
-                                                                            >
-                                                                                Просмотр
-                                                                            </button>
-                                                                        )}
-                                                                    </div>
-                                                                </div>
-                                                            )}
-                                                            <div className="flex items-center gap-2 text-xs mt-2">
-                                                                {(() => {
-                                                                    const s = statuses[msgId]?.status || 'not_processed';
-                                                                    const err = statuses[msgId]?.error;
-                                                                    if (s === 'done') {
-                                                                        return (
-                                                                            <span className="flex items-center gap-1 text-success">
-                                                                                <CheckCircle2 className="w-4 h-4" /> Обработан
-                                                                                {statuses[msgId]?.check_id ? ` #${statuses[msgId]?.check_id}` : ''}
-                                                                            </span>
-                                                                        );
-                                                                    }
-                                                                    if (s === 'queued') {
-                                                                        return (
-                                                                            <span className="flex items-center gap-1 text-warning">
-                                                                                <Loader2 className="w-4 h-4 animate-spin" /> В очереди
-                                                                            </span>
-                                                                        );
-                                                                    }
-                                                                    if (s === 'processing') {
-                                                                        return (
-                                                                            <span className="flex items-center gap-1 text-info">
-                                                                                <Loader2 className="w-4 h-4 animate-spin" /> Обработка
-                                                                            </span>
-                                                                        );
-                                                                    }
-                                                                    if (s === 'failed') {
-                                                                        return (
-                                                                            <span className="flex items-center gap-1 text-danger" title={err || 'Ошибка'}>
-                                                                                <XCircle className="w-4 h-4" /> Ошибка {err ? `: ${err}` : ''}
-                                                                            </span>
-                                                                        );
-                                                                    }
-                                                                    return (
-                                                                        <span className="flex items-center gap-1 text-foreground-secondary">
-                                                                            <AlertCircle className="w-4 h-4" /> Не обработан
-                                                                        </span>
-                                                                    );
-                                                                })()}
-                                                            </div>
-                                                            <div className="text-[11px] mt-1 text-right opacity-80">
-                                                                {formatDateTime(message.date)}
-                                                            </div>
-                                                            <div className="flex justify-end mt-2 gap-2">
-                                                                {statuses[msgId]?.status === 'done' ? (
-                                                                    <>
-                                                                        <button
-                                                                            type="button"
-                                                                            className="text-xs px-3 py-1 rounded-md border border-success text-success bg-success/10 cursor-default"
-                                                                            disabled
-                                                                        >
-                                                                            Обработано
-                                                                        </button>
-                                                                        <button
-                                                                            type="button"
-                                                                            onClick={() => {
-                                                                                if (!currentChat?.chat_id) return;
-                                                                                reprocessMutation.mutate({
-                                                                                    chatId: currentChat.chat_id,
-                                                                                    messageId: msgId,
-                                                                                });
-                                                                            }}
-                                                                            className="text-[11px] px-2 py-1 rounded-md border border-border text-foreground-secondary hover:bg-surface-2 disabled:opacity-50"
-                                                                            disabled={processingId === msgId}
-                                                                        >
-                                                                            {processingId === msgId ? (
-                                                                                <Loader2 className="w-3 h-3 animate-spin" />
-                                                                            ) : (
-                                                                                'Повторить'
-                                                                            )}
-                                                                        </button>
-                                                                    </>
-                                                                ) : (
-                                                                    <button
-                                                                        type="button"
-                                                                        onClick={() => {
-                                                                            if (!currentChat?.chat_id) return;
-                                                                            processReceiptMutation.mutate({
-                                                                                chatId: currentChat.chat_id,
-                                                                                messageId: msgId,
-                                                                            });
-                                                                        }}
-                                                                        className={`text-xs px-3 py-1 rounded-md border ${message.is_outgoing
-                                                                            ? 'border-primary/60 text-foreground-inverse/90 hover:bg-primary/90'
-                                                                            : 'border-border text-foreground-secondary hover:bg-surface-2'
-                                                                            } transition-colors`}
-                                                                        disabled={
-                                                                            processingId === msgId ||
-                                                                            ['queued', 'processing'].includes(statuses[msgId]?.status || '')
-                                                                        }
-                                                                    >
-                                                                        {processingId === msgId ? (
-                                                                            <span className="flex items-center gap-1">
-                                                                                <Loader2 className="w-3 h-3 animate-spin" /> Обработка...
-                                                                            </span>
-                                                                        ) : (
-                                                                            'Обработать'
-                                                                        )}
-                                                                    </button>
-                                                                )}
-                                                            </div>
-                                                        </div>
-                                                    </div>
-                                                </div>
+                                                <MessageItem
+                                                    key={`${msgId}-${message.date}`}
+                                                    message={message}
+                                                    isSelected={selectedMessageIds.has(msgId)}
+                                                    status={statuses[msgId]}
+                                                    processingId={processingId}
+                                                    currentChatId={currentChat?.chat_id || null}
+                                                    onToggleSelect={toggleSelectMessage}
+                                                    onProcess={(chatId, messageIdArg) => {
+                                                        processReceiptMutation.mutate({ chatId, messageId: messageIdArg });
+                                                    }}
+                                                    onReprocess={(chatId, messageIdArg) => {
+                                                        reprocessMutation.mutate({ chatId, messageId: messageIdArg });
+                                                    }}
+                                                    onPreview={setPreviewUrl}
+                                                    formatDateTime={formatDateTime}
+                                                />
                                             );
                                         })}
                                 </div>

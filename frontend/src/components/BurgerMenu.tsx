@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
-import { X, Home, Settings, Workflow, Book, Bot } from 'lucide-react';
+import { X, Home, Settings, Workflow, Book, Bot, FileText } from 'lucide-react';
 import { ThemeToggle } from './ThemeToggle';
 
 interface BurgerMenuProps {
@@ -96,6 +96,15 @@ export const BurgerMenu: React.FC<BurgerMenuProps> = ({ isOpen, onClose }) => {
                             isActive={location.pathname === '/userbot'}
                             onClick={() => {
                                 navigate('/userbot');
+                                onClose();
+                            }}
+                        />
+                        <MenuItem
+                            icon={<FileText size={20} />}
+                            label="Логи"
+                            isActive={location.pathname === '/logs'}
+                            onClick={() => {
+                                navigate('/logs');
                                 onClose();
                             }}
                         />

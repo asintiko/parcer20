@@ -9,6 +9,7 @@ import { TransactionsPage } from './pages/TransactionsPage';
 import { ReferencePage } from './pages/ReferencePage';
 import { AutomationPage } from './pages/AutomationPage';
 import { UserbotPage } from './pages/UserbotPage';
+import { LogsPage } from './pages/LogsPage';
 import { useAutomationStatus } from './hooks/useAutomationStatus';
 
 function AppContent() {
@@ -27,6 +28,8 @@ function AppContent() {
                 return 'Автоматизация';
             case '/userbot':
                 return 'Telegram Bots';
+            case '/logs':
+                return 'Логи';
             default:
                 return 'Транзакции';
         }
@@ -89,6 +92,7 @@ function AppContent() {
                     <Route path="/reference" element={<ReferencePage />} />
                     <Route path="/automation" element={<AutomationPage />} />
                     <Route path="/userbot" element={<UserbotPage />} />
+                    <Route path="/logs" element={<LogsPage />} />
                 </Routes>
             </div>
         </div>
