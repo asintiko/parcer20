@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { X, Calendar, Search, DollarSign, Smartphone, Hash } from 'lucide-react';
+import { DatePicker } from './DateTimePicker';
 
 interface FilterState {
     dateFrom: string;
@@ -153,21 +154,19 @@ export const FilterDrawer: React.FC<FilterDrawerProps> = ({
                         </h3>
                         <div className="grid grid-cols-2 gap-4 mt-3">
                             <div>
-                                <label className="text-xs text-foreground-muted mb-1 block">Дата C</label>
-                                <input
-                                    type="date"
-                                    value={filters.dateFrom}
-                                    onChange={e => setFilters({ ...filters, dateFrom: e.target.value })}
-                                    className="input-base"
+                                <label className="text-xs text-foreground-muted mb-1 block">Дата С</label>
+                                <DatePicker
+                                    value={filters.dateFrom || null}
+                                    onChange={(val) => setFilters({ ...filters, dateFrom: val || '' })}
+                                    zIndex={1500}
                                 />
                             </div>
                             <div>
                                 <label className="text-xs text-foreground-muted mb-1 block">Дата По</label>
-                                <input
-                                    type="date"
-                                    value={filters.dateTo}
-                                    onChange={e => setFilters({ ...filters, dateTo: e.target.value })}
-                                    className="input-base"
+                                <DatePicker
+                                    value={filters.dateTo || null}
+                                    onChange={(val) => setFilters({ ...filters, dateTo: val || '' })}
+                                    zIndex={1500}
                                 />
                             </div>
                         </div>

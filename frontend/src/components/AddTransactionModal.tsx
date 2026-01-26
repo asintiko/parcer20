@@ -1,11 +1,15 @@
 import React, { useState } from 'react';
 import { X } from 'lucide-react';
 import { CreateTransactionRequest } from '../services/api';
+import { DateTimePicker } from './DateTimePicker';
+import { AutocompleteInput } from './AutocompleteInput';
 
 interface AddTransactionModalProps {
     isOpen: boolean;
     onClose: () => void;
     onSubmit: (data: CreateTransactionRequest) => Promise<void>;
+    operatorOptions?: string[];
+    appOptions?: string[];
 }
 
 const defaultForm: CreateTransactionRequest & { balance?: string | null } = {
@@ -21,7 +25,13 @@ const defaultForm: CreateTransactionRequest & { balance?: string | null } = {
     raw_text: '',
 };
 
-export const AddTransactionModal: React.FC<AddTransactionModalProps> = ({ isOpen, onClose, onSubmit }) => {
+export const AddTransactionModal: React.FC<AddTransactionModalProps> = ({
+    isOpen,
+    onClose,
+    onSubmit,
+    operatorOptions = [],
+    appOptions = [],
+}) => {
     const [form, setForm] = useState<typeof defaultForm>(defaultForm);
     const [isSubmitting, setIsSubmitting] = useState(false);
     const [error, setError] = useState<string | null>(null);
@@ -66,7 +76,7 @@ export const AddTransactionModal: React.FC<AddTransactionModalProps> = ({ isOpen
             <div className="bg-surface rounded-lg shadow-xl border border-border w-full max-w-xl">
                 <div className="flex items-center justify-between p-4 border-b border-border">
                     <h3 className="text-lg font-semibold text-foreground">Добавить транзакцию</h3>
-                    <button onClick={onClose} className="p-2 rounded-full hover:bg-surface-2">
+                    <button type="button" onClick={onClose} className="p-2 rounded-full hover:bg-surface-2" title="Закрыть">
                         <X className="w-5 h-5" />
                     </button>
                 </div>
@@ -75,33 +85,35 @@ export const AddTransactionModal: React.FC<AddTransactionModalProps> = ({ isOpen
                     <div className="grid grid-cols-2 gap-4">
                         <label className="flex flex-col text-sm text-foreground">
                             Дата и время
-                            <input
-                                type="datetime-local"
-                                className="input-base mt-1"
-                                value={form.datetime}
-                                onChange={(e) => handleChange('datetime', e.target.value)}
-                                required
-                            />
+                            <div className="mt-1">
+                                <DateTimePicker
+                                    value={form.datetime || null}
+                                    onChange={(val) => handleChange('datetime', val || '')}
+                                    zIndex={1500}
+                                />
+                            </div>
                         </label>
-                        <label className="flex flex-col text-sm text-foreground">
-                            Оператор
-                            <input
-                                type="text"
-                                className="input-base mt-1"
+                        <div className="flex flex-col text-sm text-foreground">
+                            <span className="mb-1">Оператор</span>
+                            <AutocompleteInput
                                 value={form.operator}
-                                onChange={(e) => handleChange('operator', e.target.value)}
+                                onChange={(val) => handleChange('operator', val)}
+                                options={operatorOptions}
+                                placeholder="Введите или выберите"
                                 required
+                                zIndex={1600}
                             />
-                        </label>
-                        <label className="flex flex-col text-sm text-foreground">
-                            Приложение
-                            <input
-                                type="text"
-                                className="input-base mt-1"
+                        </div>
+                        <div className="flex flex-col text-sm text-foreground">
+                            <span className="mb-1">Приложение</span>
+                            <AutocompleteInput
                                 value={form.app || ''}
-                                onChange={(e) => handleChange('app', e.target.value)}
+                                onChange={(val) => handleChange('app', val)}
+                                options={appOptions}
+                                placeholder="Введите или выберите"
+                                zIndex={1600}
                             />
-                        </label>
+                        </div>
                         <label className="flex flex-col text-sm text-foreground">
                             Сумма
                             <input

@@ -3,11 +3,12 @@
  * Offline-first: loads from IndexedDB, manual sync to server, local filtering/sorting/pagination
  */
 import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useQuery } from '@tanstack/react-query';
 import { Transaction } from '../services/api';
 import { TransactionTable } from '../components/TransactionTable';
 import { useOfflineTransactions } from '../hooks/useOfflineTransactions';
 import { AddTransactionModal } from '../components/AddTransactionModal';
-import { transactionsApi, CreateTransactionRequest } from '../services/api';
+import { transactionsApi, CreateTransactionRequest, referenceApi } from '../services/api';
 
 type SortState = { sort_by: string; sort_dir: 'asc' | 'desc' };
 
@@ -129,21 +130,40 @@ export function TransactionsPage() {
         return [...data].sort(sortComparator(sort.sort_by, sort.sort_dir));
     }, [data, sort.sort_by, sort.sort_dir, sortComparator]);
 
+    // Load operators from reference dictionary
+    const { data: referenceData } = useQuery({
+        queryKey: ['reference-operators-for-autocomplete'],
+        queryFn: () => referenceApi.getOperators({ page_size: 500 }),
+        staleTime: 5 * 60 * 1000, // 5 minutes
+    });
+
+    // Combine operators from transactions and reference
     const operatorOptions = useMemo(() => {
         const set = new Set<string>();
+        // From transactions
         data.forEach((tx) => {
             if (tx.operator_raw) set.add(tx.operator_raw);
         });
+        // From reference dictionary
+        referenceData?.items?.forEach((op) => {
+            if (op.operator_name) set.add(op.operator_name);
+        });
         return Array.from(set).sort((a, b) => a.localeCompare(b));
-    }, [data]);
+    }, [data, referenceData]);
 
+    // Combine apps from transactions and reference
     const appOptions = useMemo(() => {
         const set = new Set<string>();
+        // From transactions
         data.forEach((tx) => {
             if (tx.application_mapped) set.add(tx.application_mapped);
         });
+        // From reference dictionary
+        referenceData?.items?.forEach((op) => {
+            if (op.application_name) set.add(op.application_name);
+        });
         return Array.from(set).sort((a, b) => a.localeCompare(b));
-    }, [data]);
+    }, [data, referenceData]);
 
     const total = sortedData.length;
 
@@ -283,6 +303,8 @@ export function TransactionsPage() {
                 isOpen={addModalOpen}
                 onClose={() => setAddModalOpen(false)}
                 onSubmit={handleCreateTransaction}
+                operatorOptions={operatorOptions}
+                appOptions={appOptions}
             />
         </div>
     );

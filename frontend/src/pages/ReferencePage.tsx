@@ -16,7 +16,7 @@ export function ReferencePage() {
     const [search, setSearch] = useState('');
     const [debouncedSearch, setDebouncedSearch] = useState('');
     const [applicationFilter, setApplicationFilter] = useState<string>('');
-    const [activeOnly, setActiveOnly] = useState(true);
+    const [activeOnly, setActiveOnly] = useState(false);
     const [p2pOnly, setP2pOnly] = useState(false);
     const [isAddOpen, setIsAddOpen] = useState(false);
 

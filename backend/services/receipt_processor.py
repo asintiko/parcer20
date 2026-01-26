@@ -43,12 +43,12 @@ async def process_tdlib_message(
         infer_transaction_type,
         build_transaction_response,
     )
-    # Duplicate check
+    # Duplicate check - use integer types to match database schema (BigInteger)
     existing = (
         db.query(Transaction)
         .filter(
-            Transaction.source_chat_id == str(chat_id),
-            Transaction.source_message_id == str(message_id),
+            Transaction.source_chat_id == int(chat_id),
+            Transaction.source_message_id == int(message_id),
         )
         .first()
     )
@@ -254,8 +254,8 @@ async def process_tdlib_message(
         parsing_method=parsed.get("parsing_method"),
         parsing_confidence=parsed.get("parsing_confidence"),
         is_gpt_parsed=is_gpt_parsed,
-        source_chat_id=str(chat_id),
-        source_message_id=str(message_id),
+        source_chat_id=int(chat_id),
+        source_message_id=int(message_id),
         fingerprint=fp,
     )
 

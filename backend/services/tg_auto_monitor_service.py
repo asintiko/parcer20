@@ -9,7 +9,7 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from database.models import MonitoredBotChat
+from database.models import MonitoredBotChat, Transaction
 from database.connection import SessionLocal
 from services.receipt_processor import process_tdlib_message
 from services.telegram_tdlib_manager import TelegramTDLibManager
@@ -175,9 +175,25 @@ class TgAutoMonitorService:
         self._enqueue(chat_id, message_id)
 
     def _enqueue(self, chat_id: int, message_id: int) -> None:
+        """Add message to processing queue with duplicate check."""
         key = (chat_id, message_id)
         if key in self._inflight:
             return
+
+        # Check if already processed in database (strict duplicate check)
+        try:
+            with self.session_factory() as db:
+                existing = db.query(Transaction).filter(
+                    Transaction.source_chat_id == int(chat_id),
+                    Transaction.source_message_id == int(message_id)
+                ).first()
+                if existing:
+                    logger.debug("Message %s:%s already processed (transaction %s), skipping",
+                                chat_id, message_id, existing.id)
+                    return
+        except Exception:
+            logger.exception("Duplicate check failed for %s:%s, proceeding anyway", chat_id, message_id)
+
         self._inflight.add(key)
         self.queue.put_nowait(key)
 
@@ -198,15 +214,41 @@ class TgAutoMonitorService:
             monitored = db.get(MonitoredBotChat, chat_id)
             if not monitored or not monitored.enabled:
                 return
+
+            success = False
             last_error: Optional[str] = None
             try:
-                await process_tdlib_message(chat_id=chat_id, message_id=message_id, force=False, db=db, manager=self.manager)
+                result = await process_tdlib_message(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    force=False,
+                    db=db,
+                    manager=self.manager
+                )
                 db.commit()
+                success = True
+                # Mark as success even for duplicates (they were processed before)
+                if result.duplicate:
+                    logger.debug("Message %s:%s is duplicate", chat_id, message_id)
             except Exception as exc:  # noqa: BLE001
                 db.rollback()
                 last_error = str(exc)
-                logger.warning("Processing failed for %s:%s -> %s", chat_id, message_id, last_error)
-            finally:
+                # Check if error is due to parsing failure (not retriable) vs transient error
+                error_str = str(exc).lower()
+                is_permanent_error = any(x in error_str for x in [
+                    "cannot parse", "empty message", "unsupported",
+                    "missing", "invalid"
+                ])
+                if is_permanent_error:
+                    # Mark as processed to avoid retrying parsing errors forever
+                    success = True
+                    logger.warning("Permanent parsing error for %s:%s -> %s", chat_id, message_id, last_error)
+                else:
+                    logger.warning("Transient error for %s:%s -> %s (will retry)", chat_id, message_id, last_error)
+
+            # Only update last_processed_message_id on success
+            # This prevents skipping messages that failed due to transient errors
+            if success:
                 db.query(MonitoredBotChat).filter(MonitoredBotChat.chat_id == chat_id).update(
                     {
                         MonitoredBotChat.last_processed_message_id: func.greatest(
@@ -215,6 +257,13 @@ class TgAutoMonitorService:
                         ),
                         MonitoredBotChat.last_error: last_error,
                     },
+                    synchronize_session=False,
+                )
+                db.commit()
+            else:
+                # Only update last_error for transient failures
+                db.query(MonitoredBotChat).filter(MonitoredBotChat.chat_id == chat_id).update(
+                    {MonitoredBotChat.last_error: last_error},
                     synchronize_session=False,
                 )
                 db.commit()

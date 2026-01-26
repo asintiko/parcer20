@@ -59,7 +59,7 @@ async def get_operators(
     search: Optional[str] = Query(None, description="Search in operator or app name"),
     application: Optional[str] = Query(None, description="Filter by application"),
     is_p2p: Optional[bool] = Query(None, description="Filter by P2P status"),
-    is_active: Optional[bool] = Query(True, description="Filter by active status"),
+    is_active: Optional[bool] = Query(None, description="Filter by active status (None = all)"),
     db: Session = Depends(get_db_session),
     current_user: dict = Depends(get_current_user),
 ):

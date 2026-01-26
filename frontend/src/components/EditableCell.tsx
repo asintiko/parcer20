@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef, KeyboardEvent, useMemo } from 'react';
 import { formatDate, formatTime, formatDateTime, EMPTY_VALUE } from '../utils/dateTimeFormatters';
+import { DatePicker, TimePicker, DateTimePicker } from './DateTimePicker';
 
 // Type mappings for different columns
 export type CellType = 'text' | 'number' | 'date' | 'time' | 'datetime' | 'select' | 'checkbox';
@@ -236,44 +237,54 @@ export const EditableCell: React.FC<EditableCellProps> = ({
 
             case 'date':
                 return (
-                    <input
-                        ref={inputRef as React.RefObject<HTMLInputElement>}
-                        type="date"
-                        value={toDateString(editValue)}
-                        onChange={(e) => setEditValue(e.target.value)}
-                        onBlur={handleSave}
-                        onKeyDown={handleKeyDown}
-                        className={baseClass}
-                        disabled={isSaving}
-                    />
+                    <div onKeyDown={handleKeyDown}>
+                        <DatePicker
+                            value={toDateString(editValue) || null}
+                            onChange={(val) => {
+                                setEditValue(val || '');
+                                // Auto-save after selection
+                                if (val) {
+                                    setTimeout(() => handleSave(), 100);
+                                }
+                            }}
+                            disabled={isSaving}
+                            zIndex={9999}
+                        />
+                    </div>
                 );
 
             case 'time':
                 return (
-                    <input
-                        ref={inputRef as React.RefObject<HTMLInputElement>}
-                        type="time"
-                        value={toTimeString(editValue)}
-                        onChange={(e) => setEditValue(e.target.value)}
-                        onBlur={handleSave}
-                        onKeyDown={handleKeyDown}
-                        className={baseClass}
-                        disabled={isSaving}
-                    />
+                    <div onKeyDown={handleKeyDown}>
+                        <TimePicker
+                            value={toTimeString(editValue) || null}
+                            onChange={(val) => {
+                                setEditValue(val || '');
+                                if (val) {
+                                    setTimeout(() => handleSave(), 100);
+                                }
+                            }}
+                            disabled={isSaving}
+                            zIndex={9999}
+                        />
+                    </div>
                 );
 
             case 'datetime':
                 return (
-                    <input
-                        ref={inputRef as React.RefObject<HTMLInputElement>}
-                        type="datetime-local"
-                        value={toDateTimeString(editValue)}
-                        onChange={(e) => setEditValue(e.target.value)}
-                        onBlur={handleSave}
-                        onKeyDown={handleKeyDown}
-                        className={baseClass}
-                        disabled={isSaving}
-                    />
+                    <div onKeyDown={handleKeyDown}>
+                        <DateTimePicker
+                            value={toDateTimeString(editValue) || null}
+                            onChange={(val) => {
+                                setEditValue(val || '');
+                                if (val) {
+                                    setTimeout(() => handleSave(), 100);
+                                }
+                            }}
+                            disabled={isSaving}
+                            zIndex={9999}
+                        />
+                    </div>
                 );
 
             case 'select':
