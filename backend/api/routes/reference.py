@@ -55,7 +55,7 @@ class OperatorReferenceListResponse(BaseModel):
 @router.get("/", response_model=OperatorReferenceListResponse)
 async def get_operators(
     page: int = Query(1, ge=1, description="Page number"),
-    page_size: int = Query(50, ge=1, le=500, description="Items per page"),
+    page_size: int = Query(50, ge=1, le=2000, description="Items per page"),
     search: Optional[str] = Query(None, description="Search in operator or app name"),
     application: Optional[str] = Query(None, description="Filter by application"),
     is_p2p: Optional[bool] = Query(None, description="Filter by P2P status"),

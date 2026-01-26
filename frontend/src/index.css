@@ -97,6 +97,8 @@
   background-color: var(--surface) !important;
   color: var(--text) !important;
   padding: 4px 0 !important;
+  max-height: 300px !important;
+  overflow-y: auto !important;
 }
 
 .MuiAutocomplete-option {
