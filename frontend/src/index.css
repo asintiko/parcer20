@@ -61,6 +61,7 @@
     transform: translateX(100%);
     opacity: 0;
   }
+
   to {
     transform: translateX(0);
     opacity: 1;
@@ -78,4 +79,83 @@
 /* Dragging state */
 .is-dragging {
   @apply opacity-50 bg-surface-2 border-2 border-dashed border-border;
+}
+
+/* MUI Autocomplete Global Styles for Dark Theme */
+.MuiAutocomplete-popper {
+  z-index: 9999 !important;
+}
+
+.MuiAutocomplete-paper {
+  background-color: var(--surface) !important;
+  color: var(--text) !important;
+  border: 1px solid var(--border) !important;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4) !important;
+}
+
+.MuiAutocomplete-listbox {
+  background-color: var(--surface) !important;
+  color: var(--text) !important;
+  padding: 4px 0 !important;
+}
+
+.MuiAutocomplete-option {
+  background-color: var(--surface) !important;
+  color: var(--text) !important;
+  padding: 8px 16px !important;
+  font-size: 0.875rem !important;
+}
+
+.MuiAutocomplete-option:hover,
+.MuiAutocomplete-option.Mui-focused {
+  background-color: var(--surface-2) !important;
+}
+
+.MuiAutocomplete-option[aria-selected="true"] {
+  background-color: var(--primary) !important;
+  color: white !important;
+}
+
+.MuiAutocomplete-noOptions {
+  color: var(--text-secondary) !important;
+  padding: 14px 16px !important;
+  font-size: 0.875rem !important;
+}
+
+/* MUI DatePicker/TimePicker Global Styles */
+.MuiPickersPopper-root {
+  z-index: 9999 !important;
+}
+
+.MuiPickersPopper-paper {
+  background-color: var(--surface) !important;
+  color: var(--text) !important;
+  border: 1px solid var(--border) !important;
+}
+
+.MuiPickersDay-root {
+  color: var(--text) !important;
+}
+
+.MuiPickersDay-root:hover {
+  background-color: var(--surface-2) !important;
+}
+
+.MuiPickersDay-root.Mui-selected {
+  background-color: var(--primary) !important;
+  color: white !important;
+}
+
+.MuiPickersCalendarHeader-label {
+  color: var(--text) !important;
+}
+
+.MuiDayCalendar-weekDayLabel {
+  color: var(--text-secondary) !important;
+}
+
+/* Native select dropdown styling */
+select option {
+  background-color: var(--surface);
+  color: var(--text);
 }
