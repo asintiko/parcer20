@@ -14,29 +14,29 @@
   --text-secondary: #6b7280;
   --text-muted: #9ca3af;
   --text-inverse: #ffffff;
-  
+
   /* Semantic Colors */
   --primary: #3390ec;
   --primary-hover: #2563eb;
   --primary-light: #dbeafe;
   --primary-dark: #1e40af;
-  
+
   --danger: #dc2626;
   --danger-hover: #b91c1c;
   --danger-light: #fee2e2;
-  
+
   --warning: #f59e0b;
   --warning-hover: #d97706;
   --warning-light: #fef3c7;
-  
+
   --success: #16a34a;
   --success-hover: #15803d;
   --success-light: #dcfce7;
-  
+
   --info: #3390ec;
   --info-hover: #2563eb;
   --info-light: #dbeafe;
-  
+
   /* Table Colors */
   --table-header: #f3f4f6;
   --table-border: #e5e7eb;
@@ -44,18 +44,18 @@
   --table-row-selected: rgba(51, 144, 236, 0.1);
   --table-text: #111827;
   --table-text-secondary: #6b7280;
-  
+
   /* Expense/Income Colors */
   --expense: #dc2626;
   --income: #16a34a;
-  
+
   /* Input & Form Colors */
   --input-bg: #ffffff;
   --input-border: #e5e7eb;
   --input-border-focus: #3390ec;
   --input-text: #111827;
   --input-placeholder: #9ca3af;
-  
+
   /* Button Colors */
   --button-primary-bg: #3390ec;
   --button-primary-hover: #2563eb;
@@ -63,57 +63,70 @@
   --button-secondary-bg: #f3f4f6;
   --button-secondary-hover: #e5e7eb;
   --button-secondary-text: #111827;
-  
+
   /* Modal & Overlay Colors */
   --modal-bg: #ffffff;
   --modal-overlay: rgba(0, 0, 0, 0.5);
   --modal-border: #e5e7eb;
-  
+
   /* Context Menu Colors */
   --context-menu-bg: #ffffff;
   --context-menu-border: #e5e7eb;
   --context-menu-hover: #f3f4f6;
   --context-menu-text: #111827;
   --context-menu-text-secondary: #6b7280;
-  
+
   /* Widget & Card Colors */
   --widget-bg: #ffffff;
   --widget-border: #e5e7eb;
   --widget-accent-blue: #dbeafe;
   --widget-accent-green: #dcfce7;
   --widget-text-accent: #3390ec;
-  
+
   /* Editable Cell Colors */
   --editable-cell-bg: #ffffff;
   --editable-cell-border: #3390ec;
   --editable-cell-border-error: #dc2626;
   --editable-cell-hover: #f0f9ff;
   --editable-cell-text: #111827;
-  
+
   /* Shadows */
   --shadow-sm: 0 1px 2px 0 rgba(0, 0, 0, 0.05);
   --shadow: 0 1px 3px 0 rgba(0, 0, 0, 0.1), 0 1px 2px -1px rgba(0, 0, 0, 0.1);
   --shadow-md: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -2px rgba(0, 0, 0, 0.1);
   --shadow-lg: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -4px rgba(0, 0, 0, 0.1);
   --shadow-xl: 0 20px 25px -5px rgba(0, 0, 0, 0.1), 0 8px 10px -6px rgba(0, 0, 0, 0.1);
-  
+
   /* Focus States */
   --focus-ring: 2px solid var(--primary);
   --focus-ring-offset: 2px;
-  
+
   /* Transitions */
   --transition-theme: background-color 0.2s ease, color 0.2s ease, border-color 0.2s ease;
-  
+
   /* Border Radius */
-  --radius-sm: 0.25rem;   /* 4px */
-  --radius-md: 0.5rem;    /* 8px */
-  --radius-lg: 0.75rem;   /* 12px */
-  --radius-xl: 1rem;      /* 16px */
-  --radius-2xl: 1.5rem;   /* 24px */
+  --radius-sm: 0.25rem;
+  /* 4px */
+  --radius-md: 0.5rem;
+  /* 8px */
+  --radius-lg: 0.75rem;
+  /* 12px */
+  --radius-xl: 1rem;
+  /* 16px */
+  --radius-2xl: 1.5rem;
+  /* 24px */
   --radius-full: 9999px;
-  
+
   /* Drawer/Menu */
   --drawer-bg: var(--surface);
+
+  /* MUI Component Variables */
+  --color-surface: var(--surface);
+  --color-surface-2: var(--surface-2);
+  --color-foreground: var(--text);
+  --color-foreground-secondary: var(--text-secondary);
+  --color-border: var(--border);
+  --color-primary: var(--primary);
 }
 
 [data-theme="dark"] {
@@ -129,29 +142,29 @@
   --text-secondary: #aaaaaa;
   --text-muted: #707579;
   --text-inverse: #000000;
-  
+
   /* Semantic Colors - Dark Theme */
   --primary: #8774E1;
   --primary-hover: #9a87f0;
   --primary-light: rgba(135, 116, 225, 0.15);
   --primary-dark: #6b5bb8;
-  
+
   --danger: #ff595a;
   --danger-hover: #ff6b6c;
   --danger-light: rgba(255, 89, 90, 0.15);
-  
+
   --warning: #ffa500;
   --warning-hover: #ffb733;
   --warning-light: rgba(255, 165, 0, 0.15);
-  
+
   --success: #5CC85E;
   --success-hover: #6dd46f;
   --success-light: rgba(92, 200, 94, 0.15);
-  
+
   --info: #3390ec;
   --info-hover: #4aa0f0;
   --info-light: rgba(51, 144, 236, 0.15);
-  
+
   /* Table Colors - Dark Theme */
   --table-header: #2a2a2a;
   --table-border: #2f2f2f;
@@ -159,18 +172,18 @@
   --table-row-selected: rgba(135, 116, 225, 0.2);
   --table-text: #ffffff;
   --table-text-secondary: #aaaaaa;
-  
+
   /* Expense/Income Colors - Dark Theme */
   --expense: #ff595a;
   --income: #5CC85E;
-  
+
   /* Input & Form Colors - Dark Theme */
   --input-bg: #212121;
   --input-border: #2f2f2f;
   --input-border-focus: #8774E1;
   --input-text: #ffffff;
   --input-placeholder: #707579;
-  
+
   /* Button Colors - Dark Theme */
   --button-primary-bg: #8774E1;
   --button-primary-hover: #9a87f0;
@@ -178,46 +191,54 @@
   --button-secondary-bg: #2a2a2a;
   --button-secondary-hover: #2f2f2f;
   --button-secondary-text: #ffffff;
-  
+
   /* Modal & Overlay Colors - Dark Theme */
   --modal-bg: #212121;
   --modal-overlay: rgba(0, 0, 0, 0.7);
   --modal-border: #2f2f2f;
-  
+
   /* Context Menu Colors - Dark Theme */
   --context-menu-bg: #212121;
   --context-menu-border: #2f2f2f;
   --context-menu-hover: #2a2a2a;
   --context-menu-text: #ffffff;
   --context-menu-text-secondary: #aaaaaa;
-  
+
   /* Widget & Card Colors - Dark Theme */
   --widget-bg: #212121;
   --widget-border: #2f2f2f;
   --widget-accent-blue: rgba(51, 144, 236, 0.2);
   --widget-accent-green: rgba(92, 200, 94, 0.2);
   --widget-text-accent: #3390ec;
-  
+
   /* Editable Cell Colors - Dark Theme */
   --editable-cell-bg: #212121;
   --editable-cell-border: #8774E1;
   --editable-cell-border-error: #ff595a;
   --editable-cell-hover: rgba(135, 116, 225, 0.1);
   --editable-cell-text: #ffffff;
-  
+
   /* Shadows - Dark Theme */
   --shadow-sm: 0 1px 2px 0 rgba(0, 0, 0, 0.3);
   --shadow: 0 1px 3px 0 rgba(0, 0, 0, 0.4), 0 1px 2px -1px rgba(0, 0, 0, 0.4);
   --shadow-md: 0 4px 6px -1px rgba(0, 0, 0, 0.4), 0 2px 4px -2px rgba(0, 0, 0, 0.4);
   --shadow-lg: 0 10px 15px -3px rgba(0, 0, 0, 0.5), 0 4px 6px -4px rgba(0, 0, 0, 0.5);
   --shadow-xl: 0 20px 25px -5px rgba(0, 0, 0, 0.6), 0 8px 10px -6px rgba(0, 0, 0, 0.6);
-  
+
   /* Focus States - Dark Theme */
   --focus-ring: 2px solid var(--primary);
   --focus-ring-offset: 2px;
-  
+
   /* Drawer/Menu - Dark Theme */
   --drawer-bg: var(--surface);
+
+  /* MUI Component Variables - Dark Theme */
+  --color-surface: var(--surface);
+  --color-surface-2: var(--surface-2);
+  --color-foreground: var(--text);
+  --color-foreground-secondary: var(--text-secondary);
+  --color-border: var(--border);
+  --color-primary: var(--primary);
 }
 
 /* Base Styles */
@@ -277,4 +298,3 @@ body {
 * {
   transition: background-color 0.2s ease, color 0.2s ease, border-color 0.2s ease;
 }
-
