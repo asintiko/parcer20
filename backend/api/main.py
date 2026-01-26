@@ -162,12 +162,14 @@ async def health_check():
 
 
 # Import and register routes
-from api.routes import analytics, automation, auth, reference, transactions, userbot, telegram_client
+from api.routes import analytics, automation, auth, logs, reference, transactions, userbot, telegram_client
 
 app.include_router(auth.router, tags=["Authentication"])
 app.include_router(transactions.router, prefix="/api/transactions", tags=["Transactions"])
 app.include_router(analytics.router, prefix="/api/analytics", tags=["Analytics"])
 app.include_router(reference.router, prefix="/api/reference", tags=["Reference"])
+app.include_router(logs.router, prefix="/api/logs", tags=["Logs"])
 app.include_router(automation.router, tags=["Automation"])
 app.include_router(userbot.router, tags=["Userbot"])
 app.include_router(telegram_client.router, tags=["Telegram"])
+

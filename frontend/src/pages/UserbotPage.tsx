@@ -483,6 +483,35 @@ export const UserbotPage: React.FC = () => {
         [chatsQuery.data, selectedChatId]
     );
 
+    // Keyboard shortcuts
+    useEffect(() => {
+        const handleKeyDown = (e: KeyboardEvent) => {
+            const target = e.target as HTMLElement;
+            const isInput = target.tagName === 'INPUT' || target.tagName === 'TEXTAREA';
+
+            // Ctrl/Cmd + A - Select all
+            if ((e.ctrlKey || e.metaKey) && e.key === 'a' && !isInput) {
+                e.preventDefault();
+                selectAllMessages();
+            }
+
+            // Escape - Deselect all
+            if (e.key === 'Escape') {
+                deselectAllMessages();
+            }
+
+            // Ctrl/Cmd + Enter - Process selected
+            if ((e.ctrlKey || e.metaKey) && e.key === 'Enter' && selectedMessageIds.size > 0 && currentChat) {
+                e.preventDefault();
+                const ids = Array.from(selectedMessageIds);
+                processBatchMutation.mutate({ chatId: currentChat.chat_id, messageIds: ids });
+            }
+        };
+
+        window.addEventListener('keydown', handleKeyDown);
+        return () => window.removeEventListener('keydown', handleKeyDown);
+    }, [selectAllMessages, deselectAllMessages, selectedMessageIds, currentChat, processBatchMutation]);
+
     const renderAuthPanel = () => {
         if (authLoading) {
             return (
@@ -1123,8 +1152,30 @@ export const UserbotPage: React.FC = () => {
                                 </div>
 
                                 <div className="flex items-center justify-between px-4 py-3 border-t border-border bg-surface flex-shrink-0">
-                                    <div className="text-[11px] text-foreground-muted">
-                                        Сообщений: {messagesState.length}
+                                    <div className="flex items-center gap-3">
+                                        <span className="text-sm text-foreground-muted">
+                                            Сообщений: {messagesState.length}
+                                        </span>
+                                        <div className="flex items-center gap-2">
+                                            <button
+                                                onClick={selectAllMessages}
+                                                disabled={!messagesState.length}
+                                                className="flex items-center gap-1.5 px-3 py-2 min-h-[40px] rounded-md border border-border text-foreground-secondary text-sm hover:bg-surface-2 disabled:opacity-50 transition-colors"
+                                                title="Ctrl/Cmd + A"
+                                            >
+                                                <CheckSquare className="w-4 h-4" />
+                                                Выбрать все
+                                            </button>
+                                            <button
+                                                onClick={deselectAllMessages}
+                                                disabled={!selectedMessageIds.size}
+                                                className="flex items-center gap-1.5 px-3 py-2 min-h-[40px] rounded-md border border-border text-foreground-secondary text-sm hover:bg-surface-2 disabled:opacity-50 transition-colors"
+                                                title="Escape"
+                                            >
+                                                <Square className="w-4 h-4" />
+                                                Снять
+                                            </button>
+                                        </div>
                                     </div>
                                     <button
                                         onClick={() => {
@@ -1134,14 +1185,15 @@ export const UserbotPage: React.FC = () => {
                                             processBatchMutation.mutate({ chatId: currentChat.chat_id, messageIds: ids });
                                         }}
                                         disabled={!selectedMessageIds.size || batchProcessing}
-                                        className="px-4 py-2 rounded-md border border-primary text-primary text-sm hover:bg-primary-light/30 disabled:opacity-50 disabled:cursor-not-allowed"
+                                        className="px-5 py-2.5 min-h-[44px] rounded-md border-2 border-primary text-primary text-sm font-semibold hover:bg-primary hover:text-foreground-inverse disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                                        title="Ctrl/Cmd + Enter"
                                     >
                                         {batchProcessing ? (
                                             <span className="flex items-center gap-2">
-                                                <Loader2 className="w-4 h-4 animate-spin" /> Обрабатываем...
+                                                <Loader2 className="w-5 h-5 animate-spin" /> Обрабатываем...
                                             </span>
                                         ) : (
-                                            <>Обработать выбранные ({selectedMessageIds.size || 0})</>
+                                            <>▶ Обработать выбранные ({selectedMessageIds.size || 0})</>
                                         )}
                                     </button>
                                 </div>
