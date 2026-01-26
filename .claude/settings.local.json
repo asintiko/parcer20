@@ -46,6 +46,9 @@
       "Bash(grep -l \"get_current_user\" backend/api/routes/*.py)",
       "Bash(docker ps:*)",
       "Bash(bash /tmp/create_transactions.sh:*)"
+    ],
+    "additionalDirectories": [
+      "/Users/kulacidmyt/Documents/parcer2.0/backend/scripts"
     ]
   }
 }

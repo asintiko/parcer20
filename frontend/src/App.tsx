@@ -2,17 +2,20 @@
  * Main Application Component with Routing
  */
 import { useState } from 'react';
-import { BrowserRouter, Routes, Route, useLocation } from 'react-router-dom';
-import { Menu } from 'lucide-react';
+import { BrowserRouter, Routes, Route, useLocation, useNavigate } from 'react-router-dom';
+import { Menu, Loader2, CheckCircle2 } from 'lucide-react';
 import { BurgerMenu } from './components/BurgerMenu';
 import { TransactionsPage } from './pages/TransactionsPage';
 import { ReferencePage } from './pages/ReferencePage';
 import { AutomationPage } from './pages/AutomationPage';
 import { UserbotPage } from './pages/UserbotPage';
+import { useAutomationStatus } from './hooks/useAutomationStatus';
 
 function AppContent() {
     const [isMenuOpen, setIsMenuOpen] = useState(false);
     const location = useLocation();
+    const navigate = useNavigate();
+    const { isRunning, isCompleted, taskStatus } = useAutomationStatus();
 
     const getPageTitle = () => {
         switch (location.pathname) {
@@ -42,6 +45,41 @@ function AppContent() {
                     <Menu className="w-5 h-5" />
                 </button>
                 <h1 className="text-lg font-semibold text-foreground">{getPageTitle()}</h1>
+
+                {/* Background Automation Status Indicator */}
+                {isRunning && location.pathname !== '/automation' && (
+                    <button
+                        type="button"
+                        onClick={() => navigate('/automation')}
+                        className="ml-4 flex items-center gap-2 px-3 py-1.5 bg-primary/10 hover:bg-primary/20 border border-primary/30 rounded-lg transition-colors"
+                        title="Перейти к автоматизации"
+                    >
+                        <Loader2 className="w-4 h-4 text-primary animate-spin" />
+                        <span className="text-sm text-primary font-medium">AI работает</span>
+                        {taskStatus?.progress && (
+                            <span className="text-xs text-primary/70">
+                                {taskStatus.progress.processed}/{taskStatus.progress.total}
+                            </span>
+                        )}
+                    </button>
+                )}
+
+                {isCompleted && location.pathname !== '/automation' && (
+                    <button
+                        type="button"
+                        onClick={() => navigate('/automation')}
+                        className="ml-4 flex items-center gap-2 px-3 py-1.5 bg-success/10 hover:bg-success/20 border border-success/30 rounded-lg transition-colors"
+                        title="Перейти к автоматизации"
+                    >
+                        <CheckCircle2 className="w-4 h-4 text-success" />
+                        <span className="text-sm text-success font-medium">AI завершен</span>
+                        {taskStatus?.results?.suggestions_count !== undefined && (
+                            <span className="text-xs text-success/70">
+                                {taskStatus.results.suggestions_count} предложений
+                            </span>
+                        )}
+                    </button>
+                )}
             </header>
 
             {/* Main Content */}

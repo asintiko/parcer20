@@ -37,7 +37,11 @@ class Transaction(Base):
     application_mapped = Column(String(100))
     transaction_type = Column(String(20), nullable=False)
     balance_after = Column(Numeric(18, 2))
-    
+
+    # Receiver fields (for P2P transfers)
+    receiver_name = Column(String(255))
+    receiver_card = Column(String(4))
+
     # Metadata
     parsed_at = Column(DateTime(timezone=False), server_default=func.now(), nullable=False)
     is_gpt_parsed = Column(Boolean, default=False)

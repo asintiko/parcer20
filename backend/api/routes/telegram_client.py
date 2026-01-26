@@ -626,6 +626,26 @@ async def receipt_status(
             .first()
         )
         if tracking:
+            # If tracking says "done" but transaction doesn't exist, reset tracking
+            if tracking.status == "done" and tracking.transaction_id:
+                tx_exists = (
+                    db.query(Transaction.id)
+                    .filter(Transaction.id == tracking.transaction_id)
+                    .scalar()
+                )
+                if not tx_exists:
+                    # Transaction was deleted, reset tracking
+                    db.delete(tracking)
+                    db.commit()
+                    statuses.append(
+                        {
+                            "chat_id": chat_id,
+                            "message_id": msg_id,
+                            "status": "not_processed",
+                        }
+                    )
+                    continue
+
             statuses.append(
                 {
                     "chat_id": chat_id,

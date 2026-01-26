@@ -15,7 +15,7 @@ from sqlalchemy.orm import Session
 from pydantic import BaseModel, Field
 
 from database.connection import get_db_session
-from database.models import Transaction, Check
+from database.models import Transaction, Check, ReceiptProcessingTask
 from services.telegram_tdlib_manager import TelegramTDLibManager, get_tdlib_manager
 from services.receipt_processor import process_tdlib_message
 from api.dependencies import get_current_user
@@ -171,6 +171,8 @@ class TransactionResponse(BaseModel):
     transaction_type: str
     transaction_type_display: str
     balance_after: Optional[str]
+    receiver_name: Optional[str] = None
+    receiver_card: Optional[str] = None
     source_type: str
     source_channel: str
     source_display: str
@@ -282,6 +284,8 @@ def build_transaction_response(c: Transaction) -> TransactionResponse:
         transaction_type=canonical_type,
         transaction_type_display=get_transaction_type_display(canonical_type),
         balance_after=normalize_optional_amount_for_response(balance_val),
+        receiver_name=getattr(c, "receiver_name", None),
+        receiver_card=getattr(c, "receiver_card", None),
         source_type=source_type_val,
         source_channel=source_channel,
         source_display=get_source_display(source_channel),
@@ -396,6 +400,8 @@ class TransactionUpdateRequest(BaseModel):
     amount: Optional[Decimal] = Field(None, ge=0)
     balance_after: Optional[Decimal] = None
     card_last_4: Optional[str] = Field(None, pattern=r'^\d{4}$')
+    receiver_name: Optional[str] = Field(None, max_length=255)
+    receiver_card: Optional[str] = Field(None, pattern=r'^\d{4}$')
     transaction_type: Optional[str] = Field(None, pattern=r'^(DEBIT|CREDIT|CONVERSION|REVERSAL)$')
     currency: Optional[str] = Field(None, pattern=r'^(UZS|USD)$')
     source_type: Optional[str] = Field(None, pattern=r'^(AUTO|MANUAL)$')
@@ -468,6 +474,8 @@ class TransactionCreateRequest(BaseModel):
     app: Optional[str] = Field(None, max_length=100)
     balance: Optional[Decimal] = None
     is_p2p: Optional[bool] = False
+    receiver_name: Optional[str] = Field(None, max_length=255)
+    receiver_card: Optional[str] = Field(None, pattern=r'^\d{4}$')
     raw_text: Optional[str] = None
 
 
@@ -487,6 +495,8 @@ async def bulk_update_transactions(
         "amount",
         "balance_after",
         "card_last_4",
+        "receiver_name",
+        "receiver_card",
         "transaction_type",
         "currency",
         "source_type",
@@ -542,6 +552,12 @@ async def bulk_update_transactions(
 
             if "balance_after" in fields:
                 c.balance = fields["balance_after"]
+
+            if "receiver_name" in fields:
+                c.receiver_name = fields["receiver_name"]
+
+            if "receiver_card" in fields:
+                c.receiver_card = fields["receiver_card"]
 
             if "amount" in fields:
                 amt = Decimal(str(fields["amount"]))
@@ -706,6 +722,8 @@ async def create_transaction(
             balance_after=payload.balance,
             card_last_4=payload.card_last4,
             is_p2p=payload.is_p2p or False,
+            receiver_name=payload.receiver_name,
+            receiver_card=payload.receiver_card,
             transaction_type=txn_type,
             currency=payload.currency,
             source_type="MANUAL",
@@ -809,6 +827,12 @@ async def update_transaction(
         if "balance_after" in update_dict:
             c.balance_after = update_dict["balance_after"]
 
+        if "receiver_name" in update_dict:
+            c.receiver_name = update_dict["receiver_name"]
+
+        if "receiver_card" in update_dict:
+            c.receiver_card = update_dict["receiver_card"]
+
         # Amount normalization: store debits as negative, credits/etc as positive
         if "amount" in update_dict:
             amt = Decimal(str(update_dict["amount"]))
@@ -848,12 +872,17 @@ async def delete_transaction(
     Delete a transaction by ID
     """
     try:
-        check = db.query(Transaction).filter(Transaction.id == transaction_id).first()
+        transaction = db.query(Transaction).filter(Transaction.id == transaction_id).first()
 
-        if not check:
+        if not transaction:
             raise HTTPException(status_code=404, detail=f"Transaction {transaction_id} not found")
 
-        db.delete(check)
+        # Delete related tracking records to keep sync with Telegram client
+        db.query(ReceiptProcessingTask).filter(
+            ReceiptProcessingTask.transaction_id == transaction_id
+        ).delete(synchronize_session=False)
+
+        db.delete(transaction)
         db.commit()
 
         return DeleteResponse(

@@ -63,6 +63,8 @@ export interface Transaction {
     transaction_type: 'DEBIT' | 'CREDIT' | 'CONVERSION' | 'REVERSAL';
     transaction_type_display: string;
     balance_after: string | null;
+    receiver_name?: string | null;
+    receiver_card?: string | null;
     source_type: 'MANUAL' | 'AUTO';
     source_channel: 'TELEGRAM' | 'SMS' | 'MANUAL';
     source_display: string;
@@ -114,6 +116,8 @@ export interface TransactionUpdateRequest {
     amount?: string;
     balance_after?: string;
     card_last_4?: string;
+    receiver_name?: string;
+    receiver_card?: string;
     transaction_type?: 'DEBIT' | 'CREDIT' | 'CONVERSION' | 'REVERSAL';
     currency?: 'UZS' | 'USD';
     source_type?: 'AUTO' | 'MANUAL';
@@ -196,6 +200,8 @@ export interface CreateTransactionRequest {
     app?: string | null;
     balance?: string | null;
     is_p2p?: boolean;
+    receiver_name?: string | null;
+    receiver_card?: string | null;
     raw_text?: string | null;
 }
 

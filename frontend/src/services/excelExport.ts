@@ -97,9 +97,9 @@ const formatExcelValue = (row: Transaction, columnId: string, rowIndex: number) 
 
 const getNumberFormat = (columnId: string) => {
     if (columnId === 'amount' || columnId === 'balance_after') return '#,##0.00';
-    if (columnId === 'date_time') return 'yyyy-mm-dd hh:mm:ss';
-    if (columnId === 'transaction_date') return 'yyyy-mm-dd';
-    if (columnId === 'time') return 'hh:mm:ss';
+    if (columnId === 'date_time') return 'yyyy.mm.dd hh:mm';
+    if (columnId === 'transaction_date') return 'yyyy.mm.dd';
+    if (columnId === 'time') return 'hh:mm';
     return undefined;
 };
 

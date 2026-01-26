@@ -451,6 +451,28 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
                 ),
             },
             {
+                accessorKey: 'receiver_name',
+                id: 'receiver_name',
+                header: 'Получатель',
+                size: 180,
+                cell: (info) => (
+                    <div className="truncate text-table-xs" title={info.getValue() as string}>
+                        {info.getValue() as string || '—'}
+                    </div>
+                ),
+            },
+            {
+                accessorKey: 'receiver_card',
+                id: 'receiver_card',
+                header: 'Карта получателя',
+                size: 60,
+                cell: (info) => (
+                    <div className="font-mono text-table-xs">
+                        {info.getValue() as string || '—'}
+                    </div>
+                ),
+            },
+            {
                 accessorKey: 'amount',
                 id: 'amount',
                 header: 'Сумма',
@@ -558,6 +580,8 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
         time: 'time',
         operator_raw: 'text',
         application_mapped: 'text',
+        receiver_name: 'text',
+        receiver_card: 'text',
         amount: 'number',
         balance_after: 'number',
         card_last_4: 'text',
@@ -1015,6 +1039,8 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
         time: 'transaction_date',
         operator_raw: 'operator_raw',
         application_mapped: 'application_mapped',
+        receiver_name: 'receiver_name',
+        receiver_card: 'receiver_card',
         amount: 'amount',
         balance_after: 'balance_after',
         card_last_4: 'card_last_4',

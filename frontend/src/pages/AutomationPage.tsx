@@ -2,7 +2,7 @@
  * Automation Page Component
  * AI-powered transaction analysis and application mapping
  */
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { useMutation, useQuery } from '@tanstack/react-query';
 import { automationApi } from '../services/api';
 import {
@@ -24,9 +24,22 @@ export function AutomationPage() {
         only_unmapped: true,
         currency_filter: '',
     });
-    const [activeTaskId, setActiveTaskId] = useState<string | null>(null);
+    const [activeTaskId, setActiveTaskId] = useState<string | null>(() => {
+        // Restore active task from localStorage on mount
+        const saved = localStorage.getItem('automation_task_id');
+        return saved || null;
+    });
     const [selectedSuggestions, setSelectedSuggestions] = useState<string[]>([]);
     const [filterConfidence, setFilterConfidence] = useState(0.0);
+
+    // Save active task ID to localStorage whenever it changes
+    useEffect(() => {
+        if (activeTaskId) {
+            localStorage.setItem('automation_task_id', activeTaskId);
+        } else {
+            localStorage.removeItem('automation_task_id');
+        }
+    }, [activeTaskId]);
 
     // Start analysis mutation
     const startAnalysisMutation = useMutation({
