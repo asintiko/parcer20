@@ -91,8 +91,9 @@ def normalize_amount_positive(value) -> Decimal:
 
 def download_pdf_text(file_id: int) -> str:
     """
-    Download PDF via internal backend endpoint and extract text with PyMuPDF.
-    Returns extracted text (may be empty).
+    Download PDF via internal backend endpoint and extract text with OCR fallback.
+    Uses cascade: PyMuPDF → pdfplumber → OCR (Tesseract).
+    Returns extracted text (may be empty if all methods fail).
     """
     url = f"{BACKEND_INTERNAL_URL.rstrip('/')}/api/tg/files/{file_id}"
     with httpx.Client(timeout=60) as client:
@@ -100,19 +101,16 @@ def download_pdf_text(file_id: int) -> str:
         resp.raise_for_status()
         pdf_bytes = resp.content
 
-    with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
-        texts = []
-        for page in doc:
-            try:
-                txt = page.get_text() or ""
-            except Exception:
-                txt = ""
-            if txt:
-                texts.append(txt)
-        full_text = "\n\n".join(texts).strip()
-        if len(full_text) > 20000:
-            full_text = full_text[:20000]
-        return full_text
+    # Use new cascade extraction with OCR fallback
+    from parsers.pdf_extractor import extract_text_from_pdf_bytes
+    text = extract_text_from_pdf_bytes(pdf_bytes, max_pages=2, use_ocr=True)
+
+    if not text or len(text.strip()) < 20:
+        logger.warning(f"PDF {file_id} has insufficient text after extraction: {len(text)} chars")
+        # Return what we have - don't fail, Vision API can handle images later if needed
+
+    # Limit to 20k chars for API efficiency
+    return text[:20000] if len(text) > 20000 else text
 
 
 def queue_receipt_task(task_data: dict) -> str:

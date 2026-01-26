@@ -36,6 +36,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     zlib1g \
     libssl3 \
     ca-certificates \
+    tesseract-ocr \
+    tesseract-ocr-rus \
+    tesseract-ocr-eng \
+    poppler-utils \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy TDLib artifacts
