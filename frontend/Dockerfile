@@ -12,8 +12,8 @@ RUN npm ci
 # Copy source code
 COPY . .
 
-# Copy Telegram Web K files (already built in public/tweb)
-# Note: public/tweb should contain pre-built telegram-web-k files
+# Drop legacy Telegram Web K assets to keep image slim
+RUN rm -rf public/tweb || true
 
 # Build application
 RUN npm run build
@@ -23,9 +23,6 @@ FROM nginx:alpine
 
 # Copy built files to nginx
 COPY --from=build /app/dist /usr/share/nginx/html
-
-# Copy Telegram Web K files
-COPY --from=build /app/public/tweb /usr/share/nginx/html/tweb
 
 # Copy nginx configuration
 COPY nginx.conf /etc/nginx/conf.d/default.conf

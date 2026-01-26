@@ -1,6 +1,7 @@
 """
 Parser orchestrator - coordinates regex and GPT parsers with operator mapping
 """
+import os
 from typing import Dict, Any, Optional
 from sqlalchemy.orm import Session
 
@@ -12,10 +13,18 @@ from parsers.operator_mapper import OperatorMapper
 class ParserOrchestrator:
     """Main parsing coordinator that cascades through parsing strategies"""
     
-    def __init__(self, db_session: Session, openai_api_key: Optional[str] = None):
+    def __init__(self, db_session: Optional[Session], openai_api_key: Optional[str] = None, allow_missing_openai: bool = True):
         self.regex_parser = RegexParser()
-        self.gpt_parser = GPTParser(api_key=openai_api_key)
-        self.operator_mapper = OperatorMapper(db_session)
+        self.gpt_parser = None
+        self.openai_api_key = openai_api_key or os.getenv("OPENAI_API_KEY")
+        self.allow_missing_openai = allow_missing_openai
+        if self.openai_api_key:
+            try:
+                self.gpt_parser = GPTParser(api_key=self.openai_api_key, allow_without_api_key=allow_missing_openai)
+            except Exception as e:
+                print(f"⚠️ GPT parser unavailable at init: {e}")
+                self.gpt_parser = None
+        self.operator_mapper = OperatorMapper(db_session) if db_session is not None else None
         
         # Confidence threshold for accepting regex results
         self.confidence_threshold = 0.8
@@ -55,35 +64,125 @@ class ParserOrchestrator:
             print(f"❌ Regex parsing error: {e}")
             parsed_data = None
         
-        # Step 2: Fallback to GPT if regex failed
+        # Step 2: Fallback to GPT if regex failed and key is available
         if not parsed_data:
-            try:
-                parsed_data = self.gpt_parser.parse(raw_text)
-                if parsed_data:
-                    print(f"✅ GPT parsing successful")
-                else:
-                    print(f"❌ GPT parsing also failed")
+            if not self.gpt_parser and self.openai_api_key:
+                try:
+                    self.gpt_parser = GPTParser(api_key=self.openai_api_key, allow_without_api_key=self.allow_missing_openai)
+                except Exception as e:
+                    print(f"⚠️ GPT parser instantiation failed: {e}")
+                    self.gpt_parser = None
+
+            if self.gpt_parser and self.gpt_parser.enabled:
+                try:
+                    parsed_data = self.gpt_parser.parse(raw_text)
+                    if parsed_data:
+                        print(f"✅ GPT parsing successful")
+                    else:
+                        print(f"❌ GPT parsing also failed")
+                        return None
+                except Exception as e:
+                    print(f"❌ GPT parsing error: {e}")
                     return None
-            except Exception as e:
-                print(f"❌ GPT parsing error: {e}")
-                return None
+            else:
+                # No GPT available; stay silent and return None
+                parsed_data = None
         
-        # Step 3: Apply operator mapping
-        if parsed_data and parsed_data.get('operator_raw'):
+        # Step 3: Post-validation and enrichment
+        if parsed_data:
             try:
-                mapped_app = self.operator_mapper.map_operator(parsed_data['operator_raw'])
-                parsed_data['application_mapped'] = mapped_app
-                
-                if mapped_app:
-                    print(f"✅ Operator mapped: '{parsed_data['operator_raw']}' → '{mapped_app}'")
+                parsed_data = self._post_validate_and_enrich(parsed_data, raw_text)
+            except Exception as e:
+                print(f"❌ Post-validation error: {e}")
+                return None
+
+        # Step 4: Resolve application via reference dictionary, then AI fallback
+        if parsed_data and parsed_data.get('operator_raw') and self.operator_mapper:
+            operator_raw = parsed_data['operator_raw']
+            try:
+                match = self.operator_mapper.map_operator_details(operator_raw)
+                if match and match.get("application_name"):
+                    parsed_data['application_mapped'] = match["application_name"]
+                    if match.get("is_p2p") is not None:
+                        parsed_data['is_p2p'] = match["is_p2p"]
+                    parsed_data["app_resolution"] = {
+                        "method": "DICT",
+                        "match_type": match.get("match_type"),
+                        "reference_id": match.get("reference_id"),
+                    }
+                    print(f"✅ Operator mapped: '{operator_raw}' → '{match['application_name']}' ({match['match_type']})")
                 else:
-                    print(f"⚠️  No mapping found for operator: '{parsed_data['operator_raw']}'")
+                    # No dictionary hit; try AI resolution if available
+                    if self.gpt_parser and self.gpt_parser.enabled:
+                        known_apps = self.operator_mapper.get_existing_applications()
+                        hints = self.operator_mapper.get_candidate_examples(operator_raw, limit=10)
+                        ai = self.gpt_parser.resolve_application(operator_raw, raw_text, known_apps, hints)
+
+                        if ai and ai.get("application_name") and ai.get("application_name") != "Unknown" and ai.get("confidence", 0) >= 0.75:
+                            parsed_data["application_mapped"] = ai["application_name"]
+                            parsed_data["is_p2p"] = ai.get("is_p2p", parsed_data.get("is_p2p"))
+                            parsed_data["app_resolution"] = {
+                                "method": "AI",
+                                "confidence": ai.get("confidence"),
+                                "reasoning": ai.get("reasoning"),
+                                "recommended_operator_name": ai.get("recommended_operator_name"),
+                            }
+                            parsed_data["operator_reference_suggestion"] = {
+                                "operator_name": ai.get("recommended_operator_name") or operator_raw,
+                                "application_name": ai["application_name"],
+                                "is_p2p": ai.get("is_p2p"),
+                            }
+                            print(f"✅ AI-mapped operator: '{operator_raw}' → '{ai['application_name']}' (confidence {ai.get('confidence')})")
+                        else:
+                            # Heuristic fallback
+                            parsed_data["application_mapped"] = None
+                            parsed_data["is_p2p"] = 'P2P' in operator_raw.upper()
+                            parsed_data["app_resolution"] = {"method": "HEURISTIC"}
+                            print(f"⚠️  AI could not confidently map operator: '{operator_raw}'")
+                    else:
+                        parsed_data["application_mapped"] = None
+                        parsed_data["app_resolution"] = {"method": "HEURISTIC"}
+                        print(f"⚠️  No mapping found for operator and AI disabled: '{operator_raw}'")
             except Exception as e:
                 print(f"❌ Operator mapping error: {e}")
-                parsed_data['application_mapped'] = None
-        
-        # Step 4: Mark GPT usage
+                if 'application_mapped' not in parsed_data:
+                    parsed_data['application_mapped'] = None
+
+        # Step 5: Mark GPT usage
         if parsed_data:
             parsed_data['is_gpt_parsed'] = (parsed_data.get('parsing_method') == 'GPT')
         
         return parsed_data
+
+    def _post_validate_and_enrich(self, data: Dict[str, Any], raw_text: str) -> Dict[str, Any]:
+        """Ensure required fields and normalize values."""
+        if not data.get('amount') or not data.get('transaction_date') or not data.get('transaction_type'):
+            raise ValueError("Missing required fields")
+
+        # amount & balance non-negative
+        if data.get('amount') is not None:
+            data['amount'] = abs(data['amount'])
+        if data.get('balance_after') is not None:
+            data['balance_after'] = abs(data['balance_after'])
+
+        # currency uppercase, default UZS
+        if data.get('currency'):
+            data['currency'] = str(data['currency']).upper()
+        else:
+            data['currency'] = 'UZS'
+
+        # card last4 fallback
+        if not data.get('card_last_4'):
+            try:
+                from parsers.regex_parser import RegexParser
+                fallback = RegexParser().extract_card_last4(raw_text)
+                data['card_last_4'] = fallback
+            except Exception:
+                pass
+
+        # is_p2p heuristic only if not already set by parser
+        if data.get('is_p2p') is None:
+            operator_raw = (data.get('operator_raw') or '').upper()
+            data['is_p2p'] = 'P2P' in operator_raw
+
+        return data

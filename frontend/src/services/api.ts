@@ -21,7 +21,7 @@ const defaultHost =
     typeof window !== 'undefined'
         ? (window.location.hostname === 'localhost' ? '127.0.0.1' : window.location.hostname || '127.0.0.1')
         : '127.0.0.1';
-const API_BASE_URL = envApiUrl || `http://${defaultHost}:8000`;
+export const API_BASE_URL = envApiUrl || `http://${defaultHost}:8000`;
 
 export const apiClient = axios.create({
     baseURL: API_BASE_URL,
@@ -29,6 +29,27 @@ export const apiClient = axios.create({
         'Content-Type': 'application/json',
     },
 });
+
+// Add auth token to all requests
+apiClient.interceptors.request.use((config) => {
+    const token = localStorage.getItem('auth_token');
+    if (token) {
+        config.headers.Authorization = `Bearer ${token}`;
+    }
+    return config;
+});
+
+// Handle 401 responses
+apiClient.interceptors.response.use(
+    (response) => response,
+    (error) => {
+        if (error.response?.status === 401) {
+            // Single-user mode: just drop the token and let the request fail visibly
+            localStorage.removeItem('auth_token');
+        }
+        return Promise.reject(error);
+    }
+);
 
 // Types
 export interface Transaction {
@@ -137,6 +158,34 @@ export interface BulkUpdateResponse {
     errors: string[];
 }
 
+export interface ProcessReceiptResponse {
+    created: boolean;
+    duplicate: boolean;
+    transaction: Transaction;
+    parsing: {
+        method: string | null;
+        confidence: number | null;
+        notes?: string | null;
+    };
+}
+
+export interface ProcessReceiptBatchItem {
+    message_id: number;
+    success: boolean;
+    error?: string;
+    created?: boolean;
+    duplicate?: boolean;
+    transaction?: Transaction;
+}
+
+export interface ProcessReceiptBatchResponse {
+    results: ProcessReceiptBatchItem[];
+}
+
+export interface ProcessedStatusResponse {
+    statuses: Record<number, boolean>;
+}
+
 export interface CreateTransactionRequest {
     datetime: string;
     operator: string;
@@ -240,6 +289,37 @@ export const transactionsApi = {
 
     createTransaction: async (payload: CreateTransactionRequest): Promise<Transaction> => {
         const response = await apiClient.post<Transaction>('/api/transactions/', payload);
+        return response.data;
+    },
+
+    processReceipt: async (chatId: number, messageId: number, force = false): Promise<ProcessReceiptResponse> => {
+        const response = await apiClient.post<ProcessReceiptResponse>('/api/transactions/process-receipt', {
+            chat_id: chatId,
+            message_id: messageId,
+            force,
+        });
+        return response.data;
+    },
+
+    processReceiptBatch: async (
+        chatId: number,
+        messageIds: number[],
+        force = false
+    ): Promise<ProcessReceiptBatchResponse> => {
+        const response = await apiClient.post<ProcessReceiptBatchResponse>('/api/transactions/process-receipt-batch', {
+            chat_id: chatId,
+            message_ids: messageIds,
+            force,
+        });
+        return response.data;
+    },
+
+    getProcessedStatus: async (chatId: number, messageIds: number[]): Promise<ProcessedStatusResponse> => {
+        const params = {
+            chat_id: chatId,
+            message_ids: messageIds.join(','),
+        };
+        const response = await apiClient.get<ProcessedStatusResponse>('/api/transactions/processed-status', { params });
         return response.data;
     },
 };
@@ -388,8 +468,22 @@ export const automationApi = {
     },
 
     getAnalyzeStatus: async (taskId: string): Promise<AnalyzeStatusResponse> => {
-        const response = await apiClient.get<AnalyzeStatusResponse>(`/api/automation/analyze-status/${taskId}`);
-        return response.data;
+        try {
+            const response = await apiClient.get<AnalyzeStatusResponse>(`/api/automation/analyze-status/${taskId}`);
+            return response.data;
+        } catch (err: any) {
+            const status = err?.response?.status;
+            if (status === 404) {
+                // Gracefully handle missing/expired task ids
+                return {
+                    task_id: taskId,
+                    status: 'not_found',
+                    progress: { total: 0, processed: 0, percent: 0 },
+                    results: undefined,
+                };
+            }
+            throw err;
+        }
     },
 
     getSuggestions: async (params: {
@@ -459,6 +553,211 @@ export const userbotApi = {
 
     disconnect: async (): Promise<{ success: boolean; message: string }> => {
         const response = await apiClient.post('/api/userbot/disconnect');
+        return response.data;
+    },
+};
+
+// Telegram TDLib client types
+export type TelegramAuthState =
+    | 'wait_phone_number'
+    | 'wait_code'
+    | 'wait_password'
+    | 'wait_tdlib_parameters'
+    | 'wait_encryption_key'
+    | 'ready'
+    | 'closing'
+    | 'closed'
+    | 'logging_out'
+    | 'tdlib_unavailable'
+    | 'misconfigured'
+    | 'unknown';
+
+export interface TelegramUserSummary {
+    id?: number;
+    first_name?: string;
+    last_name?: string;
+    username?: string;
+    phone_number?: string;
+}
+
+export interface TelegramAuthStatus {
+    state: TelegramAuthState;
+    raw_state: string;
+    is_authorized: boolean;
+    phone_number?: string;
+    user?: TelegramUserSummary;
+}
+
+export interface TelegramChatMessage {
+    id?: number;
+    date?: string;
+    is_outgoing?: boolean;
+    sender_id?: any;
+    text?: string | null;
+    document?: {
+        file_id: number;
+        file_name?: string;
+        mime_type?: string;
+        size?: number;
+        download_url?: string;
+        local_path?: string;
+    } | null;
+}
+
+export interface TelegramBotChat {
+    chat_id: number;
+    title: string;
+    username?: string;
+    is_hidden: boolean;
+    is_monitored?: boolean;
+    monitor_enabled?: boolean;
+    last_message?: TelegramChatMessage | null;
+}
+
+export interface TelegramChatListResponse {
+    total: number;
+    items: TelegramBotChat[];
+}
+
+export interface TelegramMessagesResponse {
+    total: number;
+    items: TelegramChatMessage[];
+}
+
+export interface TelegramProcessResult {
+    chat_id: number;
+    message_id: number;
+    task_id?: string;
+    status: 'queued' | 'processing' | 'done' | 'failed' | 'not_processed';
+    check_id?: number;
+    error?: string;
+}
+
+export interface TelegramProcessBatchResponse {
+    results: TelegramProcessResult[];
+}
+
+export interface TelegramMonitoredChat {
+    chat_id: number;
+    enabled: boolean;
+    last_processed_message_id: number;
+    last_error?: string | null;
+    created_at?: string | null;
+    updated_at?: string | null;
+}
+
+export interface TelegramMonitorStatus {
+    running: boolean;
+    queue_size: number;
+    workers: number;
+}
+
+// Telegram TDLib client API
+export const telegramClientApi = {
+    getStatus: async (): Promise<TelegramAuthStatus> => {
+        const response = await apiClient.get<TelegramAuthStatus>('/api/tg/status');
+        return response.data;
+    },
+
+    sendPhoneNumber: async (phone_number: string): Promise<TelegramAuthStatus> => {
+        const response = await apiClient.post<TelegramAuthStatus>('/api/tg/auth/phone', { phone_number });
+        return response.data;
+    },
+
+    sendCode: async (code: string): Promise<TelegramAuthStatus> => {
+        const response = await apiClient.post<TelegramAuthStatus>('/api/tg/auth/code', { code });
+        return response.data;
+    },
+
+    sendPassword: async (password: string): Promise<TelegramAuthStatus> => {
+        const response = await apiClient.post<TelegramAuthStatus>('/api/tg/auth/password', { password });
+        return response.data;
+    },
+
+    getChats: async (params: { search?: string; include_hidden?: boolean; limit?: number; offset?: number }): Promise<TelegramChatListResponse> => {
+        const response = await apiClient.get<TelegramChatListResponse>('/api/tg/chats', { params });
+        return response.data;
+    },
+
+    hideChat: async (chatId: number): Promise<void> => {
+        await apiClient.post(`/api/tg/chats/${chatId}/hide`);
+    },
+
+    unhideChat: async (chatId: number): Promise<void> => {
+        await apiClient.post(`/api/tg/chats/${chatId}/unhide`);
+    },
+
+    getMessages: async (chatId: number, params?: { limit?: number; from_message_id?: number; all?: boolean }): Promise<TelegramMessagesResponse> => {
+        const response = await apiClient.get<TelegramMessagesResponse>(`/api/tg/chats/${chatId}/messages`, { params });
+        return response.data;
+    },
+
+    sendMessage: async (chatId: number, text: string): Promise<TelegramChatMessage> => {
+        const response = await apiClient.post<TelegramChatMessage>(`/api/tg/chats/${chatId}/messages`, { text });
+        return response.data;
+    },
+
+    sendPdf: async (chatId: number, file: File, caption?: string): Promise<TelegramChatMessage> => {
+        const form = new FormData();
+        form.append('file', file);
+        if (caption) form.append('caption', caption);
+        const response = await apiClient.post<TelegramChatMessage>(`/api/tg/chats/${chatId}/documents`, form, {
+            headers: { 'Content-Type': 'multipart/form-data' },
+        });
+        return response.data;
+    },
+
+    processMessage: async (chatId: number, messageId: number): Promise<TelegramProcessResult> => {
+        const response = await apiClient.post<TelegramProcessResult>(
+            `/api/tg/chats/${chatId}/messages/${messageId}/process`
+        );
+        return response.data;
+    },
+
+    processBatch: async (chatId: number, messageIds: number[]): Promise<TelegramProcessBatchResponse> => {
+        const response = await apiClient.post<TelegramProcessBatchResponse>(`/api/tg/chats/${chatId}/process-batch`, {
+            message_ids: messageIds,
+        });
+        return response.data;
+    },
+
+    getReceiptStatus: async (chatId: number, messageIds: number[]): Promise<TelegramProcessBatchResponse> => {
+        const params = { message_ids: messageIds.join(',') };
+        const response = await apiClient.get<TelegramProcessBatchResponse>(
+            `/api/tg/chats/${chatId}/receipt-status`,
+            { params }
+        );
+        return response.data;
+    },
+
+    getMonitors: async (): Promise<TelegramMonitoredChat[]> => {
+        const response = await apiClient.get<TelegramMonitoredChat[]>('/api/tg/monitors');
+        return response.data;
+    },
+
+    setMonitor: async (chatId: number, enabled: boolean, startFromLatest = true): Promise<TelegramMonitoredChat> => {
+        const response = await apiClient.put<TelegramMonitoredChat>(`/api/tg/monitors/${chatId}`, {
+            enabled,
+            start_from_latest: startFromLatest,
+        });
+        return response.data;
+    },
+
+    getMonitorStatus: async (): Promise<TelegramMonitorStatus> => {
+        const response = await apiClient.get<TelegramMonitorStatus>('/api/tg/monitor/status');
+        return response.data;
+    },
+
+    processReceiptDirect: async (
+        chatId: number,
+        messageId: number,
+        force = false
+    ): Promise<ProcessReceiptResponse> => {
+        const response = await apiClient.post<ProcessReceiptResponse>('/api/transactions/process-receipt', {
+            chat_id: chatId,
+            message_id: messageId,
+            force,
+        });
         return response.data;
     },
 };

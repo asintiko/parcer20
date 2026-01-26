@@ -239,7 +239,7 @@ export const EditableCell: React.FC<EditableCellProps> = ({
                     <input
                         ref={inputRef as React.RefObject<HTMLInputElement>}
                         type="date"
-                        value={editValue || ''}
+                        value={toDateString(editValue)}
                         onChange={(e) => setEditValue(e.target.value)}
                         onBlur={handleSave}
                         onKeyDown={handleKeyDown}
@@ -253,7 +253,7 @@ export const EditableCell: React.FC<EditableCellProps> = ({
                     <input
                         ref={inputRef as React.RefObject<HTMLInputElement>}
                         type="time"
-                        value={editValue || ''}
+                        value={toTimeString(editValue)}
                         onChange={(e) => setEditValue(e.target.value)}
                         onBlur={handleSave}
                         onKeyDown={handleKeyDown}
@@ -267,7 +267,7 @@ export const EditableCell: React.FC<EditableCellProps> = ({
                     <input
                         ref={inputRef as React.RefObject<HTMLInputElement>}
                         type="datetime-local"
-                        value={editValue || ''}
+                        value={toDateTimeString(editValue)}
                         onChange={(e) => setEditValue(e.target.value)}
                         onBlur={handleSave}
                         onKeyDown={handleKeyDown}

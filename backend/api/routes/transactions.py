@@ -2,17 +2,23 @@
 Transaction API routes
 Server-side pagination, sorting, and filtering for financial transactions
 """
-from fastapi import APIRouter, Depends, Query, HTTPException
-from sqlalchemy.orm import Session
-from sqlalchemy import func, asc, desc, extract
-from typing import List, Optional, Callable
+import json
 import re
 from datetime import datetime
-from pydantic import BaseModel, Field
 from decimal import Decimal
+from typing import Any, Callable, Dict, List, Optional
+
+import pytz
+from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy import asc, desc, extract, func
+from sqlalchemy.orm import Session
+from pydantic import BaseModel, Field
 
 from database.connection import get_db_session
-from database.models import Check
+from database.models import Transaction, Check
+from services.telegram_tdlib_manager import TelegramTDLibManager, get_tdlib_manager
+from services.receipt_processor import process_tdlib_message
+from api.dependencies import get_current_user
 
 # Normalization helpers
 EMOJI_PATTERN = re.compile(r"[\U0001F300-\U0001FAFF\U00002600-\U000027BF]")
@@ -31,24 +37,26 @@ TRANSACTION_TYPE_DISPLAY_MAP = {
 }
 
 
-def normalize_source_type(added_via: Optional[str]) -> str:
+def normalize_source_type(source_type: Optional[str]) -> str:
     """
-    Map legacy source/added_via values to AUTO|MANUAL
+    Normalize source type to AUTO|MANUAL.
     """
-    if not added_via:
+    if not source_type:
         return "MANUAL"
-    value = added_via.strip().lower()
-    if value in {"bot", "auto", "telegram", "userbot"}:
-        return "AUTO"
-    return "MANUAL"
+    value = source_type.strip().upper()
+    return "AUTO" if value == "AUTO" else "MANUAL"
 
 
-def detect_source_channel(added_via: Optional[str], raw_text: Optional[str]) -> str:
+def detect_source_channel(source_type: Optional[str], raw_text: Optional[str]) -> str:
     """
     Determine source channel for UI: TELEGRAM, SMS, or MANUAL.
     """
-    if added_via and added_via.strip().lower() == "manual":
-        return "MANUAL"
+    if source_type:
+        st = source_type.upper()
+        if st == "MANUAL":
+            return "MANUAL"
+        if st in ("AUTO", "TELEGRAM", "USERBOT", "BOT", "AUTO"):
+            return "TELEGRAM"
     if raw_text and EMOJI_PATTERN.search(raw_text):
         return "TELEGRAM"
     return "SMS"
@@ -184,40 +192,199 @@ class TransactionListResponse(BaseModel):
     items: List[TransactionResponse]
 
 
-def build_transaction_response(c: Check) -> TransactionResponse:
+class ProcessReceiptRequest(BaseModel):
+    chat_id: int
+    message_id: int
+    force: bool = False
+
+
+class ParsingInfo(BaseModel):
+    method: Optional[str] = None
+    confidence: Optional[float] = None
+    notes: Optional[str] = None
+
+
+class ProcessReceiptResponse(BaseModel):
+    created: bool
+    duplicate: bool
+    transaction: TransactionResponse
+    parsing: ParsingInfo
+
+
+class ProcessReceiptBatchRequest(BaseModel):
+    chat_id: int
+    message_ids: List[int]
+    force: bool = False
+
+
+class ProcessReceiptBatchItem(BaseModel):
+    message_id: int
+    success: bool
+    error: Optional[str] = None
+    created: Optional[bool] = None
+    duplicate: Optional[bool] = None
+    transaction: Optional[TransactionResponse] = None
+    parsing: Optional[ParsingInfo] = None
+
+
+class ProcessReceiptBatchResponse(BaseModel):
+    results: List[ProcessReceiptBatchItem]
+
+
+class ProcessedStatusResponse(BaseModel):
+    statuses: Dict[int, bool]
+
+
+def build_transaction_response(c: Transaction) -> TransactionResponse:
+    parsing_method = getattr(c, "parsing_method", None)
+    parsing_confidence = getattr(c, "parsing_confidence", None)
+    is_gpt_parsed = getattr(c, "is_gpt_parsed", None)
+    metadata_json = getattr(c, "metadata_json", None) or getattr(c, "metadata", None) if hasattr(c, "metadata") else None
+    if metadata_json:
+        try:
+            meta = json.loads(metadata_json)
+            parsing_method = meta.get("parsing_method", parsing_method)
+            parsing_confidence = meta.get("parsing_confidence", parsing_confidence)
+            is_gpt_parsed = meta.get("is_gpt_parsed", is_gpt_parsed)
+        except Exception:
+            pass
+
+    raw_message = getattr(c, "raw_message", None) or getattr(c, "raw_text", None)
+    tx_date = getattr(c, "transaction_date", None) or getattr(c, "datetime", None)
+    amount_val = getattr(c, "amount", Decimal("0"))
+    card4 = getattr(c, "card_last_4", None) or getattr(c, "card_last4", None)
+    operator_raw = getattr(c, "operator_raw", None) or getattr(c, "operator", None)
+    app_mapped = getattr(c, "application_mapped", None) or getattr(c, "app", None)
+    balance_val = getattr(c, "balance_after", None) or getattr(c, "balance", None)
+    source_type_raw = getattr(c, "source_type", None)
+    if not source_type_raw:
+        added_via = getattr(c, "added_via", "") or ""
+        source_type_raw = "AUTO" if added_via.lower() != "manual" else "MANUAL"
+
     canonical_type = infer_transaction_type(
         getattr(c, "transaction_type", None),
-        getattr(c, "raw_text", None)
+        raw_message
     )
-    source_type_val = normalize_source_type(
-        getattr(c, "added_via", None) or getattr(c, "source", None)
-    )
+    source_type_val = normalize_source_type(source_type_raw)
     source_channel = detect_source_channel(
-        getattr(c, "added_via", None),
-        getattr(c, "raw_text", None)
+        source_type_raw,
+        raw_message
     )
 
     return TransactionResponse(
         id=c.id,
-        transaction_date=c.datetime,
-        amount=normalize_amount_for_response(getattr(c, "amount", Decimal("0"))),
-        currency=c.currency,
-        card_last_4=c.card_last4,
-        operator_raw=c.operator,
-        application_mapped=c.app,
+        transaction_date=tx_date,
+        amount=normalize_amount_for_response(amount_val),
+        currency=getattr(c, "currency", "UZS"),
+        card_last_4=card4,
+        operator_raw=operator_raw,
+        application_mapped=app_mapped,
         transaction_type=canonical_type,
         transaction_type_display=get_transaction_type_display(canonical_type),
-        balance_after=normalize_optional_amount_for_response(getattr(c, "balance", None)),
+        balance_after=normalize_optional_amount_for_response(balance_val),
         source_type=source_type_val,
         source_channel=source_channel,
         source_display=get_source_display(source_channel),
-        parsing_method=getattr(c, "added_via", None),
-        parsing_confidence=None,
-        is_p2p=c.is_p2p,
-        created_at=c.created_at,
+        parsing_method=parsing_method,
+        parsing_confidence=parsing_confidence,
+        is_p2p=getattr(c, "is_p2p", None),
+        created_at=getattr(c, "created_at", None),
         updated_at=getattr(c, "updated_at", None),
-        raw_message=getattr(c, "raw_text", None)
+        raw_message=raw_message
     )
+
+
+
+@router.post("/process-receipt", response_model=ProcessReceiptResponse)
+async def process_receipt_from_telegram(
+    payload: ProcessReceiptRequest,
+    db: Session = Depends(get_db_session),
+    manager: TelegramTDLibManager = Depends(get_tdlib_manager),
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Process a Telegram message (chat_id, message_id) into a transaction.
+    """
+    return await process_tdlib_message(
+        chat_id=payload.chat_id,
+        message_id=payload.message_id,
+        force=payload.force,
+        db=db,
+        manager=manager,
+    )
+
+
+@router.post("/process-receipt-batch", response_model=ProcessReceiptBatchResponse)
+async def process_receipt_batch(
+    payload: ProcessReceiptBatchRequest,
+    db: Session = Depends(get_db_session),
+    manager: TelegramTDLibManager = Depends(get_tdlib_manager),
+    current_user: dict = Depends(get_current_user),
+):
+    results: List[ProcessReceiptBatchItem] = []
+    for msg_id in payload.message_ids:
+        try:
+            res = await process_tdlib_message(
+                chat_id=payload.chat_id,
+                message_id=msg_id,
+                force=payload.force,
+                db=db,
+                manager=manager,
+            )
+            results.append(
+                ProcessReceiptBatchItem(
+                    message_id=msg_id,
+                    success=True,
+                    created=res.created,
+                    duplicate=res.duplicate,
+                    transaction=res.transaction,
+                    parsing=res.parsing,
+                )
+            )
+        except HTTPException as exc:
+            results.append(
+                ProcessReceiptBatchItem(
+                    message_id=msg_id,
+                    success=False,
+                    error=exc.detail if isinstance(exc.detail, str) else str(exc.detail),
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            results.append(
+                ProcessReceiptBatchItem(
+                    message_id=msg_id,
+                    success=False,
+                    error=str(exc),
+                )
+            )
+    return ProcessReceiptBatchResponse(results=results)
+
+
+@router.get("/processed-status", response_model=ProcessedStatusResponse)
+async def get_processed_status(
+    chat_id: int = Query(...),
+    message_ids: str = Query(..., description="Comma-separated list of message IDs"),
+    db: Session = Depends(get_db_session),
+    current_user: dict = Depends(get_current_user),
+):
+    try:
+        ids = [int(x) for x in message_ids.split(",") if x.strip().isdigit()]
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid message_ids parameter")
+    if not ids:
+        return ProcessedStatusResponse(statuses={})
+
+    rows = (
+        db.query(Transaction.source_message_id)
+        .filter(
+            Transaction.source_chat_id == str(chat_id),
+            Transaction.source_message_id.in_([str(i) for i in ids]),
+        )
+        .all()
+    )
+    found_ids = {int(r[0]) for r in rows}
+    statuses = {mid: (mid in found_ids) for mid in ids}
+    return ProcessedStatusResponse(statuses=statuses)
 
 
 # Update/Delete schemas
@@ -307,7 +474,8 @@ class TransactionCreateRequest(BaseModel):
 @router.patch("/bulk-update", response_model=BulkUpdateResponse)
 async def bulk_update_transactions(
     request: BulkUpdateRequest,
-    db: Session = Depends(get_db_session)
+    db: Session = Depends(get_db_session),
+    current_user: dict = Depends(get_current_user),
 ):
     """
     Apply multiple updates in one request.
@@ -331,7 +499,7 @@ async def bulk_update_transactions(
 
     try:
         for item in request.updates:
-            c = db.query(Check).filter(Check.id == item.id).first()
+            c = db.query(Transaction).filter(Transaction.id == item.id).first()
             if not c:
                 failed_ids.append(item.id)
                 errors.append(f"ID {item.id} not found")
@@ -347,7 +515,7 @@ async def bulk_update_transactions(
             if "transaction_type" in fields:
                 c.transaction_type = infer_transaction_type(
                     fields["transaction_type"],
-                    getattr(c, "raw_text", None)
+                    getattr(c, "raw_message", None)
                 )
 
             if "source_type" in fields:
@@ -355,19 +523,19 @@ async def bulk_update_transactions(
                 c.added_via = "bot" if src == "AUTO" else "manual"
 
             if "transaction_date" in fields:
-                c.datetime = fields["transaction_date"]
+                c.transaction_date = fields["transaction_date"]
 
             if "operator_raw" in fields:
-                c.operator = fields["operator_raw"]
+                c.operator_raw = fields["operator_raw"]
 
             if "application_mapped" in fields:
-                c.app = fields["application_mapped"]
+                c.application_mapped = fields["application_mapped"]
 
             if "currency" in fields:
                 c.currency = fields["currency"]
 
             if "card_last_4" in fields:
-                c.card_last4 = fields["card_last_4"]
+                c.card_last_4 = fields["card_last_4"]
 
             if "is_p2p" in fields:
                 c.is_p2p = fields["is_p2p"]
@@ -379,7 +547,7 @@ async def bulk_update_transactions(
                 amt = Decimal(str(fields["amount"]))
                 txn_type = infer_transaction_type(
                     c.transaction_type,
-                    getattr(c, "raw_text", None)
+                    getattr(c, "raw_message", None)
                 )
                 store_amount = -abs(amt) if txn_type == "DEBIT" else abs(amt)
                 c.amount = store_amount
@@ -431,70 +599,71 @@ async def get_transactions(
     currency: Optional[str] = Query(None, pattern="^(UZS|USD)$"),
     card: Optional[str] = Query(None, description="Filter by last 4 digits of card"),
     days_of_week: Optional[str] = Query(None, description="Comma-separated day of week numbers 0-6"),
-    db: Session = Depends(get_db_session)
+    db: Session = Depends(get_db_session),
+    current_user: dict = Depends(get_current_user),
 ):
     """
-    Get paginated list of transactions (Checks) with server-side filters and sorting.
+    Get paginated list of transactions (Transactions) with server-side filters and sorting.
     """
-    query = db.query(Check)
+    query = db.query(Transaction)
 
     # Filters
     if date_from:
-        query = query.filter(Check.datetime >= date_from)
+        query = query.filter(Transaction.transaction_date >= date_from)
     if date_to:
-        query = query.filter(Check.datetime <= date_to)
+        query = query.filter(Transaction.transaction_date <= date_to)
     if operator:
-        query = query.filter(Check.operator.ilike(f"%{operator}%"))
+        query = query.filter(Transaction.operator_raw.ilike(f"%{operator}%"))
     operator_list = _split_csv(operators)
     if operator_list:
-        query = query.filter(Check.operator.in_(operator_list))
+        query = query.filter(Transaction.operator_raw.in_(operator_list))
     if app:
-        query = query.filter(Check.app.ilike(f"%{app}%"))
+        query = query.filter(Transaction.application_mapped.ilike(f"%{app}%"))
     app_list = _split_csv(apps)
     if app_list:
-        query = query.filter(Check.app.in_(app_list))
+        query = query.filter(Transaction.application_mapped.in_(app_list))
     if amount_min is not None:
-        query = query.filter(Check.amount >= amount_min)
+        query = query.filter(func.abs(Transaction.amount) >= amount_min)
     if amount_max is not None:
-        query = query.filter(Check.amount <= amount_max)
+        query = query.filter(func.abs(Transaction.amount) <= amount_max)
     if parsing_method:
-        query = query.filter(Check.added_via.ilike(f"%{parsing_method}%"))
+        query = query.filter(Transaction.parsing_method == parsing_method)
+    if confidence_min is not None:
+        query = query.filter(Transaction.parsing_confidence >= confidence_min)
+    if confidence_max is not None:
+        query = query.filter(Transaction.parsing_confidence <= confidence_max)
     if search:
-        query = query.filter(Check.raw_text.ilike(f"%{search}%"))
+        query = query.filter(Transaction.raw_message.ilike(f"%{search}%"))
     if source_type:
-        # map AUTO -> bot, MANUAL -> manual
-        if source_type == "AUTO":
-            query = query.filter(Check.added_via.ilike("%bot%"))
-        else:
-            query = query.filter(Check.added_via.ilike("%manual%"))
+        query = query.filter(Transaction.source_type == source_type)
     if transaction_type:
         norm_type = normalize_transaction_type(transaction_type)
-        query = query.filter(Check.transaction_type == norm_type)
+        query = query.filter(Transaction.transaction_type == norm_type)
     tx_type_list = _split_csv(transaction_types)
     if tx_type_list:
         norm_list = [normalize_transaction_type(t) for t in tx_type_list]
-        query = query.filter(Check.transaction_type.in_(norm_list))
+        query = query.filter(Transaction.transaction_type.in_(norm_list))
     if currency:
-        query = query.filter(Check.currency == currency)
+        query = query.filter(Transaction.currency == currency)
     if card:
-        query = query.filter(Check.card_last4 == card)
+        query = query.filter(Transaction.card_last_4 == card)
     dow_values = [int(x) for x in _split_csv(days_of_week) if x.isdigit()]
     if dow_values:
-        query = query.filter(extract("dow", Check.datetime).in_(dow_values))
+        query = query.filter(extract("dow", Transaction.transaction_date).in_(dow_values))
 
     total = query.count()
 
     # Sorting (whitelisted)
     sort_map: dict[str, Callable] = {
-        "transaction_date": Check.datetime,
-        "amount": Check.amount,
-        "created_at": Check.created_at,
-        "parsing_confidence": Check.metadata_json,  # placeholder for absence, fall back to created_at
-        "updated_at": Check.updated_at,
+        "transaction_date": Transaction.transaction_date,
+        "amount": func.abs(Transaction.amount),
+        "created_at": Transaction.created_at,
+        "parsing_confidence": Transaction.parsing_confidence,
+        "updated_at": Transaction.updated_at,
     }
-    sort_column = sort_map.get(sort_by, Check.datetime)
+    sort_column = sort_map.get(sort_by, Transaction.transaction_date)
     order_fn = desc if sort_dir.lower() == "desc" else asc
-    query = query.order_by(order_fn(sort_column), Check.id.desc())
+    query = query.order_by(order_fn(sort_column), Transaction.id.desc())
 
     # Pagination
     offset = (page - 1) * page_size
@@ -513,7 +682,8 @@ async def get_transactions(
 @router.post("/", response_model=TransactionResponse)
 async def create_transaction(
     payload: TransactionCreateRequest,
-    db: Session = Depends(get_db_session)
+    db: Session = Depends(get_db_session),
+    current_user: dict = Depends(get_current_user),
 ):
     """
     Manually create a new transaction/check.
@@ -524,33 +694,48 @@ async def create_transaction(
         store_amount = -abs(amount) if txn_type == "DEBIT" else abs(amount)
 
         dt = payload.datetime
-        weekday_label = compute_weekday_label(dt)
-        date_display = compute_date_display(dt)
-        time_display = compute_time_display(dt)
 
-        check = Check(
-            datetime=dt,
-            weekday=weekday_label,
-            date_display=date_display,
-            time_display=time_display,
-            operator=payload.operator,
-            app=payload.app,
+        # Generate raw_message from payload if not provided
+        raw_message = payload.raw_text or f"{txn_type}\n{payload.operator}\nСумма: {amount} {payload.currency}\nКарта: *{payload.card_last4}"
+
+        txn = Transaction(
+            transaction_date=dt,
+            operator_raw=payload.operator,
+            application_mapped=payload.app,
             amount=store_amount,
-            balance=payload.balance,
-            card_last4=payload.card_last4,
+            balance_after=payload.balance,
+            card_last_4=payload.card_last4,
             is_p2p=payload.is_p2p or False,
             transaction_type=txn_type,
             currency=payload.currency,
-            source="Manual",
-            added_via="manual",
-            raw_text=payload.raw_text,
+            source_type="MANUAL",
+            source_chat_id=0,  # 0 for manual transactions
+            raw_message=raw_message,
+            parsing_method="REGEX_SMS",  # Use valid parsing method
+            parsing_confidence=None,
+            is_gpt_parsed=False,
         )
 
-        db.add(check)
+        db.add(txn)
         db.commit()
-        db.refresh(check)
+        db.refresh(txn)
 
-        return build_transaction_response(check)
+        # Auto-map application if not provided
+        if not payload.app and txn.operator_raw:
+            try:
+                from parsers.operator_mapper import OperatorMapper
+                mapper = OperatorMapper(db)
+                match = mapper.map_operator_details(txn.operator_raw)
+                if match and match.get("application_name"):
+                    txn.application_mapped = match["application_name"]
+                    if match.get("is_p2p") is not None:
+                        txn.is_p2p = match["is_p2p"]
+                    db.commit()
+                    db.refresh(txn)
+            except Exception as e:
+                print(f"⚠️ Failed to auto-map operator: {e}")
+
+        return build_transaction_response(txn)
     except HTTPException:
         db.rollback()
         raise
@@ -562,28 +747,30 @@ async def create_transaction(
 @router.get("/{transaction_id}", response_model=TransactionResponse)
 async def get_transaction(
     transaction_id: int,
-    db: Session = Depends(get_db_session)
+    db: Session = Depends(get_db_session),
+    current_user: dict = Depends(get_current_user),
 ):
     """Get single transaction by ID"""
-    c = db.query(Check).filter(Check.id == transaction_id).first()
+    tx = db.query(Transaction).filter(Transaction.id == transaction_id).first()
 
-    if not c:
+    if not tx:
         raise HTTPException(status_code=404, detail="Transaction not found")
 
-    return build_transaction_response(c)
+    return build_transaction_response(tx)
 
 
 @router.put("/{transaction_id}", response_model=TransactionUpdateResponse)
 async def update_transaction(
     transaction_id: int,
     update_data: TransactionUpdateRequest,
-    db: Session = Depends(get_db_session)
+    db: Session = Depends(get_db_session),
+    current_user: dict = Depends(get_current_user),
 ):
     """
     Update a transaction by ID (partial updates supported).
     """
     try:
-        c = db.query(Check).filter(Check.id == transaction_id).first()
+        c = db.query(Transaction).filter(Transaction.id == transaction_id).first()
 
         if not c:
             raise HTTPException(status_code=404, detail=f"Transaction {transaction_id} not found")
@@ -594,41 +781,40 @@ async def update_transaction(
         if "transaction_type" in update_dict:
             c.transaction_type = infer_transaction_type(
                 update_dict["transaction_type"],
-                getattr(c, "raw_text", None)
+                getattr(c, "raw_message", None)
             )
 
-        # Normalize source_type -> added_via
         if "source_type" in update_dict and update_dict["source_type"]:
             src = update_dict["source_type"]
-            c.added_via = "bot" if src == "AUTO" else "manual"
+            c.source_type = "AUTO" if src == "AUTO" else "MANUAL"
 
         if "transaction_date" in update_dict:
-            c.datetime = update_dict["transaction_date"]
+            c.transaction_date = update_dict["transaction_date"]
 
         if "operator_raw" in update_dict:
-            c.operator = update_dict["operator_raw"]
+            c.operator_raw = update_dict["operator_raw"]
 
         if "application_mapped" in update_dict:
-            c.app = update_dict["application_mapped"]
+            c.application_mapped = update_dict["application_mapped"]
 
         if "currency" in update_dict:
             c.currency = update_dict["currency"]
 
         if "card_last_4" in update_dict:
-            c.card_last4 = update_dict["card_last_4"]
+            c.card_last_4 = update_dict["card_last_4"]
 
         if "is_p2p" in update_dict:
             c.is_p2p = update_dict["is_p2p"]
 
         if "balance_after" in update_dict:
-            c.balance = update_dict["balance_after"]
+            c.balance_after = update_dict["balance_after"]
 
         # Amount normalization: store debits as negative, credits/etc as positive
         if "amount" in update_dict:
             amt = Decimal(str(update_dict["amount"]))
             txn_type = infer_transaction_type(
                 c.transaction_type,
-                getattr(c, "raw_text", None)
+                getattr(c, "raw_message", None)
             )
             store_amount = -abs(amt) if txn_type == "DEBIT" else abs(amt)
             c.amount = store_amount
@@ -655,13 +841,14 @@ async def update_transaction(
 @router.delete("/{transaction_id}", response_model=DeleteResponse)
 async def delete_transaction(
     transaction_id: int,
-    db: Session = Depends(get_db_session)
+    db: Session = Depends(get_db_session),
+    current_user: dict = Depends(get_current_user),
 ):
     """
     Delete a transaction by ID
     """
     try:
-        check = db.query(Check).filter(Check.id == transaction_id).first()
+        check = db.query(Transaction).filter(Transaction.id == transaction_id).first()
 
         if not check:
             raise HTTPException(status_code=404, detail=f"Transaction {transaction_id} not found")
@@ -686,17 +873,18 @@ async def delete_transaction(
 @router.post("/bulk-delete", response_model=BulkDeleteResponse)
 async def bulk_delete_transactions(
     request: BulkDeleteRequest,
-    db: Session = Depends(get_db_session)
+    db: Session = Depends(get_db_session),
+    current_user: dict = Depends(get_current_user),
 ):
     """
     Delete multiple transactions at once
     """
     try:
         ids = request.ids
-        existing_ids = set(id_ for (id_,) in db.query(Check.id).filter(Check.id.in_(ids)).all())
+        existing_ids = set(id_ for (id_,) in db.query(Transaction.id).filter(Transaction.id.in_(ids)).all())
         failed_ids = [i for i in ids if i not in existing_ids]
 
-        deleted_count = db.query(Check).filter(Check.id.in_(existing_ids)).delete(synchronize_session=False)
+        deleted_count = db.query(Transaction).filter(Transaction.id.in_(existing_ids)).delete(synchronize_session=False)
         db.commit()
 
         return BulkDeleteResponse(

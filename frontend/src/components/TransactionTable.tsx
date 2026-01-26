@@ -18,7 +18,7 @@ import {
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { Transaction } from '../services/api';
 import { formatDate, formatTime, formatDateTime, EMPTY_VALUE as DATE_EMPTY } from '../utils/dateTimeFormatters';
-import { ChevronUp, ChevronDown, Search, FileText, Filter, Eye, Undo2, Redo2, X } from 'lucide-react';
+import { ChevronUp, ChevronDown, Search, FileText, Filter, Eye, Undo2, Redo2, X, Trash2 } from 'lucide-react';
 import { ContextMenu } from './ContextMenu';
 import { FilterDrawer } from './FilterDrawer';
 import { EditableCell, CellType, SelectOption } from './EditableCell';
@@ -70,6 +70,8 @@ interface TransactionTableProps {
     }>) => void;
     onPageChange: (page: number) => void;
     onPageSizeChange: (size: number) => void;
+    operatorOptions?: string[];
+    appOptions?: string[];
 }
 
 // Types for Styling
@@ -117,7 +119,7 @@ type ActiveFilters = {
     daysOfWeek?: number[];
     amountMin?: string;
     amountMax?: string;
-    currency?: 'UZS' | 'USD';
+    currency?: 'ALL' | 'UZS' | 'USD';
     transactionTypes?: string[];
     operators?: string[];
     apps?: string[];
@@ -130,10 +132,12 @@ const DraggableTableHeader = ({
     header,
     children,
     onContextMenu,
+    paddingClass,
 }: {
     header: Header<Transaction, unknown>;
     children: React.ReactNode;
     onContextMenu: (e: React.MouseEvent) => void;
+    paddingClass: string;
 }) => {
     const {
         attributes,
@@ -158,7 +162,7 @@ const DraggableTableHeader = ({
         <th
             ref={setNodeRef}
             style={style}
-            className={`relative group bg-table-header font-semibold text-foreground border border-table-border select-none ${isDragging ? 'shadow-xl bg-primary-light border-primary z-50' : ''}`}
+            className={`relative group bg-table-header font-semibold text-foreground border border-table-border select-none ${paddingClass} ${isDragging ? 'shadow-xl bg-primary-light border-primary z-50' : ''}`}
             onContextMenu={onContextMenu}
         >
             <div
@@ -196,6 +200,8 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
     onQueryChange,
     onPageChange,
     onPageSizeChange,
+    operatorOptions = [],
+    appOptions = [],
 }) => {
     const [sorting, setSorting] = useState<SortingState>([{ id: 'transaction_date', desc: false }]);
     const [columnFilters, setColumnFilters] = useState<ColumnFiltersState>([]);
@@ -213,7 +219,7 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
 
     // Advanced Filters State
     const [filterDrawerOpen, setFilterDrawerOpen] = useState(false);
-    const [activeFilters, setActiveFilters] = useState<ActiveFilters>({ currency: 'UZS' }); // Default to UZS
+    const [activeFilters, setActiveFilters] = useState<ActiveFilters>({ currency: 'ALL' }); // Default all currencies
     const activeFilterCount = Object.keys(activeFilters).filter(k => {
         const v = (activeFilters as any)[k];
         if (k === 'currency') return false; // Don't count currency as active filter
@@ -723,6 +729,13 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
     }, [setDefaultPreset]);
 
     const rowHeight = useMemo(() => ROW_HEIGHT_BY_DENSITY[density] || ROW_HEIGHT_BY_DENSITY.standard, [density]);
+    const cellPadding = useMemo(() => {
+        return {
+            compact: 'px-2 py-1',
+            standard: 'px-3 py-2',
+            comfortable: 'px-4 py-3',
+        }[density];
+    }, [density]);
     const rows = table.getRowModel().rows;
     const rowCount = rows.length;
 
@@ -781,6 +794,11 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
         getItemKey: (index) => rows[index]?.id ?? index,
     });
 
+    // Force virtualizer to recompute sizes when плотность меняется
+    useEffect(() => {
+        rowVirtualizer.measure();
+    }, [density, rowVirtualizer]);
+
     const virtualRows = rowVirtualizer.getVirtualItems();
     const totalSize = rowVirtualizer.getTotalSize();
     const paddingTop = virtualRows.length > 0 ? virtualRows[0].start : 0;
@@ -794,6 +812,33 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
             console.warn(`[TransactionTable] Rendering ${rowCount} rows without virtualization enabled`);
         }
     }, [rowCount, virtualizationActive, isDev]);
+
+    const PaginationControls: React.FC<{ className?: string }> = ({ className }) => (
+        <div className={`flex items-center justify-between text-sm text-foreground px-3 py-2 border border-border rounded-md bg-surface-2 shadow-sm ${className || ''}`}>
+            <div className="font-medium">
+                Строк: {rowCount}
+            </div>
+            <div className="flex items-center gap-3">
+                <button
+                    onClick={() => table.previousPage()}
+                    disabled={!table.getCanPreviousPage()}
+                    className="px-3 py-1 rounded-md border border-primary bg-primary text-foreground-inverse hover:bg-primary-dark disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                    ← Пред
+                </button>
+                <span className="font-semibold">
+                    Стр. {table.getState().pagination.pageIndex + 1} из {table.getPageCount()}
+                </span>
+                <button
+                    onClick={() => table.nextPage()}
+                    disabled={!table.getCanNextPage()}
+                    className="px-3 py-1 rounded-md border border-primary bg-primary text-foreground-inverse hover:bg-primary-dark disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                    След →
+                </button>
+            </div>
+        </div>
+    );
 
     // DnD Sensors
     const sensors = useSensors(
@@ -1215,29 +1260,28 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
                     onHideColumn={contextMenu.type === 'header' && !LOCKED_COLUMNS.has(contextMenu.targetIdx)
                         ? () => handleHideColumn(contextMenu.targetIdx)
                         : undefined}
+                    onDelete={contextMenu.type === 'cell' ? handleDeleteSelected : undefined}
                 />
             )}
 
             {/* Currency Tabs */}
             <div className="flex space-x-1 bg-surface-2 p-1 rounded-lg w-fit mb-4">
-                <button
-                    onClick={() => setActiveFilters({ ...activeFilters, currency: 'UZS' })}
-                    className={`px-4 py-2 text-sm font-medium rounded-md transition-all focus:outline-none focus:ring-2 focus:ring-primary ${activeFilters.currency === 'UZS'
-                        ? 'bg-surface text-foreground shadow-sm'
-                        : 'text-foreground-secondary hover:text-foreground'
-                        }`}
-                >
-                    Основной (UZS)
-                </button>
-                <button
-                    onClick={() => setActiveFilters({ ...activeFilters, currency: 'USD' })}
-                    className={`px-4 py-2 text-sm font-medium rounded-md transition-all focus:outline-none focus:ring-2 focus:ring-primary ${activeFilters.currency === 'USD'
-                        ? 'bg-surface text-foreground shadow-sm'
-                        : 'text-foreground-secondary hover:text-foreground'
-                        }`}
-                >
-                    Валютный (USD)
-                </button>
+                {[
+                    { key: 'ALL', label: 'Все' },
+                    { key: 'UZS', label: 'UZS' },
+                    { key: 'USD', label: 'USD' },
+                ].map((item) => (
+                    <button
+                        key={item.key}
+                        onClick={() => setActiveFilters({ ...activeFilters, currency: item.key as any })}
+                        className={`px-4 py-2 text-sm font-medium rounded-md transition-all focus:outline-none focus:ring-2 focus:ring-primary ${activeFilters.currency === item.key
+                            ? 'bg-surface text-foreground shadow-sm'
+                            : 'text-foreground-secondary hover:text-foreground'
+                            }`}
+                    >
+                        {item.label}
+                    </button>
+                ))}
             </div>
 
             {/* Smart Search Bar */}
@@ -1469,6 +1513,25 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
                     </button>
                 </div>
 
+                {/* Delete + selection count */}
+                <div className="flex items-center gap-2 ml-2 border-l pl-2 border-border">
+                    <div className="text-xs text-foreground-secondary">
+                        Выбрано строк: {Array.from(selectedCells).reduce((acc, key) => {
+                            const rowId = Number(key.split(':')[0]);
+                            return acc.add(rowId);
+                        }, new Set<number>()).size}
+                    </div>
+                    <button
+                        onClick={() => handleDeleteSelected()}
+                        disabled={selectedCells.size === 0}
+                        className="flex items-center gap-1 px-3 py-1.5 text-sm font-medium text-danger bg-surface border border-border rounded hover:bg-danger/10 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-danger disabled:opacity-50 disabled:cursor-not-allowed"
+                        title="Удалить выбранные"
+                    >
+                        <Trash2 className="w-4 h-4" />
+                        Удалить
+                    </button>
+                </div>
+
                 {/* Saving Indicator */}
                 {isSaving && (
                     <div className="flex items-center gap-2 ml-auto text-sm text-foreground-secondary">
@@ -1478,11 +1541,16 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
                 )}
             </div>
 
+            {/* Pagination (top) */}
+            <PaginationControls className="mb-3" />
+
             <FilterDrawer
                 isOpen={filterDrawerOpen}
                 onClose={() => setFilterDrawerOpen(false)}
                 onApply={(filters) => setActiveFilters(filters)}
                 initialFilters={activeFilters}
+                operatorOptions={operatorOptions}
+                appOptions={appOptions}
             />
 
             <DndContext
@@ -1509,6 +1577,7 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
                                                 key={header.id}
                                                 header={header}
                                                 onContextMenu={(e) => handleHeaderContextMenu(e, header.column.id)}
+                                                paddingClass={cellPadding}
                                             >
                                                 <div
                                                     className={`flex items-center gap-1 ${header.column.getCanSort() ? 'cursor-pointer hover:text-foreground' : ''}`}
@@ -1548,7 +1617,7 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
                                         key={row.id}
                                         data-index={virtualRow.index}
                                         ref={rowVirtualizer.measureElement}
-                                        style={{ height: `${virtualRow.size}px` }}
+                                        style={{ height: `${rowHeight}px` }}
                                         className={rowClass}
                                     >
                                         {row.getVisibleCells().map((cell) => {
@@ -1568,19 +1637,13 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
                                                 backgroundColor: cStyle.backgroundColor || colStyle.backgroundColor || undefined,
                                             };
 
-                                            const densityClasses = {
-                                                compact: '!py-0.5',
-                                                standard: '!py-2',
-                                                comfortable: '!py-4',
-                                            };
-
                                             const isDetailsCell = cell.column.id === 'details';
 
                                             return (
                                                 <td
                                                     key={cell.id}
-                                                    style={finalStyle}
-                                                    className={`cursor-default select-none border border-table-border px-2 text-table-text ${densityClasses[density]} ${isSelected ? 'ring-2 ring-inset ring-primary z-10 bg-table-row-selected' : ''}`}
+                                                style={finalStyle}
+                                                className={`cursor-default select-none border border-table-border text-table-text ${cellPadding} ${isSelected ? 'ring-2 ring-inset ring-primary z-10 bg-table-row-selected' : ''}`}
                                                     onClick={(e) => handleCellClick(e, cellKey)}
                                                     onMouseDown={(e) => handleCellMouseDown(e, row.id, cell.column.id, virtualRow.index, colIndex)}
                                                     onMouseEnter={() => handleCellMouseEnter(virtualRow.index, colIndex)}
@@ -1635,31 +1698,7 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
             </DndContext>
 
             {/* Pagination */}
-            <div className="flex items-center justify-between text-sm text-foreground-secondary px-1">
-                <div>
-                    Rows: {rowCount}
-                </div>
-                <div className="flex items-center gap-2">
-                    <button
-                        onClick={() => table.previousPage()}
-                        disabled={!table.getCanPreviousPage()}
-                        className="px-3 py-1 border border-border rounded disabled:opacity-50 disabled:cursor-not-allowed hover:bg-surface-2 bg-surface text-foreground"
-                    >
-                        ← Prev
-                    </button>
-                    <span>
-                        Page {table.getState().pagination.pageIndex + 1} of {' '}
-                        {table.getPageCount()}
-                    </span>
-                    <button
-                        onClick={() => table.nextPage()}
-                        disabled={!table.getCanNextPage()}
-                        className="px-3 py-1 border border-border rounded disabled:opacity-50 disabled:cursor-not-allowed hover:bg-surface-2 bg-surface text-foreground"
-                    >
-                        Next →
-                    </button>
-                </div>
-            </div>
+            <PaginationControls className="mt-4 mb-3" />
 
             {/* Details Drawer */}
             {detailRow && (

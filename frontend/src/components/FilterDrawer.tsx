@@ -7,7 +7,7 @@ interface FilterState {
     daysOfWeek: number[];
     amountMin: string;
     amountMax: string;
-    currency: 'UZS' | 'USD';
+    currency: 'ALL' | 'UZS' | 'USD';
     transactionTypes: string[];
     operators: string[];
     apps: string[];
@@ -20,6 +20,8 @@ interface FilterDrawerProps {
     onClose: () => void;
     onApply: (filters: FilterState) => void;
     initialFilters?: Partial<FilterState>;
+    operatorOptions?: string[];
+    appOptions?: string[];
 }
 
 const DEFAULT_FILTERS: FilterState = {
@@ -28,7 +30,7 @@ const DEFAULT_FILTERS: FilterState = {
     daysOfWeek: [],
     amountMin: '',
     amountMax: '',
-    currency: 'UZS',
+    currency: 'ALL',
     transactionTypes: [],
     operators: [],
     apps: [],
@@ -36,8 +38,6 @@ const DEFAULT_FILTERS: FilterState = {
     cardId: '',
 };
 
-const OPERATORS_LIST = ['Beeline', 'Ucell', 'Mobiuz', 'Uztelecom', 'Korzinka', 'Makro', 'Click', 'Payme'];
-const APPS_LIST = ['Click Evolution', 'Apelsin', 'Payme', 'Ipak Yuli'];
 const TRANS_TYPES = ['DEBIT', 'CREDIT', 'CONVERSION', 'REVERSAL']; // Mapped values might differ, using keys for now
 const DAYS_MAP = [
     { id: 1, label: 'Пн' },
@@ -49,10 +49,19 @@ const DAYS_MAP = [
     { id: 0, label: 'Вс' },
 ];
 
-export const FilterDrawer: React.FC<FilterDrawerProps> = ({ isOpen, onClose, onApply, initialFilters }) => {
+export const FilterDrawer: React.FC<FilterDrawerProps> = ({
+    isOpen,
+    onClose,
+    onApply,
+    initialFilters,
+    operatorOptions = [],
+    appOptions = [],
+}) => {
     const [filters, setFilters] = useState<FilterState>({ ...DEFAULT_FILTERS, ...initialFilters });
     const [isVisible, setIsVisible] = useState(false);
     const [isMounted, setIsMounted] = useState(false);
+    const [operatorSearch, setOperatorSearch] = useState('');
+    const [appSearch, setAppSearch] = useState('');
 
     // Animation Logic
     useEffect(() => {
@@ -90,8 +99,22 @@ export const FilterDrawer: React.FC<FilterDrawerProps> = ({ isOpen, onClose, onA
     };
 
     const handleReset = () => {
-        setFilters(DEFAULT_FILTERS);
+        setFilters({ ...DEFAULT_FILTERS });
+        setOperatorSearch('');
+        setAppSearch('');
     };
+
+    useEffect(() => {
+        setFilters(prev => ({ ...DEFAULT_FILTERS, ...prev, ...initialFilters }));
+    }, [initialFilters]);
+
+    const filteredOperators = operatorOptions
+        .filter((op) => op.toLowerCase().includes(operatorSearch.toLowerCase()))
+        .sort((a, b) => a.localeCompare(b));
+
+    const filteredApps = appOptions
+        .filter((app) => app.toLowerCase().includes(appSearch.toLowerCase()))
+        .sort((a, b) => a.localeCompare(b));
 
     if (!isMounted) return null;
 
@@ -191,7 +214,7 @@ export const FilterDrawer: React.FC<FilterDrawerProps> = ({ isOpen, onClose, onA
                         <div className="mt-4">
                             <label className="text-xs text-foreground-muted mb-1 block">Валюта</label>
                             <div className="flex rounded-md shadow-sm" role="group">
-                                {['UZS', 'USD'].map((curr) => (
+                                {['ALL', 'UZS', 'USD'].map((curr) => (
                                     <button
                                         key={curr}
                                         onClick={() => setFilters({ ...filters, currency: curr as any })}
@@ -200,7 +223,7 @@ export const FilterDrawer: React.FC<FilterDrawerProps> = ({ isOpen, onClose, onA
                                                 : 'bg-surface text-foreground border-border hover:bg-surface-2'
                                             } -ml-px first:ml-0`}
                                     >
-                                        {curr}
+                                        {curr === 'ALL' ? 'Все' : curr}
                                     </button>
                                 ))}
                             </div>
@@ -228,10 +251,22 @@ export const FilterDrawer: React.FC<FilterDrawerProps> = ({ isOpen, onClose, onA
                         <h3 className="section-title flex items-center gap-2">
                             <Smartphone className="w-4 h-4" /> Сущности
                         </h3>
-                        <div className="mt-3">
-                            <label className="text-xs text-foreground-muted mb-2 block">Операторы</label>
-                            <div className="grid grid-cols-2 gap-2">
-                                {OPERATORS_LIST.map(op => (
+                        <div className="mt-3 space-y-2">
+                            <div className="flex items-center justify-between">
+                                <label className="text-xs text-foreground-muted">Операторы</label>
+                                <div className="flex gap-2 text-[11px] text-primary">
+                                    <button onClick={() => setFilters({ ...filters, operators: filteredOperators })}>Выбрать все</button>
+                                    <button onClick={() => setFilters({ ...filters, operators: [] })}>Снять все</button>
+                                </div>
+                            </div>
+                            <input
+                                value={operatorSearch}
+                                onChange={(e) => setOperatorSearch(e.target.value)}
+                                placeholder="Поиск оператора"
+                                className="input-base text-sm"
+                            />
+                            <div className="grid grid-cols-2 gap-2 max-h-40 overflow-auto border border-border rounded-md p-2">
+                                {filteredOperators.map(op => (
                                     <label key={op} className="flex items-center gap-2 text-sm text-foreground">
                                         <input
                                             type="checkbox"
@@ -242,12 +277,27 @@ export const FilterDrawer: React.FC<FilterDrawerProps> = ({ isOpen, onClose, onA
                                         {op}
                                     </label>
                                 ))}
+                                {filteredOperators.length === 0 && (
+                                    <div className="text-xs text-foreground-secondary col-span-2">Ничего не найдено</div>
+                                )}
                             </div>
                         </div>
-                        <div className="mt-4">
-                            <label className="text-xs text-foreground-muted mb-2 block">Приложение</label>
-                            <div className="grid grid-cols-2 gap-2">
-                                {APPS_LIST.map(app => (
+                        <div className="mt-4 space-y-2">
+                            <div className="flex items-center justify-between">
+                                <label className="text-xs text-foreground-muted">Приложения</label>
+                                <div className="flex gap-2 text-[11px] text-primary">
+                                    <button onClick={() => setFilters({ ...filters, apps: filteredApps })}>Выбрать все</button>
+                                    <button onClick={() => setFilters({ ...filters, apps: [] })}>Снять все</button>
+                                </div>
+                            </div>
+                            <input
+                                value={appSearch}
+                                onChange={(e) => setAppSearch(e.target.value)}
+                                placeholder="Поиск приложения"
+                                className="input-base text-sm"
+                            />
+                            <div className="grid grid-cols-2 gap-2 max-h-40 overflow-auto border border-border rounded-md p-2">
+                                {filteredApps.map(app => (
                                     <label key={app} className="flex items-center gap-2 text-sm text-foreground">
                                         <input
                                             type="checkbox"
@@ -258,6 +308,9 @@ export const FilterDrawer: React.FC<FilterDrawerProps> = ({ isOpen, onClose, onA
                                         {app}
                                     </label>
                                 ))}
+                                {filteredApps.length === 0 && (
+                                    <div className="text-xs text-foreground-secondary col-span-2">Ничего не найдено</div>
+                                )}
                             </div>
                         </div>
                         <div className="mt-4">

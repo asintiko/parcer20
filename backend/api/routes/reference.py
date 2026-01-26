@@ -14,6 +14,7 @@ from openpyxl.styles import Font, PatternFill
 
 from database.connection import get_db_session
 from database.models import OperatorReference
+from api.dependencies import get_current_user
 
 router = APIRouter()
 
@@ -33,7 +34,7 @@ class OperatorReferenceResponse(BaseModel):
 class OperatorReferenceCreate(BaseModel):
     operator_name: str
     application_name: str
-    is_p2p: bool = True
+    is_p2p: bool = False
     is_active: bool = True
 
 
@@ -59,7 +60,8 @@ async def get_operators(
     application: Optional[str] = Query(None, description="Filter by application"),
     is_p2p: Optional[bool] = Query(None, description="Filter by P2P status"),
     is_active: Optional[bool] = Query(True, description="Filter by active status"),
-    db: Session = Depends(get_db_session)
+    db: Session = Depends(get_db_session),
+    current_user: dict = Depends(get_current_user),
 ):
     """Get paginated list of operators"""
     query = db.query(OperatorReference)
@@ -101,7 +103,8 @@ async def get_operators(
 @router.post("/", response_model=OperatorReferenceResponse)
 async def create_operator(
     operator: OperatorReferenceCreate,
-    db: Session = Depends(get_db_session)
+    db: Session = Depends(get_db_session),
+    current_user: dict = Depends(get_current_user),
 ):
     """Create new operator reference"""
     try:
@@ -125,14 +128,16 @@ async def create_operator(
         raise
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=f"Failed to create operator: {e}")
+        print(f"Error creating operator: {e}")
+        raise HTTPException(status_code=500, detail="Failed to create operator")
 
 
 @router.put("/{operator_id}", response_model=OperatorReferenceResponse)
 async def update_operator(
     operator_id: int,
     operator: OperatorReferenceUpdate,
-    db: Session = Depends(get_db_session)
+    db: Session = Depends(get_db_session),
+    current_user: dict = Depends(get_current_user),
 ):
     """Update operator reference"""
     try:
@@ -155,13 +160,15 @@ async def update_operator(
         raise
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=f"Failed to update operator: {e}")
+        print(f"Error updating operator: {e}")
+        raise HTTPException(status_code=500, detail="Failed to update operator")
 
 
 @router.delete("/{operator_id}")
 async def delete_operator(
     operator_id: int,
-    db: Session = Depends(get_db_session)
+    db: Session = Depends(get_db_session),
+    current_user: dict = Depends(get_current_user),
 ):
     """Delete operator reference"""
     try:
@@ -179,11 +186,15 @@ async def delete_operator(
         raise
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=f"Failed to delete operator: {e}")
+        print(f"Error deleting operator: {e}")
+        raise HTTPException(status_code=500, detail="Failed to delete operator")
 
 
 @router.get("/export/excel")
-async def export_to_excel(db: Session = Depends(get_db_session)):
+async def export_to_excel(
+    db: Session = Depends(get_db_session),
+    current_user: dict = Depends(get_current_user),
+):
     """Export operators to Excel file"""
     # Get all active operators
     operators = db.query(OperatorReference).filter(
@@ -196,7 +207,7 @@ async def export_to_excel(db: Session = Depends(get_db_session)):
     ws.title = "Операторы"
 
     # Headers
-    headers = ["Оператор/Продавец", "Приложение"]
+    headers = ["Оператор/Продавец", "Приложение", "P2P"]
     ws.append(headers)
 
     # Style headers
@@ -207,11 +218,16 @@ async def export_to_excel(db: Session = Depends(get_db_session)):
 
     # Add data
     for op in operators:
-        ws.append([op.operator_name, op.application_name])
+        ws.append([
+            op.operator_name,
+            op.application_name,
+            1 if op.is_p2p else 0
+        ])
 
     # Adjust column widths
     ws.column_dimensions['A'].width = 50
     ws.column_dimensions['B'].width = 20
+    ws.column_dimensions['C'].width = 8
 
     # Save to BytesIO
     output = BytesIO()
@@ -228,10 +244,31 @@ async def export_to_excel(db: Session = Depends(get_db_session)):
 @router.post("/import/excel")
 async def import_from_excel(
     file: UploadFile = File(...),
-    db: Session = Depends(get_db_session)
+    db: Session = Depends(get_db_session),
+    current_user: dict = Depends(get_current_user),
 ):
     """Import operators from Excel file"""
     try:
+        def parse_bool(value) -> bool:
+            """Parse truthy values from Excel cell."""
+            if value is None:
+                return False
+            if isinstance(value, bool):
+                return value
+            try:
+                # Numeric truthy like 1 / 0
+                if isinstance(value, (int, float)):
+                    return bool(int(value))
+            except (TypeError, ValueError):
+                pass
+
+            str_val = str(value).strip().lower()
+            if str_val in {"1", "true", "t", "yes", "y", "да", "p2p"}:
+                return True
+            if str_val in {"0", "false", "f", "no", "n", ""}:
+                return False
+            return False
+
         # Read Excel file
         contents = await file.read()
         wb = openpyxl.load_workbook(BytesIO(contents))
@@ -248,6 +285,8 @@ async def import_from_excel(
 
             operator_name = str(row[0]).strip() if row[0] else None
             application_name = str(row[1]).strip() if row[1] else None
+            is_p2p_raw = row[2] if len(row) > 2 else None
+            is_p2p = parse_bool(is_p2p_raw)
 
             if not operator_name or not application_name:
                 errors.append(f"Row {row_idx}: Missing operator or application name")
@@ -268,7 +307,8 @@ async def import_from_excel(
             new_operator = OperatorReference(
                 operator_name=operator_name,
                 application_name=application_name,
-                is_p2p=True,
+                # Default to False unless explicitly marked
+                is_p2p=is_p2p,
                 is_active=True
             )
             db.add(new_operator)
@@ -284,11 +324,15 @@ async def import_from_excel(
 
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=400, detail=f"Import failed: {str(e)}")
+        print(f"Import failed: {e}")
+        raise HTTPException(status_code=400, detail="Import failed")
 
 
 @router.get("/applications")
-async def get_applications(db: Session = Depends(get_db_session)):
+async def get_applications(
+    db: Session = Depends(get_db_session),
+    current_user: dict = Depends(get_current_user),
+):
     """Get list of unique application names"""
     apps = db.query(OperatorReference.application_name).distinct().order_by(OperatorReference.application_name).all()
     return [app[0] for app in apps]

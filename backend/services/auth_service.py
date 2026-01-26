@@ -14,13 +14,26 @@ import base64
 from jose import jwt, JWTError
 import redis.asyncio as aioredis
 
-# Configuration
-API_ID = int(os.getenv("TELEGRAM_API_ID", "18508404"))
-API_HASH = os.getenv("TELEGRAM_API_HASH", "693e735235f6f6106555f16885e76bf2")
-JWT_SECRET = os.getenv("JWT_SECRET", "your_super_secret_jwt_key_change_in_production_12345")
+# Configuration - all sensitive values MUST be set via environment variables
+API_ID = os.getenv("TELEGRAM_API_ID")
+API_HASH = os.getenv("TELEGRAM_API_HASH")
+JWT_SECRET = os.getenv("JWT_SECRET")
 JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
 JWT_EXPIRATION_HOURS = int(os.getenv("JWT_EXPIRATION_HOURS", "720"))
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
+
+# Validate required environment variables at import time
+_missing_vars = []
+if not API_ID:
+    _missing_vars.append("TELEGRAM_API_ID")
+if not API_HASH:
+    _missing_vars.append("TELEGRAM_API_HASH")
+if not JWT_SECRET:
+    _missing_vars.append("JWT_SECRET")
+if _missing_vars:
+    raise EnvironmentError(f"Missing required environment variables: {', '.join(_missing_vars)}")
+
+API_ID = int(API_ID)
 
 # Global client storage
 auth_clients: Dict[str, TelegramClient] = {}
@@ -111,7 +124,7 @@ async def generate_qr_login(session_id: str) -> dict:
         if session_id in auth_clients:
             try:
                 await auth_clients[session_id].disconnect()
-            except:
+            except Exception:
                 pass
             del auth_clients[session_id]
         if session_id in auth_sessions:
@@ -213,7 +226,7 @@ async def cleanup_session(session_id: str):
     if session_id in auth_clients:
         try:
             await auth_clients[session_id].disconnect()
-        except:
+        except Exception:
             pass
         del auth_clients[session_id]
 
@@ -237,7 +250,7 @@ async def logout_user(token: str) -> bool:
         await redis.delete(f"auth_token:{user_id}")
         await redis.close()
         return True
-    except:
+    except Exception:
         return False
 
 
@@ -259,6 +272,6 @@ async def verify_user_token(token: str) -> Optional[dict]:
             return None
 
         return payload
-    except:
+    except Exception:
         # If Redis fails, just verify the JWT signature
         return payload

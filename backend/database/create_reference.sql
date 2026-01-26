@@ -5,7 +5,7 @@ CREATE TABLE IF NOT EXISTS operator_reference (
     id SERIAL PRIMARY KEY,
     operator_name VARCHAR(500) NOT NULL,
     application_name VARCHAR(200) NOT NULL,
-    is_p2p BOOLEAN DEFAULT true,
+    is_p2p BOOLEAN DEFAULT false,
     is_active BOOLEAN DEFAULT true,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -19,6 +19,10 @@ CREATE INDEX IF NOT EXISTS idx_operator_ref_operator ON operator_reference(opera
 CREATE INDEX IF NOT EXISTS idx_operator_ref_app ON operator_reference(application_name);
 CREATE INDEX IF NOT EXISTS idx_operator_ref_active ON operator_reference(is_active) WHERE is_active = true;
 CREATE INDEX IF NOT EXISTS idx_operator_ref_p2p ON operator_reference(is_p2p) WHERE is_p2p = true;
+
+-- Ensure default stays false even on existing deployments
+ALTER TABLE operator_reference
+    ALTER COLUMN is_p2p SET DEFAULT false;
 
 -- Add trigger for updated_at
 CREATE OR REPLACE FUNCTION update_operator_reference_updated_at()

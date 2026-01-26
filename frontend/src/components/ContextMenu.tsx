@@ -7,6 +7,7 @@ interface ContextMenuProps {
     onAlign: (alignment: 'left' | 'center' | 'right') => void;
     onColor: (color: string) => void;
     onHideColumn?: () => void;
+    onDelete?: () => void;
 }
 
 // Colors for cell background - light theme values
@@ -21,7 +22,7 @@ const COLORS = [
     { label: 'Оранж', value: 'rgba(255, 165, 0, 0.15)' }, // warning-light variant
 ];
 
-export const ContextMenu: React.FC<ContextMenuProps> = ({ x, y, onClose, onAlign, onColor, onHideColumn }) => {
+export const ContextMenu: React.FC<ContextMenuProps> = ({ x, y, onClose, onAlign, onColor, onHideColumn, onDelete }) => {
     const menuRef = useRef<HTMLDivElement>(null);
 
     useEffect(() => {
@@ -52,21 +53,21 @@ export const ContextMenu: React.FC<ContextMenuProps> = ({ x, y, onClose, onAlign
                     onClick={() => onAlign('left')}
                     title="По левому краю"
                 >
-                    ⬅
+                    L
                 </button>
                 <button
                     className="p-1.5 hover:bg-context-menu-hover rounded text-context-menu-text"
                     onClick={() => onAlign('center')}
                     title="По центру"
                 >
-                    ↔
+                    C
                 </button>
                 <button
                     className="p-1.5 hover:bg-context-menu-hover rounded text-context-menu-text"
                     onClick={() => onAlign('right')}
                     title="По правому краю"
                 >
-                    ➡
+                    R
                 </button>
             </div>
 
@@ -105,6 +106,21 @@ export const ContextMenu: React.FC<ContextMenuProps> = ({ x, y, onClose, onAlign
                         }}
                     >
                         Скрыть колонку
+                    </button>
+                </>
+            )}
+
+            {onDelete && (
+                <>
+                    <div className="border-t border-context-menu-border my-2"></div>
+                    <button
+                        className="w-full text-left px-3 py-2 text-sm text-danger hover:bg-danger/10"
+                        onClick={() => {
+                            onDelete();
+                            onClose();
+                        }}
+                    >
+                        Удалить строку
                     </button>
                 </>
             )}

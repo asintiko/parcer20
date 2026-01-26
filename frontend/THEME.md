@@ -11,7 +11,6 @@
 - `frontend/src/styles/theme.css` - CSS переменные для всех тем
 - `frontend/src/contexts/ThemeContext.tsx` - React Context для управления темой
 - `frontend/tailwind.config.js` - Конфигурация Tailwind с токенами темы
-- `frontend/src/hooks/useTelegramThemeSync.ts` - Хук для синхронизации с Telegram Web K
 
 ## Использование токенов темы
 
@@ -107,36 +106,7 @@ colors: {
 
 ## Синхронизация с Telegram Web K
 
-### Как это работает
-
-1. **PostMessage API**: Frontend отправляет события `theme_changed` в iframe Telegram Web K
-2. **URL параметры**: Тема передается через параметр `?theme=dark` в URL iframe
-3. **Прямое обращение**: Если iframe same-origin, возможно прямое обращение к `themeController`
-
-### Обработка в Telegram Web K
-
-Telegram Web K слушает сообщения от родительского окна в `telegram-web-k/src/index.ts`:
-
-```typescript
-window.addEventListener('message', (event: MessageEvent) => {
-  if (event.data?.type === 'theme_changed') {
-    // Применяет тему через themeController
-  }
-});
-```
-
-### Использование хука синхронизации
-
-```tsx
-import { useTelegramThemeSync } from '../hooks/useTelegramThemeSync';
-
-function UserbotPage() {
-  const iframeRef = useRef<HTMLIFrameElement>(null);
-  useTelegramThemeSync(iframeRef);
-  
-  return <iframe ref={iframeRef} src="/tweb/index.html" />;
-}
-```
+Legacy note: iframe Telegram Web K убран из приложения. Тема теперь применяется напрямую в нативном UI, хук `useTelegramThemeSync` не используется.
 
 ## Ограничения
 
@@ -245,5 +215,4 @@ useEffect(() => {
   console.log('Theme changed:', theme, isDark);
 }, [theme, isDark]);
 ```
-
 

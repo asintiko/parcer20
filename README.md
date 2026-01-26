@@ -94,26 +94,13 @@ npm run dev
 - Overscan is set to `10` rows; tune `overscan` in the `useVirtualizer` config for smoother scroll on slow machines (higher = fewer reflows, lower = less work per scroll).
 - A dev-only guard logs a warning if a large dataset (>2000 rows) ever renders without virtualization.
 
-### Telegram Web K (bots-only)
+### Telegram TDLib Client (bots-only)
 
-The Userbot tab embeds a local build of Telegram Web K from `telegram-web-k/`.
+The `/userbot` page is now a native React UI powered by a server-side TDLib client. No iframe/WebK is used.
 
-Build and copy steps:
-```bash
-cd telegram-web-k
-pnpm install
-node build
-```
-
-Then copy the build output into the frontend public folder:
-```bash
-# from repo root
-rm -rf frontend/public/tweb
-mkdir -p frontend/public/tweb
-cp -r telegram-web-k/public/* frontend/public/tweb/
-```
-
-Rebuild the frontend after copying.
+- Backend exposes `/api/tg/*` for auth (phone → code → password), bot-only chats, hide/unhide, history, and send.
+- TDLib session is stored under `sessions/tdlib` (see `docs/telegram-tdlib-deploy.md`).
+- Frontend relies on the new API; hidden chats are persisted in Postgres.
 
 ## Configuration
 

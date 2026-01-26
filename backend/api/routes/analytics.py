@@ -12,6 +12,7 @@ import os
 
 from database.connection import get_db_session
 from database.models import Transaction
+from api.dependencies import get_current_user
 
 router = APIRouter()
 
@@ -29,7 +30,8 @@ class TopAgentResponse(BaseModel):
 
 @router.get("/top-agent", response_model=TopAgentResponse)
 async def get_top_agent(
-    db: Session = Depends(get_db_session)
+    db: Session = Depends(get_db_session),
+    current_user: dict = Depends(get_current_user),
 ):
     """
     Get 'Top Agent' statistics for the last hour
@@ -59,7 +61,7 @@ async def get_top_agent(
         )
     
     # Calculate total volume
-    total_volume = sum(float(t.amount) for t in recent_transactions if t.currency == 'UZS')
+    total_volume = sum(abs(float(t.amount)) for t in recent_transactions if t.currency == 'UZS')
     
     # Find top application by count
     app_counts = {}
@@ -69,7 +71,7 @@ async def get_top_agent(
         app = t.application_mapped or t.operator_raw or "Unknown"
         app_counts[app] = app_counts.get(app, 0) + 1
         if t.currency == 'UZS':
-            app_volumes[app] = app_volumes.get(app, 0) + float(t.amount)
+            app_volumes[app] = app_volumes.get(app, 0) + abs(float(t.amount))
     
     top_app = max(app_counts, key=app_counts.get)
     top_app_count = app_counts[top_app]
@@ -98,7 +100,8 @@ async def get_top_agent(
 
 @router.get("/summary")
 async def get_summary(
-    db: Session = Depends(get_db_session)
+    db: Session = Depends(get_db_session),
+    current_user: dict = Depends(get_current_user),
 ):
     """
     Get overall system statistics
@@ -120,7 +123,7 @@ async def get_summary(
     ).scalar()
     
     # Total volume (UZS only)
-    total_volume = db.query(func.sum(Transaction.amount)).filter(
+    total_volume = db.query(func.sum(func.abs(Transaction.amount))).filter(
         Transaction.currency == 'UZS'
     ).scalar() or 0
     

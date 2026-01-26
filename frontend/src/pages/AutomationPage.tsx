@@ -46,6 +46,12 @@ export function AutomationPage() {
             return query.state.data.status === 'processing' || query.state.data.status === 'started' ? 2000 : false;
         },
     });
+    // Reset task if it was not found (e.g., after backend restart)
+    useEffect(() => {
+        if (taskStatus?.status === 'not_found' && activeTaskId) {
+            setActiveTaskId(null);
+        }
+    }, [taskStatus?.status, activeTaskId]);
 
     // Fetch suggestions
     const { data: suggestions, refetch: refetchSuggestions } = useQuery({

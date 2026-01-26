@@ -1,6 +1,6 @@
 """
 Telegram Bot using Aiogram 3.x for manual receipt input
-Handles user messages and forwards to processing queue
+Handles user messages and forwards them to Celery for processing
 """
 import os
 import asyncio
@@ -8,28 +8,18 @@ from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.fsm.storage.memory import MemoryStorage
 from dotenv import load_dotenv
-import redis.asyncio as aioredis
 import json
+from workers.celery_worker import queue_receipt_task
 
 load_dotenv()
 
 # Configuration
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 
 # Initialize bot and dispatcher
 bot = Bot(token=BOT_TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
-
-# Redis connection for queue
-redis_client = None
-
-
-async def init_redis():
-    """Initialize Redis connection"""
-    global redis_client
-    redis_client = await aioredis.from_url(REDIS_URL, decode_responses=True)
 
 
 @dp.message(Command("start"))
@@ -107,7 +97,7 @@ async def handle_text_message(message: types.Message):
     # Send processing message
     status_msg = await message.answer("⏳ Обрабатываю чек...")
     
-    # Add to Redis queue for async processing
+    # Dispatch Celery task for async processing
     try:
         task_data = {
             'raw_text': raw_text,
@@ -115,18 +105,19 @@ async def handle_text_message(message: types.Message):
             'source_chat_id': message.chat.id,
             'source_message_id': message.message_id,
             'user_id': message.from_user.id,
-            'status_message_id': status_msg.message_id
+            'status_message_id': status_msg.message_id,
+            'added_via': 'telegram'
         }
-        
-        await redis_client.rpush('receipt_queue', json.dumps(task_data))
-        
-        # In production, response will come from Celery worker
-        # For now, acknowledge receipt
-        await asyncio.sleep(1)  # Simulate processing
-        await status_msg.edit_text("✅ Чек добавлен в очередь обработки. Обработка займет несколько секунд.")
-        
+
+        task_id = queue_receipt_task(task_data)
+        await status_msg.edit_text(
+            f"✅ Задача поставлена в обработку.\nID: `{task_id}`\n"
+            "Обработка займет несколько секунд.",
+            parse_mode="Markdown"
+        )
+
     except Exception as e:
-        await status_msg.edit_text(f"❌ Ошибка при добавлении в очередь: {str(e)}")
+        await status_msg.edit_text(f"❌ Ошибка при постановке задачи в обработку: {str(e)}")
 
 
 @dp.message(F.photo | F.document)
@@ -141,10 +132,6 @@ async def handle_media(message: types.Message):
 async def main():
     """Main bot startup"""
     print("🤖 Starting Telegram Bot...")
-    
-    # Initialize Redis
-    await init_redis()
-    print("✅ Redis connected")
     
     # Start polling
     print("✅ Bot is running! Press Ctrl+C to stop.")

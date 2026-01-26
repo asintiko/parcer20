@@ -22,7 +22,7 @@ type FiltersState = {
     source_channel?: 'TELEGRAM' | 'SMS' | 'MANUAL';
     transaction_type?: 'DEBIT' | 'CREDIT' | 'CONVERSION' | 'REVERSAL';
     transaction_types?: string[];
-    currency?: 'UZS' | 'USD';
+    currency?: 'ALL' | 'UZS' | 'USD';
     card?: string;
     days_of_week?: number[];
 };
@@ -31,7 +31,7 @@ export function TransactionsPage() {
     const [page, setPage] = useState(1);
     const [pageSize, setPageSize] = useState(100);
     const [sort, setSort] = useState<SortState>({ sort_by: 'transaction_date', sort_dir: 'asc' });
-    const [filters, setFilters] = useState<FiltersState>({ currency: 'UZS' });
+    const [filters, setFilters] = useState<FiltersState>({ currency: 'ALL' });
     const [addModalOpen, setAddModalOpen] = useState(false);
     const [highlightRowId, setHighlightRowId] = useState<number | null>(null);
 
@@ -50,12 +50,17 @@ export function TransactionsPage() {
     const filteredData = useMemo(() => {
         const search = (filters.search || '').trim().toLowerCase();
 
+        const dateToEnd = filters.dateTo ? new Date(filters.dateTo) : null;
+        if (dateToEnd) {
+            dateToEnd.setHours(23, 59, 59, 999);
+        }
+
         return data.filter((tx: Transaction) => {
             const txDate = tx.transaction_date ? new Date(tx.transaction_date) : null;
 
-            if (filters.currency && tx.currency !== filters.currency) return false;
+            if (filters.currency && filters.currency !== 'ALL' && tx.currency !== filters.currency) return false;
             if (filters.dateFrom && txDate && txDate < new Date(filters.dateFrom)) return false;
-            if (filters.dateTo && txDate && txDate > new Date(filters.dateTo)) return false;
+            if (dateToEnd && txDate && txDate > dateToEnd) return false;
 
             if (filters.days_of_week?.length && txDate) {
                 const dayIdx = txDate.getDay();
@@ -79,7 +84,9 @@ export function TransactionsPage() {
             if (filters.transaction_type && tx.transaction_type !== filters.transaction_type) return false;
             if (filters.transaction_types?.length && !filters.transaction_types.includes(tx.transaction_type)) return false;
             if (filters.source_channel && tx.source_channel !== filters.source_channel) return false;
-            if (filters.card && tx.card_last_4 && tx.card_last_4 !== filters.card) return false;
+            if (filters.card) {
+                if (tx.card_last_4 !== filters.card) return false;
+            }
 
             if (search) {
                 const blob = `${tx.operator_raw || ''} ${tx.application_mapped || ''} ${tx.raw_message || ''} ${tx.amount || ''} ${tx.currency || ''}`.toLowerCase();
@@ -121,6 +128,22 @@ export function TransactionsPage() {
     const allSortedData = useMemo(() => {
         return [...data].sort(sortComparator(sort.sort_by, sort.sort_dir));
     }, [data, sort.sort_by, sort.sort_dir, sortComparator]);
+
+    const operatorOptions = useMemo(() => {
+        const set = new Set<string>();
+        data.forEach((tx) => {
+            if (tx.operator_raw) set.add(tx.operator_raw);
+        });
+        return Array.from(set).sort((a, b) => a.localeCompare(b));
+    }, [data]);
+
+    const appOptions = useMemo(() => {
+        const set = new Set<string>();
+        data.forEach((tx) => {
+            if (tx.application_mapped) set.add(tx.application_mapped);
+        });
+        return Array.from(set).sort((a, b) => a.localeCompare(b));
+    }, [data]);
 
     const total = sortedData.length;
 
@@ -213,21 +236,26 @@ export function TransactionsPage() {
         <div className="h-full flex flex-col bg-bg">
             <div className="flex-1 overflow-hidden p-4">
                 <div className="h-full flex flex-col bg-surface border border-table-border rounded-lg shadow-sm">
-                    <div className="flex-1 overflow-hidden p-0">
-                        <div className="flex items-center justify-between px-4 py-2 border-b border-table-border bg-surface-2">
-                            <div className="text-sm text-foreground-secondary">
-                                {isOfflineReady ? 'Локальный кеш загружен' : 'Кеш отсутствует, выполняется синхронизация'}
-                                {lastSyncAt ? ` · Последняя синхронизация: ${new Date(lastSyncAt).toLocaleString()}` : ''}
+                    <div className="flex-1 overflow-hidden p-0 pb-6">
+                        <div className="flex flex-col gap-3 px-4 py-2 border-b border-table-border bg-surface-2">
+                            <div className="flex items-center justify-between">
+                                <div className="text-sm text-foreground-secondary">
+                                    {isOfflineReady ? 'Локальный кеш загружен' : 'Кеш отсутствует, выполняется синхронизация'}
+                                    {lastSyncAt ? ` · Последняя синхронизация: ${new Date(lastSyncAt).toLocaleString()}` : ''}
+                                </div>
+                                <button
+                                    onClick={() => syncFromServer()}
+                                    disabled={offlineLoading || syncProgress.status === 'running'}
+                                    className="px-3 py-1.5 text-sm font-medium text-foreground bg-surface border border-border rounded hover:bg-surface-2 disabled:opacity-60"
+                                >
+                                    {syncProgress.status === 'running'
+                                        ? `Синхронизация... (${syncProgress.downloaded} записей)`
+                                        : 'Синхронизировать'}
+                                </button>
                             </div>
-                            <button
-                                onClick={() => syncFromServer()}
-                                disabled={offlineLoading || syncProgress.status === 'running'}
-                                className="px-3 py-1.5 text-sm font-medium text-foreground bg-surface border border-border rounded hover:bg-surface-2 disabled:opacity-60"
-                            >
-                                {syncProgress.status === 'running'
-                                    ? `Синхронизация... (${syncProgress.downloaded} записей)`
-                                    : 'Синхронизировать'}
-                            </button>
+                            <div className="px-3 py-2 text-sm font-medium text-foreground bg-surface shadow-sm rounded-md border border-table-border">
+                                Всего записей: {total}
+                            </div>
                         </div>
                         <TransactionTable
                             data={paginatedItems}
@@ -245,10 +273,9 @@ export function TransactionsPage() {
                             onQueryChange={handleQueryChange}
                             onPageChange={handlePageChange}
                             onPageSizeChange={handlePageSizeChange}
+                            operatorOptions={operatorOptions}
+                            appOptions={appOptions}
                         />
-                    </div>
-                    <div className="px-4 py-2 border-t border-table-border text-xs text-foreground-secondary bg-surface-2">
-                        Всего записей: {total}
                     </div>
                 </div>
             </div>

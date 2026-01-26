@@ -4,7 +4,7 @@ Handles three main formats: Humo Notification, SMS Inline, and Semicolon-delimit
 """
 import re
 from datetime import datetime
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from decimal import Decimal
 import pytz
 
@@ -18,20 +18,20 @@ class RegexParser:
         # Regex patterns for different formats
         self.patterns = {
             'humo_notification': {
-                'amount': r'[➖➕💸]\s*([\d\s\.,]+)\s*UZS',
+                'amount': r'[➖➕💸]\s*([\d\s\.,]+)\s*(UZS|USD)',
                 'transaction_type': r'(Оплата|Пополнение|Операция|Конверсия)',
-                'card': r'(?:HUMO-?CARD|💳)\s*\*+(\d{4})',
+                'card': r'(?:HUMO-?CARD|HUMOCARD|💳)\s*([\d\*]{6,})',
                 'operator': r'📍\s*(.+)',
-                'datetime': r'[🕓🕘]\s*(\d{2}:\d{2})\s+(\d{2}\.\d{2}\.\d{2,4})',
-                'balance': r'💰\s*([\d\s\.,]+)\s*UZS',
+                'datetime': r'[🕓🕘]\s*(?:(\d{2}:\d{2})\s+(\d{2}\.\d{2}\.\d{2,4})|(\d{2}\.\d{2}\.\d{2,4})\s+(\d{2}:\d{2}))',
+                'balance': r'[💰💵]\s*([\d\s\.,]+)\s*(USD|UZS)',
                 'currency': r'(USD|UZS)',
             },
             'sms_inline': {
                 'operator': r'(?:Pokupka|Spisanie c karty|Popolnenie scheta|E-Com oplata|Platezh):\s*(.+?)(?:,|\s+\d{2}\.\d{2})',
                 'datetime': r'(\d{2}\.\d{2}\.\d{2})\s+(\d{2}:\d{2})',
-                'amount': r'summa:([\d\.]+)\s*UZS',
+                'amount': r'summa:([\d\s\.,]+)\s*UZS',
                 'card': r'karta\s*\*{3}(\d{4})',
-                'balance': r'balans:([\d\.]+)\s*UZS',
+                'balance': r'balans:([\d\s\.,]+)\s*UZS',
                 'type_keyword': r'^(Pokupka|Spisanie|Popolnenie|E-Com|Platezh|OTMENA)',
             },
             'semicolon_format': {
@@ -39,14 +39,56 @@ class RegexParser:
                 'operator': r';\s*([^;]+?)\s*;',
                 'datetime': r';\s*(\d{2})-(\d{2})-(\d{2})\s+(\d{2}:\d{2})',
                 'balance': r'Dostupno:\s*([\d\.]+)\s*UZS',
+            },
+            'cardxabar': {
+                'amount': r'[➖➕]\s*([\d\s\.,]+)\s*(USD|UZS)',
+                'card': r'💳\s*([\d\*]{6,})',
+                'operator': r'📍\s*(.+)',
+                'datetime': r'🕓\s*(?:(\d{2}:\d{2})\s+(\d{2}\.\d{2}\.\d{2,4})|(\d{2}\.\d{2}\.\d{2,4})\s+(\d{2}:\d{2}))',
+                'balance': r'[💰💵]\s*([\d\s\.,]+)\s*(USD|UZS)?',
+                'currency': r'(USD|UZS)',
             }
         }
     
     def normalize_amount(self, amount_str: str) -> Decimal:
-        """Normalize amount string to Decimal"""
-        # Remove spaces and replace comma with dot
-        cleaned = amount_str.replace(' ', '').replace(',', '.')
+        """Normalize amount string to Decimal with robust thousand/decimal handling."""
+        if amount_str is None:
+            raise ValueError("Amount string is None")
+        cleaned = amount_str.strip().replace("\u00a0", "")
+        cleaned = cleaned.replace(" ", "")
+
+        has_dot = "." in cleaned
+        has_comma = "," in cleaned
+
+        if has_dot and has_comma:
+            cleaned = cleaned.replace(".", "")
+            cleaned = cleaned.replace(",", ".")
+        elif has_comma:
+            cleaned = cleaned.replace(",", ".")
+
+        cleaned = re.sub(r"[^0-9\.]", "", cleaned)
+
+        if cleaned.count(".") > 1:
+            parts = cleaned.split(".")
+            cleaned = "".join(parts[:-1]) + "." + parts[-1]
+
+        if cleaned == "" or cleaned == ".":
+            raise ValueError(f"Invalid amount string: '{amount_str}'")
+
         return Decimal(cleaned)
+
+    def extract_card_last4(self, text: str) -> Optional[str]:
+        """Extract last 4 digits of card number from various masked formats."""
+        patterns = [
+            r'\*+(\d{4})',                # ***4862, *6714
+            r'\d+\*+(\d{4})',             # 479091**6905
+            r'\d+\*+\d*(\d{4})',          # 532154**1744
+        ]
+        for pat in patterns:
+            m = re.search(pat, text)
+            if m:
+                return m.group(1)
+        return None
     
     def parse_date(self, date_str: str, time_str: str, format_type: str = 'standard') -> datetime:
         """Parse date and time strings to datetime object"""
@@ -79,24 +121,29 @@ class RegexParser:
         if not amount_match:
             return None
         amount = self.normalize_amount(amount_match.group(1))
+        amount_currency = amount_match.group(2) if amount_match.lastindex and amount_match.lastindex >= 2 else None
         
         # Extract transaction type
         type_match = re.search(patterns['transaction_type'], text)
+        type_map = {
+            'Оплата': 'DEBIT',
+            'Пополнение': 'CREDIT',
+            'Операция': 'DEBIT',
+            'Конверсия': 'CONVERSION'
+        }
         if type_match:
-            type_map = {
-                'Оплата': 'DEBIT',
-                'Пополнение': 'CREDIT',
-                'Операция': 'DEBIT',
-                'Конверсия': 'CONVERSION'
-            }
             transaction_type = type_map.get(type_match.group(1), 'DEBIT')
         else:
-            # Infer from emoji if no explicit type
-            transaction_type = 'CREDIT' if '➕' in text or '🎉' in text else 'DEBIT'
+            upper_text = text.upper()
+            if "OTMENA" in upper_text:
+                transaction_type = 'REVERSAL'
+            elif "КОНВЕРС" in upper_text or "CONVERS" in upper_text:
+                transaction_type = 'CONVERSION'
+            else:
+                transaction_type = 'CREDIT' if '➕' in text or '🎉' in text else 'DEBIT'
         
         # Extract card
-        card_match = re.search(patterns['card'], text)
-        card_last_4 = card_match.group(1) if card_match else None
+        card_last_4 = self.extract_card_last4(text)
         
         # Extract operator
         operator_match = re.search(patterns['operator'], text)
@@ -106,8 +153,12 @@ class RegexParser:
         datetime_match = re.search(patterns['datetime'], text)
         if not datetime_match:
             return None
-        time_str = datetime_match.group(1)
-        date_str = datetime_match.group(2)
+        if datetime_match.group(1) and datetime_match.group(2):
+            time_str = datetime_match.group(1)
+            date_str = datetime_match.group(2)
+        else:
+            date_str = datetime_match.group(3)
+            time_str = datetime_match.group(4)
         transaction_date = self.parse_date(date_str, time_str)
         
         # Extract balance
@@ -115,8 +166,10 @@ class RegexParser:
         balance_after = self.normalize_amount(balance_match.group(1)) if balance_match else None
         
         # Extract currency
-        currency_match = re.search(patterns['currency'], text)
-        currency = currency_match.group(1) if currency_match else 'UZS'
+        currency = amount_currency
+        if not currency:
+            currency_match = re.search(patterns['currency'], text)
+            currency = currency_match.group(1) if currency_match else 'UZS'
         
         return {
             'amount': amount,
@@ -153,8 +206,7 @@ class RegexParser:
         transaction_date = self.parse_date(date_str, time_str)
         
         # Extract card
-        card_match = re.search(patterns['card'], text)
-        card_last_4 = card_match.group(1) if card_match else None
+        card_last_4 = self.extract_card_last4(text)
         
         # Extract balance
         balance_match = re.search(patterns['balance'], text)
@@ -234,6 +286,61 @@ class RegexParser:
             'parsing_method': 'REGEX_SEMICOLON',
             'parsing_confidence': 0.92
         }
+
+    def parse_cardxabar(self, text: str) -> Optional[Dict[str, Any]]:
+        """Parse CardXabar-style emoji notifications."""
+        patterns = self.patterns['cardxabar']
+
+        amount_match = re.search(patterns['amount'], text)
+        if not amount_match:
+            return None
+        amount = self.normalize_amount(amount_match.group(1))
+        currency = amount_match.group(2) if amount_match.lastindex and amount_match.lastindex >= 2 else None
+
+        card_last_4 = self.extract_card_last4(text)
+
+        operator_match = re.search(patterns['operator'], text)
+        operator_raw = operator_match.group(1).strip() if operator_match else None
+
+        dt_match = re.search(patterns['datetime'], text)
+        if not dt_match:
+            return None
+        if dt_match.group(1) and dt_match.group(2):
+            time_str = dt_match.group(1)
+            date_str = dt_match.group(2)
+        else:
+            date_str = dt_match.group(3)
+            time_str = dt_match.group(4)
+        transaction_date = self.parse_date(date_str, time_str)
+
+        balance_match = re.search(patterns['balance'], text)
+        balance_after = self.normalize_amount(balance_match.group(1)) if balance_match and balance_match.group(1) else None
+        if not currency and balance_match and balance_match.lastindex and balance_match.lastindex >= 2 and balance_match.group(2):
+            currency = balance_match.group(2)
+        if not currency:
+            currency = 'UZS'
+
+        upper_text = text.upper()
+        if "OTMENA" in upper_text:
+            transaction_type = 'REVERSAL'
+        elif "КОНВЕРС" in upper_text or "CONVERS" in upper_text or "CONVERSION" in upper_text or "КОНВЕРСИЯ" in upper_text or "KONVERS" in upper_text:
+            transaction_type = 'CONVERSION'
+        elif '🟢' in text or '➕' in text:
+            transaction_type = 'CREDIT'
+        else:
+            transaction_type = 'DEBIT'
+
+        return {
+            'amount': amount,
+            'currency': currency,
+            'transaction_type': transaction_type,
+            'card_last_4': card_last_4,
+            'operator_raw': operator_raw,
+            'transaction_date': transaction_date,
+            'balance_after': balance_after,
+            'parsing_method': 'REGEX_CARDXABAR',
+            'parsing_confidence': 0.93
+        }
     
     def parse(self, text: str) -> Optional[Dict[str, Any]]:
         """
@@ -245,6 +352,12 @@ class RegexParser:
         Returns:
             Parsed transaction dict or None if parsing failed
         """
+        # CardXabar style (red/green bullets, 💵 balance)
+        if any(marker in text for marker in ['CardXabar', 'NBU Card', '🔴', '🟢']):
+            result = self.parse_cardxabar(text)
+            if result:
+                return result
+
         # Try Humo notification format first (most common)
         if any(emoji in text for emoji in ['💸', '💳', '📍', '🕓', '🕘']):
             result = self.parse_humo_notification(text)

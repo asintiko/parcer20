@@ -4,11 +4,11 @@ SQLAlchemy ORM Models for Uzbek Receipt Parser
 from datetime import datetime
 from typing import Optional
 from sqlalchemy import (
-    BigInteger, Boolean, CheckConstraint, Column, DateTime, 
-    Float, Integer, Numeric, String, Text, Index
+    BigInteger, Boolean, CheckConstraint, Column, DateTime,
+    Float, Integer, Numeric, String, Text, Index, UniqueConstraint
 )
 from sqlalchemy.dialects.postgresql import UUID
-from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import declarative_base
 from sqlalchemy.sql import func
 import uuid
 
@@ -29,7 +29,7 @@ class Transaction(Base):
     source_message_id = Column(BigInteger)
     
     # Parsed Transaction Data
-    transaction_date = Column(DateTime(timezone=True), nullable=False)
+    transaction_date = Column(DateTime(timezone=False), nullable=False)
     amount = Column(Numeric(18, 2), nullable=False)
     currency = Column(String(3), default='UZS', nullable=False)
     card_last_4 = Column(String(4))
@@ -39,13 +39,14 @@ class Transaction(Base):
     balance_after = Column(Numeric(18, 2))
     
     # Metadata
-    parsed_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    parsed_at = Column(DateTime(timezone=False), server_default=func.now(), nullable=False)
     is_gpt_parsed = Column(Boolean, default=False)
     parsing_confidence = Column(Float)
     parsing_method = Column(String(20))
-    
-    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
-    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    is_p2p = Column(Boolean, default=False)
+
+    created_at = Column(DateTime(timezone=False), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=False), server_default=func.now(), onupdate=func.now())
     
     __table_args__ = (
         CheckConstraint("source_type IN ('MANUAL', 'AUTO')", name='check_source_type'),
@@ -58,9 +59,10 @@ class Transaction(Base):
             name='check_confidence_range'
         ),
         CheckConstraint(
-            "parsing_method IN ('REGEX_HUMO', 'REGEX_SMS', 'REGEX_SEMICOLON', 'GPT')", 
+            "parsing_method IN ('REGEX_HUMO', 'REGEX_SMS', 'REGEX_SEMICOLON', 'REGEX_CARDXABAR', 'GPT')",
             name='check_parsing_method'
         ),
+        UniqueConstraint('source_chat_id', 'source_message_id', name='uq_transactions_source_msg'),
         Index('idx_transactions_date', 'transaction_date', postgresql_using='btree'),
         Index('idx_transactions_created', 'created_at', postgresql_using='btree'),
         Index('idx_transactions_card', 'card_last_4'),
@@ -131,6 +133,46 @@ class Check(Base):
         return f"<Check(id={self.id}, date={self.datetime}, operator={self.operator}, amount={self.amount} {self.currency})>"
 
 
+class ReceiptProcessingTask(Base):
+    """Persistent tracking of receipt processing tasks (Telegram messages)."""
+    __tablename__ = 'receipt_processing_tasks'
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    task_id = Column(String(255), unique=True, nullable=False)
+    chat_id = Column(BigInteger, nullable=False)
+    message_id = Column(BigInteger, nullable=False)
+    status = Column(String(20), nullable=False)  # queued | processing | done | failed
+    transaction_id = Column(BigInteger)  # References transactions.id
+    error = Column(Text)
+    created_at = Column(DateTime(timezone=False), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=False), server_default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        UniqueConstraint('chat_id', 'message_id', name='uq_receipt_tasks_chat_msg'),
+        Index('idx_receipt_tasks_status', 'status'),
+        Index('idx_receipt_tasks_chat_msg', 'chat_id', 'message_id'),
+    )
+
+    def __repr__(self):
+        return f"<ReceiptProcessingTask(task_id={self.task_id}, chat={self.chat_id}, msg={self.message_id}, status={self.status})>"
+
+
+class MonitoredBotChat(Base):
+    """Stores per-bot monitoring state for TDLib auto-processor."""
+
+    __tablename__ = 'monitored_bot_chats'
+
+    chat_id = Column(BigInteger, primary_key=True)
+    enabled = Column(Boolean, nullable=False, server_default='true')
+    last_processed_message_id = Column(BigInteger, nullable=False, server_default='0')
+    last_error = Column(Text)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    def __repr__(self):
+        return f"<MonitoredBotChat(chat_id={self.chat_id}, enabled={self.enabled}, last_id={self.last_processed_message_id})>"
+
+
 class OperatorMapping(Base):
     """Model for operator name to application mapping rules"""
     __tablename__ = 'operator_mappings'
@@ -195,7 +237,8 @@ class OperatorReference(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     operator_name = Column(String(500), nullable=False)
     application_name = Column(String(200), nullable=False)
-    is_p2p = Column(Boolean, default=True)
+    # Explicit server_default to keep DB schema aligned with business default
+    is_p2p = Column(Boolean, default=False, server_default='false')
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
@@ -210,3 +253,42 @@ class OperatorReference(Base):
 
     def __repr__(self):
         return f"<OperatorReference(operator='{self.operator_name}', app='{self.application_name}', p2p={self.is_p2p})>"
+
+
+class HiddenBotChat(Base):
+    """Model for storing hidden bot chats (TDLib client)"""
+    __tablename__ = 'hidden_bot_chats'
+
+    chat_id = Column(BigInteger, primary_key=True)
+    title_snapshot = Column(String(255))
+    hidden_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    def __repr__(self):
+        return f"<HiddenBotChat(chat_id={self.chat_id})>"
+
+
+class AutomationTask(Base):
+    """Persistent automation analysis tasks."""
+    __tablename__ = 'automation_tasks'
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    status = Column(String(20), nullable=False, default='pending')  # pending | processing | completed | failed
+    progress_json = Column(Text)
+    result_json = Column(Text)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class AutomationSuggestion(Base):
+    """AI suggestions linked to automation tasks."""
+    __tablename__ = 'automation_suggestions'
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    task_id = Column(UUID(as_uuid=True), nullable=False, index=True)
+    transaction_id = Column(BigInteger, nullable=False, index=True)
+    suggested_application = Column(String(200), nullable=False)
+    confidence = Column(Float, nullable=False)
+    is_p2p = Column(Boolean, default=False)
+    status = Column(String(20), default='pending')  # pending | approved | rejected
+    reasoning = Column(Text)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)

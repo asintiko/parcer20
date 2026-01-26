@@ -7,9 +7,9 @@ import asyncio
 from telethon import TelegramClient, events
 from telethon.errors import FloodWaitError, SessionPasswordNeededError
 from dotenv import load_dotenv
-import redis.asyncio as aioredis
 import json
 from datetime import datetime
+from workers.celery_worker import queue_receipt_task
 
 load_dotenv()
 
@@ -21,18 +21,6 @@ SESSION_PATH = "sessions/userbot"
 
 # Target chat IDs to monitor
 TARGET_CHATS = [int(x.strip()) for x in os.getenv("TARGET_CHAT_IDS", "915326936,856264490,7028509569").split(",")]
-
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-
-# Global Redis client
-redis_client = None
-
-
-async def init_redis():
-    """Initialize Redis connection"""
-    global redis_client
-    redis_client = await aioredis.from_url(REDIS_URL, decode_responses=True)
-    print("✅ Redis connected")
 
 
 async def resolve_peers(client: TelegramClient):
@@ -55,9 +43,6 @@ async def resolve_peers(client: TelegramClient):
 async def start_userbot():
     """Start MTProto userbot and monitor target chats"""
     print("🤖 Starting Telegram Userbot (MTProto)...")
-    
-    # Initialize Redis
-    await init_redis()
     
     # Create Telethon client
     client = TelegramClient(SESSION_PATH, API_ID, API_HASH)
@@ -90,14 +75,15 @@ async def start_userbot():
                 'source_chat_id': chat_id,
                 'source_message_id': msg_id,
                 'sender_id': sender_id,
-                'timestamp': datetime.now().isoformat()
+                'timestamp': datetime.now().isoformat(),
+                'added_via': 'userbot'
             }
             
-            await redis_client.rpush('receipt_queue', json.dumps(task_data))
-            print(f"✅ Receipt queued for processing")
+            task_id = queue_receipt_task(task_data)
+            print(f"✅ Задача отправлена в Celery (task_id={task_id})")
             
         except Exception as e:
-            print(f"❌ Error queuing receipt: {e}")
+            print(f"❌ Error dispatching receipt task: {e}")
     
     # Start client
     await client.start(phone=PHONE)

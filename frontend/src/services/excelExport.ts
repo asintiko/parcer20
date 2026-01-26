@@ -49,18 +49,17 @@ const getAlignment = (align?: Alignment) => {
 
 const formatExcelValue = (row: Transaction, columnId: string, rowIndex: number) => {
     const value = (row as any)[columnId];
+    const txDate = row.transaction_date ? new Date(row.transaction_date) : null;
 
     if (columnId === 'row_number') {
         return rowIndex + 1;
     }
-    if (columnId === 'date_time' || columnId === 'transaction_date' || columnId === 'time') {
-        const date = value ? new Date(value) : null;
-        return date && !isNaN(date.getTime()) ? date : null;
-    }
+    if (columnId === 'date_time') return txDate || '';
+    if (columnId === 'transaction_date') return txDate || '';
+    if (columnId === 'time') return txDate || '';
     if (columnId === 'day') {
-        const date = row.transaction_date ? new Date(row.transaction_date) : null;
         const days = ['вс', 'пн', 'вт', 'ср', 'чт', 'пт', 'сб'];
-        return date ? days[date.getDay()] : '';
+        return txDate ? days[txDate.getDay()] : '';
     }
     if (columnId === 'amount' || columnId === 'balance_after') {
         const num = value !== undefined && value !== null ? parseFloat(String(value)) : NaN;
@@ -97,10 +96,10 @@ const formatExcelValue = (row: Transaction, columnId: string, rowIndex: number) 
 };
 
 const getNumberFormat = (columnId: string) => {
-    if (columnId === 'date_time') return 'dd.mm.yyyy hh:mm';
-    if (columnId === 'transaction_date') return 'dd.mm.yyyy';
-    if (columnId === 'time') return 'hh:mm';
     if (columnId === 'amount' || columnId === 'balance_after') return '#,##0.00';
+    if (columnId === 'date_time') return 'yyyy-mm-dd hh:mm:ss';
+    if (columnId === 'transaction_date') return 'yyyy-mm-dd';
+    if (columnId === 'time') return 'hh:mm:ss';
     return undefined;
 };
 
@@ -126,6 +125,13 @@ export const exportTransactionsToExcel = async (options: ExportOptions) => {
         key: col.id,
         width: pxToExcelWidth(col.widthPx),
     }));
+
+    // Freeze header row and enable autofilter
+    sheet.views = [{ state: 'frozen', ySplit: 1 }];
+    sheet.autoFilter = {
+        from: { row: 1, column: 1 },
+        to: { row: 1, column: columns.length },
+    };
 
     const headerRow = sheet.getRow(1);
     headerRow.font = { bold: true, color: { argb: 'FF0F172A' } };
