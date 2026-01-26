@@ -197,9 +197,9 @@ export function ReferenceTable({
                         onChange={(e) => onPageSizeChange(Number(e.target.value))}
                         className="px-3 py-2 border border-border rounded-md bg-surface text-foreground text-sm"
                     >
-                        {[20, 50, 100].map((size) => (
+                        {[20, 50, 100, 200, 500, 1000].map((size) => (
                             <option key={size} value={size}>
-                                {size} / стр
+                                {size === 1000 ? 'Все' : `${size} / стр`}
                             </option>
                         ))}
                     </select>
@@ -270,9 +270,8 @@ function ToggleCell({ checked, onChange }: { checked: boolean; onChange: (v: boo
             />
             <div className="w-9 h-5 bg-border peer-checked:bg-primary rounded-full relative transition-colors">
                 <span
-                    className={`absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-surface shadow-sm transition-all ${
-                        checked ? 'translate-x-4' : ''
-                    }`}
+                    className={`absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-surface shadow-sm transition-all ${checked ? 'translate-x-4' : ''
+                        }`}
                 />
             </div>
             {checked && <Check className="w-4 h-4 text-primary ml-2" />}

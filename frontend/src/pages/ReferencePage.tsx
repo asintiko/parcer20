@@ -5,7 +5,7 @@ import { ReferenceTable } from '../components/ReferenceTable';
 import { useToast } from '../components/Toast';
 import { Search, Plus, Download, Upload, Filter, X, CheckCircle2 } from 'lucide-react';
 
-const PAGE_SIZE_DEFAULT = 50;
+const PAGE_SIZE_DEFAULT = 100;
 
 export function ReferencePage() {
     const queryClient = useQueryClient();
