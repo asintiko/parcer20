@@ -45,7 +45,9 @@
       "Bash(python3:*)",
       "Bash(grep -l \"get_current_user\" backend/api/routes/*.py)",
       "Bash(docker ps:*)",
-      "Bash(bash /tmp/create_transactions.sh:*)"
+      "Bash(bash /tmp/create_transactions.sh:*)",
+      "Bash(ssh root@144.31.17.123 \"docker compose version && free -h && df -h /\")",
+      "Bash(rsync:*)"
     ],
     "additionalDirectories": [
       "/Users/kulacidmyt/Documents/parcer2.0/backend/scripts"
