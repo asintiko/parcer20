@@ -133,7 +133,7 @@ export function TransactionsPage() {
     // Load operators from reference dictionary
     const { data: referenceData } = useQuery({
         queryKey: ['reference-operators-for-autocomplete'],
-        queryFn: () => referenceApi.getOperators({ page_size: 2000 }),
+        queryFn: () => referenceApi.getOperators({ all: true }),
         staleTime: 5 * 60 * 1000, // 5 minutes
     });
 

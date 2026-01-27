@@ -55,15 +55,19 @@ class OperatorReferenceListResponse(BaseModel):
 @router.get("/", response_model=OperatorReferenceListResponse)
 async def get_operators(
     page: int = Query(1, ge=1, description="Page number"),
-    page_size: int = Query(50, ge=1, le=2000, description="Items per page"),
+    page_size: Optional[int] = Query(50, ge=1, description="Items per page (ignored when all=true)"),
     search: Optional[str] = Query(None, description="Search in operator or app name"),
     application: Optional[str] = Query(None, description="Filter by application"),
     is_p2p: Optional[bool] = Query(None, description="Filter by P2P status"),
     is_active: Optional[bool] = Query(None, description="Filter by active status (None = all)"),
+    all_param: Optional[str] = Query(None, alias="all", description="Return full list without pagination"),
     db: Session = Depends(get_db_session),
     current_user: dict = Depends(get_current_user),
 ):
-    """Get paginated list of operators"""
+    """Get list of operators with optional pagination"""
+    # Convert string parameter to boolean (handles "true", "1", "yes", "on")
+    return_all = all_param is not None and all_param.lower() in ("true", "1", "yes", "on")
+
     query = db.query(OperatorReference)
 
     # Apply filters
@@ -88,14 +92,25 @@ async def get_operators(
     # Get total count
     total = query.count()
 
+    # Return everything when explicitly requested
+    if return_all:
+        items = query.order_by(desc(OperatorReference.id)).all()
+        return OperatorReferenceListResponse(
+            total=total,
+            page=1,
+            page_size=total if total > 0 else 0,
+            items=items
+        )
+
     # Apply pagination
-    offset = (page - 1) * page_size
-    items = query.order_by(desc(OperatorReference.id)).offset(offset).limit(page_size).all()
+    effective_page_size = page_size or 50
+    offset = (page - 1) * effective_page_size
+    items = query.order_by(desc(OperatorReference.id)).offset(offset).limit(effective_page_size).all()
 
     return OperatorReferenceListResponse(
         total=total,
         page=page,
-        page_size=page_size,
+        page_size=effective_page_size,
         items=items
     )
 

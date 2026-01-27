@@ -5,14 +5,15 @@ import { ReferenceTable } from '../components/ReferenceTable';
 import { useToast } from '../components/Toast';
 import { Search, Plus, Download, Upload, Filter, X, CheckCircle2 } from 'lucide-react';
 
-const PAGE_SIZE_DEFAULT = 100;
+type PageSizeOption = number | 'all';
+const PAGE_SIZE_DEFAULT: PageSizeOption = 'all';
 
 export function ReferencePage() {
     const queryClient = useQueryClient();
     const { showToast } = useToast();
 
     const [page, setPage] = useState(1);
-    const [pageSize, setPageSize] = useState(PAGE_SIZE_DEFAULT);
+    const [pageSize, setPageSize] = useState<PageSizeOption>(PAGE_SIZE_DEFAULT);
     const [search, setSearch] = useState('');
     const [debouncedSearch, setDebouncedSearch] = useState('');
     const [applicationFilter, setApplicationFilter] = useState<string>('');
@@ -35,11 +36,12 @@ export function ReferencePage() {
 
     const listQuery = useQuery(
         {
-            queryKey: ['reference-list', page, pageSize, debouncedSearch, applicationFilter, activeOnly, p2pOnly],
+            queryKey: ['reference-list', pageSize === 'all' ? 'all' : page, pageSize, debouncedSearch, applicationFilter, activeOnly, p2pOnly],
             queryFn: () =>
                 referenceApi.getOperators({
-                    page,
-                    page_size: pageSize,
+                    page: pageSize === 'all' ? 1 : page,
+                    page_size: pageSize === 'all' ? undefined : pageSize,
+                    all: pageSize === 'all' ? true : undefined,
                     search: debouncedSearch || undefined,
                     application: applicationFilter || undefined,
                     is_active: activeOnly ? true : undefined,

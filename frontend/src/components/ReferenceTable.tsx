@@ -17,9 +17,9 @@ interface ReferenceTableProps {
     isLoading?: boolean;
     total: number;
     page: number;
-    pageSize: number;
+    pageSize: number | 'all';
     onPageChange: (page: number) => void;
-    onPageSizeChange: (size: number) => void;
+    onPageSizeChange: (size: number | 'all') => void;
     onUpdate: (id: number, field: EditableField, value: any) => void;
     onDelete: (id: number) => void;
 }
@@ -36,6 +36,13 @@ export function ReferenceTable({
     onDelete,
 }: ReferenceTableProps) {
     const [sorting, setSorting] = useState<SortingState>([{ id: 'operator_name', desc: false }]);
+    const isAll = pageSize === 'all';
+    const resolvedPageSize = isAll ? (total || data.length || 1) : pageSize;
+    const pageCount = isAll ? 1 : Math.max(1, Math.ceil(total / resolvedPageSize));
+    const pageStart = total === 0 ? 0 : isAll ? 1 : (page - 1) * resolvedPageSize + 1;
+    const pageEnd = total === 0 ? 0 : isAll ? total : Math.min(page * resolvedPageSize, total);
+    const disablePaging = isAll || total <= resolvedPageSize;
+    const displayPage = isAll ? 1 : Math.min(page, pageCount);
 
     const columns = useMemo<ColumnDef<OperatorReference>[]>(
         () => [
@@ -107,15 +114,12 @@ export function ReferenceTable({
         getCoreRowModel: getCoreRowModel(),
         getSortedRowModel: getSortedRowModel(),
         manualPagination: true,
-        pageCount: Math.max(1, Math.ceil(total / pageSize)),
+        pageCount,
     });
 
-    const pageStart = (page - 1) * pageSize + 1;
-    const pageEnd = Math.min(page * pageSize, total);
-
     return (
-        <div className="border border-border rounded-lg overflow-hidden bg-surface shadow-sm">
-            <div className="overflow-auto">
+        <div className="border border-border rounded-lg overflow-hidden bg-surface shadow-sm h-full flex flex-col">
+            <div className="overflow-auto flex-1">
                 <table className="w-full min-w-[720px]">
                     <thead className="bg-table-header border-b border-table-border">
                         {table.getHeaderGroups().map((hg) => (
@@ -193,30 +197,38 @@ export function ReferenceTable({
                 </div>
                 <div className="flex items-center gap-3">
                     <select
-                        value={pageSize}
-                        onChange={(e) => onPageSizeChange(Number(e.target.value))}
+                        value={isAll ? 'all' : String(pageSize)}
+                        onChange={(e) => {
+                            const val = e.target.value;
+                            if (val === 'all') {
+                                onPageSizeChange('all');
+                            } else {
+                                onPageSizeChange(Number(val));
+                            }
+                        }}
                         className="px-3 py-2 border border-border rounded-md bg-surface text-foreground text-sm"
                     >
+                        <option value="all">Все</option>
                         {[20, 50, 100, 200, 500, 1000].map((size) => (
-                            <option key={size} value={size}>
-                                {size === 1000 ? 'Все' : `${size} / стр`}
+                            <option key={size} value={size.toString()}>
+                                {`${size} / стр`}
                             </option>
                         ))}
                     </select>
                     <div className="flex items-center gap-2">
                         <button
                             onClick={() => onPageChange(Math.max(1, page - 1))}
-                            disabled={page === 1}
+                            disabled={disablePaging || displayPage === 1}
                             className="px-3 py-2 border border-border rounded-md disabled:opacity-50 hover:bg-surface-2"
                         >
                             Назад
                         </button>
                         <div className="px-2">
-                            {page} / {Math.max(1, Math.ceil(total / pageSize))}
+                            {displayPage} / {pageCount}
                         </div>
                         <button
                             onClick={() => onPageChange(page + 1)}
-                            disabled={page * pageSize >= total}
+                            disabled={disablePaging || page * resolvedPageSize >= total}
                             className="px-3 py-2 border border-border rounded-md disabled:opacity-50 hover:bg-surface-2"
                         >
                             Вперёд

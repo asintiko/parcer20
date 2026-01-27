@@ -381,6 +381,7 @@ export const referenceApi = {
         application?: string;
         is_p2p?: boolean;
         is_active?: boolean;
+        all?: boolean;
     }): Promise<OperatorReferenceListResponse> => {
         const response = await apiClient.get<OperatorReferenceListResponse>('/api/reference', { params });
         return response.data;
