@@ -701,6 +701,21 @@ export const telegramClientApi = {
         return response.data;
     },
 
+    getMessagesByDateRange: async (
+        chatId: number,
+        dateFrom: string,
+        dateTo: string,
+        limit?: number
+    ): Promise<TelegramMessagesResponse> => {
+        const params = { date_from: dateFrom, date_to: dateTo, limit };
+        const response = await apiClient.get<TelegramMessagesResponse>(
+            `/api/tg/chats/${chatId}/messages/by-date-range`,
+            { params }
+        );
+        return response.data;
+    },
+
+
     sendMessage: async (chatId: number, text: string): Promise<TelegramChatMessage> => {
         const response = await apiClient.post<TelegramChatMessage>(`/api/tg/chats/${chatId}/messages`, { text });
         return response.data;

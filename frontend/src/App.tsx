@@ -1,7 +1,7 @@
 /**
  * Main Application Component with Routing
  */
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { BrowserRouter, Routes, Route, useLocation, useNavigate } from 'react-router-dom';
 import { Menu, Loader2, CheckCircle2 } from 'lucide-react';
 import { BurgerMenu } from './components/BurgerMenu';
@@ -12,11 +12,26 @@ import { UserbotPage } from './pages/UserbotPage';
 import { LogsPage } from './pages/LogsPage';
 import { useAutomationStatus } from './hooks/useAutomationStatus';
 
+const LAST_PAGE_KEY = 'last_visited_page';
+
 function AppContent() {
     const [isMenuOpen, setIsMenuOpen] = useState(false);
     const location = useLocation();
     const navigate = useNavigate();
     const { isRunning, isCompleted, taskStatus } = useAutomationStatus();
+
+    // Restore last page on mount
+    useEffect(() => {
+        const lastPage = localStorage.getItem(LAST_PAGE_KEY);
+        if (lastPage && lastPage !== '/' && location.pathname === '/') {
+            navigate(lastPage, { replace: true });
+        }
+    }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+    // Save current page to localStorage
+    useEffect(() => {
+        localStorage.setItem(LAST_PAGE_KEY, location.pathname);
+    }, [location.pathname]);
 
     const getPageTitle = () => {
         switch (location.pathname) {

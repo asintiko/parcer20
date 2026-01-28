@@ -764,6 +764,101 @@ class TelegramTDLibManager:
         formatted.sort(key=lambda x: x.get("date") or 0)
         return {"items": formatted, "total": len(formatted)}
 
+    async def get_message_by_date(self, chat_id: int, date: int) -> Optional[Dict[str, Any]]:
+        """
+        Get the last message sent before or at the specified date.
+        
+        Args:
+            chat_id: Telegram chat ID
+            date: Unix timestamp
+            
+        Returns:
+            Formatted message dict or None
+        """
+        try:
+            response = await self._send_request({
+                "@type": "getChatMessageByDate",
+                "chat_id": chat_id,
+                "date": date,
+            })
+            if response.get("@type") == "message":
+                return self._format_message(response)
+        except Exception as exc:
+            logger.warning("Failed to get message by date for chat %s: %s", chat_id, exc)
+        return None
+
+    async def get_messages_by_date_range(
+        self,
+        chat_id: int,
+        date_from: int,
+        date_to: int,
+        limit: int = 1000,
+    ) -> Dict[str, Any]:
+        """
+        Get messages within a date range.
+        
+        Args:
+            chat_id: Telegram chat ID
+            date_from: Start Unix timestamp (inclusive)
+            date_to: End Unix timestamp (inclusive)
+            limit: Maximum number of messages to return
+            
+        Returns:
+            Dict with 'items' list and 'total' count
+        """
+        limit = min(max(limit, 1), 5000)
+        
+        # First, find a message at or after date_to to start iteration
+        start_message = await self.get_message_by_date(chat_id, date_to + 1)
+        start_message_id = start_message.get("id") if start_message else 0
+        
+        # Collect messages
+        batch_size = 100
+        collected: List[Dict[str, Any]] = []
+        current_from = start_message_id
+        safety_batches = limit // batch_size + 10
+        
+        for _ in range(safety_batches):
+            if len(collected) >= limit:
+                break
+                
+            payload = {
+                "@type": "getChatHistory",
+                "chat_id": chat_id,
+                "from_message_id": current_from,
+                "offset": 0,
+                "limit": batch_size,
+                "only_local": False,
+            }
+            response = await self._send_request(payload)
+            messages = response.get("messages", [])
+            
+            if not messages:
+                break
+            
+            for msg in messages:
+                msg_date = msg.get("date", 0)
+                if msg_date < date_from:
+                    break
+                if date_from <= msg_date <= date_to:
+                    collected.append(msg)
+                    if len(collected) >= limit:
+                        break
+            
+            oldest = messages[-1]
+            oldest_date = oldest.get("date", 0)
+            if oldest_date < date_from:
+                break
+                
+            oldest_id = oldest.get("id")
+            if not oldest_id or len(messages) < batch_size:
+                break
+            current_from = oldest_id
+        
+        formatted = [self._format_message(msg) for msg in collected if msg]
+        formatted.sort(key=lambda x: x.get("date") or 0)
+        return {"items": formatted, "total": len(formatted)}
+
     async def send_message(self, chat_id: int, text: str) -> Dict[str, Any]:
         payload = {
             "@type": "sendMessage",

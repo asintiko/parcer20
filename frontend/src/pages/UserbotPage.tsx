@@ -21,6 +21,7 @@ import {
     BadgeCheck,
     CheckSquare,
     Square,
+    Calendar,
 } from 'lucide-react';
 import { MessageItem } from '../components/MessageItem';
 import {
@@ -95,6 +96,9 @@ export const UserbotPage: React.FC = () => {
     const [previewUrl, setPreviewUrl] = useState<string | null>(null);
     const [processingId, setProcessingId] = useState<number | null>(null);
     const [batchProcessing, setBatchProcessing] = useState(false);
+    const [dateRangeFrom, setDateRangeFrom] = useState<string>('');
+    const [dateRangeTo, setDateRangeTo] = useState<string>('');
+    const [showDateRangePicker, setShowDateRangePicker] = useState(false);
     const messagesScrollRef = useRef<HTMLDivElement | null>(null);
 
     const chatTypeLabel: Record<string, string> = useMemo(
@@ -318,6 +322,63 @@ export const UserbotPage: React.FC = () => {
 
     const deselectAllMessages = useCallback(() => {
         setSelectedMessageIds(new Set());
+    }, []);
+
+    // Select messages by date range
+    const selectMessagesByDateRange = useCallback(() => {
+        if (!dateRangeFrom || !dateRangeTo) return;
+
+        const fromTs = new Date(dateRangeFrom).getTime();
+        const toTs = new Date(dateRangeTo).getTime();
+
+        if (fromTs > toTs) {
+            showToast('error', 'Начальная дата должна быть раньше конечной');
+            return;
+        }
+
+        const selectedIds = messagesState
+            .filter((m) => {
+                if (!m.date) return false;
+                const msgTime = new Date(m.date).getTime();
+                return msgTime >= fromTs && msgTime <= toTs;
+            })
+            .map((m) => m.id)
+            .filter((id): id is number => typeof id === 'number');
+
+        setSelectedMessageIds(new Set(selectedIds));
+        showToast('success', `Выбрано ${selectedIds.length} сообщений за период`);
+    }, [dateRangeFrom, dateRangeTo, messagesState, showToast]);
+
+    // Quick date range presets
+    const setDatePreset = useCallback((preset: 'today' | 'yesterday' | 'week' | 'month') => {
+        const now = new Date();
+        let from: Date;
+        let to: Date = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 23, 59, 59);
+
+        switch (preset) {
+            case 'today':
+                from = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0);
+                break;
+            case 'yesterday':
+                from = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1, 0, 0, 0);
+                to = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1, 23, 59, 59);
+                break;
+            case 'week':
+                from = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 7, 0, 0, 0);
+                break;
+            case 'month':
+                from = new Date(now.getFullYear(), now.getMonth(), 1, 0, 0, 0);
+                break;
+        }
+
+        // Format for datetime-local input
+        const formatDate = (d: Date) => {
+            const pad = (n: number) => n.toString().padStart(2, '0');
+            return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+        };
+
+        setDateRangeFrom(formatDate(from));
+        setDateRangeTo(formatDate(to));
     }, []);
 
     const sendPhoneMutation = useMutation({
@@ -1045,8 +1106,82 @@ export const UserbotPage: React.FC = () => {
                                                 <Square className="w-4 h-4" />
                                                 Снять
                                             </button>
+                                            <button
+                                                onClick={() => setShowDateRangePicker(!showDateRangePicker)}
+                                                className={`flex items-center gap-1.5 px-3 py-2 min-h-[40px] rounded-md border text-sm transition-colors ${showDateRangePicker
+                                                    ? 'border-primary bg-primary/10 text-primary'
+                                                    : 'border-border text-foreground-secondary hover:bg-surface-2'
+                                                    }`}
+                                            >
+                                                <Calendar className="w-4 h-4" />
+                                                За период
+                                            </button>
                                         </div>
                                     </div>
+
+                                    {/* Date Range Picker Panel */}
+                                    {showDateRangePicker && (
+                                        <div className="bg-surface-2 border border-border rounded-lg p-4 space-y-3">
+                                            <div className="flex items-center gap-2 text-sm font-medium text-foreground">
+                                                <Calendar className="w-4 h-4 text-primary" />
+                                                Выбрать сообщения за период
+                                            </div>
+                                            <div className="flex flex-wrap items-center gap-3">
+                                                <div className="flex items-center gap-2">
+                                                    <label className="text-xs text-foreground-secondary">От:</label>
+                                                    <input
+                                                        type="datetime-local"
+                                                        value={dateRangeFrom}
+                                                        onChange={(e) => setDateRangeFrom(e.target.value)}
+                                                        className="px-2 py-1.5 text-sm border border-border rounded-md bg-input-bg text-input-text focus:ring-2 focus:ring-primary focus:border-transparent"
+                                                    />
+                                                </div>
+                                                <div className="flex items-center gap-2">
+                                                    <label className="text-xs text-foreground-secondary">До:</label>
+                                                    <input
+                                                        type="datetime-local"
+                                                        value={dateRangeTo}
+                                                        onChange={(e) => setDateRangeTo(e.target.value)}
+                                                        className="px-2 py-1.5 text-sm border border-border rounded-md bg-input-bg text-input-text focus:ring-2 focus:ring-primary focus:border-transparent"
+                                                    />
+                                                </div>
+                                                <button
+                                                    onClick={selectMessagesByDateRange}
+                                                    disabled={!dateRangeFrom || !dateRangeTo}
+                                                    className="px-4 py-1.5 text-sm rounded-md bg-primary text-foreground-inverse hover:bg-primary-hover disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                                                >
+                                                    Выбрать
+                                                </button>
+                                            </div>
+                                            <div className="flex flex-wrap gap-2">
+                                                <span className="text-xs text-foreground-muted">Быстро:</span>
+                                                <button
+                                                    onClick={() => setDatePreset('today')}
+                                                    className="px-2 py-1 text-xs rounded border border-border text-foreground-secondary hover:bg-surface hover:text-foreground transition-colors"
+                                                >
+                                                    Сегодня
+                                                </button>
+                                                <button
+                                                    onClick={() => setDatePreset('yesterday')}
+                                                    className="px-2 py-1 text-xs rounded border border-border text-foreground-secondary hover:bg-surface hover:text-foreground transition-colors"
+                                                >
+                                                    Вчера
+                                                </button>
+                                                <button
+                                                    onClick={() => setDatePreset('week')}
+                                                    className="px-2 py-1 text-xs rounded border border-border text-foreground-secondary hover:bg-surface hover:text-foreground transition-colors"
+                                                >
+                                                    7 дней
+                                                </button>
+                                                <button
+                                                    onClick={() => setDatePreset('month')}
+                                                    className="px-2 py-1 text-xs rounded border border-border text-foreground-secondary hover:bg-surface hover:text-foreground transition-colors"
+                                                >
+                                                    Этот месяц
+                                                </button>
+                                            </div>
+                                        </div>
+                                    )}
                                     <button
                                         onClick={() => {
                                             if (!currentChat) return;
@@ -1138,7 +1273,7 @@ export const UserbotPage: React.FC = () => {
                         </div>
                     </div>
                 </div>
-            </div>
+            </div >
             {previewUrl && (
                 <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50">
                     <div className="bg-white w-11/12 h-[90vh] rounded-lg shadow-lg overflow-hidden relative">
@@ -1151,7 +1286,8 @@ export const UserbotPage: React.FC = () => {
                         <iframe src={previewUrl} title="PDF preview" className="w-full h-full border-0" />
                     </div>
                 </div>
-            )}
+            )
+            }
         </>
     );
 };

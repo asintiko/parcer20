@@ -1,4 +1,5 @@
 import React, { useEffect, useRef } from 'react';
+import { AlignLeft, AlignCenter, AlignRight } from 'lucide-react';
 
 interface ContextMenuProps {
     x: number;
@@ -49,25 +50,25 @@ export const ContextMenu: React.FC<ContextMenuProps> = ({ x, y, onClose, onAlign
             </div>
             <div className="flex justify-around px-2 mb-2">
                 <button
-                    className="p-1.5 hover:bg-context-menu-hover rounded text-context-menu-text"
+                    className="p-2 hover:bg-context-menu-hover rounded text-context-menu-text transition-colors"
                     onClick={() => onAlign('left')}
                     title="По левому краю"
                 >
-                    L
+                    <AlignLeft className="w-4 h-4" />
                 </button>
                 <button
-                    className="p-1.5 hover:bg-context-menu-hover rounded text-context-menu-text"
+                    className="p-2 hover:bg-context-menu-hover rounded text-context-menu-text transition-colors"
                     onClick={() => onAlign('center')}
                     title="По центру"
                 >
-                    C
+                    <AlignCenter className="w-4 h-4" />
                 </button>
                 <button
-                    className="p-1.5 hover:bg-context-menu-hover rounded text-context-menu-text"
+                    className="p-2 hover:bg-context-menu-hover rounded text-context-menu-text transition-colors"
                     onClick={() => onAlign('right')}
                     title="По правому краю"
                 >
-                    R
+                    <AlignRight className="w-4 h-4" />
                 </button>
             </div>
 

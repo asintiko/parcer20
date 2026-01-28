@@ -28,8 +28,12 @@ type FiltersState = {
     days_of_week?: number[];
 };
 
+const TRANSACTIONS_PAGE_KEY = 'transactions_page';
+
 export function TransactionsPage() {
+    // Start at page 1, will auto-navigate to last page once data loads
     const [page, setPage] = useState(1);
+    const [initialLoadDone, setInitialLoadDone] = useState(false);
     const [pageSize, setPageSize] = useState(100);
     const [sort, setSort] = useState<SortState>({ sort_by: 'transaction_date', sort_dir: 'asc' });
     const [filters, setFilters] = useState<FiltersState>({ currency: 'ALL' });
@@ -166,6 +170,20 @@ export function TransactionsPage() {
     }, [data, referenceData]);
 
     const total = sortedData.length;
+
+    // Save page to localStorage whenever it changes
+    useEffect(() => {
+        localStorage.setItem(TRANSACTIONS_PAGE_KEY, page.toString());
+    }, [page]);
+
+    // ALWAYS go to last page on initial load when data becomes available
+    useEffect(() => {
+        if (total > 0 && isOfflineReady && !initialLoadDone) {
+            const maxPage = Math.max(1, Math.ceil(total / pageSize));
+            setPage(maxPage);
+            setInitialLoadDone(true);
+        }
+    }, [total, pageSize, isOfflineReady, initialLoadDone]);
 
     useEffect(() => {
         const maxPage = Math.max(1, Math.ceil(total / pageSize));

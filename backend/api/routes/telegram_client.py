@@ -473,6 +473,53 @@ async def get_messages(
     )
 
 
+@router.get("/chats/{chat_id}/messages/by-date-range", response_model=MessageListResponse)
+async def get_messages_by_date_range(
+    chat_id: int,
+    date_from: str = Query(..., description="Start date in ISO format (e.g., 2026-01-27T00:00:00)"),
+    date_to: str = Query(..., description="End date in ISO format (e.g., 2026-01-28T23:59:59)"),
+    limit: int = Query(1000, ge=1, le=5000),
+    manager: TelegramTDLibManager = Depends(tdlib_manager_dep),
+    current_user: dict = Depends(get_current_user),
+) -> MessageListResponse:
+    """
+    Fetch messages within a date range.
+    
+    Args:
+        chat_id: Telegram chat ID
+        date_from: Start date/time in ISO format (inclusive)
+        date_to: End date/time in ISO format (inclusive)
+        limit: Maximum number of messages to return (default 1000, max 5000)
+    """
+    try:
+        # Parse ISO dates to Unix timestamps
+        from_dt = datetime.fromisoformat(date_from.replace("Z", "+00:00"))
+        to_dt = datetime.fromisoformat(date_to.replace("Z", "+00:00"))
+        date_from_ts = int(from_dt.timestamp())
+        date_to_ts = int(to_dt.timestamp())
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid date format: {exc}")
+    
+    if date_from_ts > date_to_ts:
+        raise HTTPException(status_code=400, detail="date_from must be before date_to")
+    
+    try:
+        result = await manager.get_messages_by_date_range(
+            chat_id=chat_id,
+            date_from=date_from_ts,
+            date_to=date_to_ts,
+            limit=limit,
+        )
+    except TDLibUnavailableError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=f"Failed to get messages by date range: {exc}")
+    
+    return MessageListResponse(
+        total=result.get("total", 0),
+        items=[_format_message(msg) for msg in result.get("items", []) if msg],
+    )
+
 @router.post("/chats/{chat_id}/messages", response_model=ChatMessage)
 async def send_message(
     chat_id: int,
