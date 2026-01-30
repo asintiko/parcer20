@@ -53,7 +53,7 @@ export function TransactionsPage() {
     } = useOfflineTransactions();
 
     const filteredData = useMemo(() => {
-        const search = (filters.search || '').trim().toLowerCase();
+        const search = (filters.search || '').trim();
 
         const dateToEnd = filters.dateTo ? new Date(filters.dateTo) : null;
         if (dateToEnd) {
@@ -89,13 +89,42 @@ export function TransactionsPage() {
             if (filters.transaction_type && tx.transaction_type !== filters.transaction_type) return false;
             if (filters.transaction_types?.length && !filters.transaction_types.includes(tx.transaction_type)) return false;
             if (filters.source_channel && tx.source_channel !== filters.source_channel) return false;
-            if (filters.card) {
-                if (tx.card_last_4 !== filters.card) return false;
-            }
+            if (filters.card && tx.card_last_4 !== filters.card) return false;
 
             if (search) {
+                const tokens = search.match(/"[^"]+"|\S+/g) || [];
                 const blob = `${tx.operator_raw || ''} ${tx.application_mapped || ''} ${tx.raw_message || ''} ${tx.amount || ''} ${tx.currency || ''}`.toLowerCase();
-                if (!blob.includes(search)) return false;
+                const statusBlob = `${tx.parsing_method || ''} ${tx.transaction_type_display || ''} ${tx.source_display || ''}`.toLowerCase();
+                const sellerBlob = `${tx.operator_raw || ''} ${tx.application_mapped || ''}`.toLowerCase();
+                const amountVal = tx.amount ? Math.abs(parseFloat(tx.amount)).toString() : '';
+                const dateStr = tx.transaction_date || '';
+
+                const matches = tokens.every((token) => {
+                    const neg = token.startsWith('-');
+                    const cleanToken = token.replace(/^[-]/, '');
+                    const hasField = cleanToken.includes(':');
+                    const [rawKey, ...rest] = hasField ? cleanToken.split(':') : ['text', cleanToken];
+                    const key = rawKey.toLowerCase();
+                    const valueRaw = rest.join(':') || cleanToken;
+                    const value = valueRaw.replace(/^"|"$/g, '').toLowerCase();
+
+                    const apply = (cond: boolean) => (neg ? !cond : cond);
+
+                    switch (key) {
+                        case 'amount':
+                            return apply(amountVal.includes(value));
+                        case 'date':
+                            return apply(dateStr.toLowerCase().includes(value));
+                        case 'status':
+                            return apply(statusBlob.includes(value));
+                        case 'seller':
+                            return apply(sellerBlob.includes(value));
+                        default:
+                            return apply(blob.includes(cleanToken.toLowerCase()));
+                    }
+                });
+
+                if (!matches) return false;
             }
 
             return true;
@@ -275,26 +304,6 @@ export function TransactionsPage() {
             <div className="flex-1 overflow-hidden p-4">
                 <div className="h-full flex flex-col bg-surface border border-table-border rounded-lg shadow-sm">
                     <div className="flex-1 overflow-hidden p-0 pb-6">
-                        <div className="flex flex-col gap-3 px-4 py-2 border-b border-table-border bg-surface-2">
-                            <div className="flex items-center justify-between">
-                                <div className="text-sm text-foreground-secondary">
-                                    {isOfflineReady ? 'Локальный кеш загружен' : 'Кеш отсутствует, выполняется синхронизация'}
-                                    {lastSyncAt ? ` · Последняя синхронизация: ${new Date(lastSyncAt).toLocaleString()}` : ''}
-                                </div>
-                                <button
-                                    onClick={() => syncFromServer()}
-                                    disabled={offlineLoading || syncProgress.status === 'running'}
-                                    className="px-3 py-1.5 text-sm font-medium text-foreground bg-surface border border-border rounded hover:bg-surface-2 disabled:opacity-60"
-                                >
-                                    {syncProgress.status === 'running'
-                                        ? `Синхронизация... (${syncProgress.downloaded} записей)`
-                                        : 'Синхронизировать'}
-                                </button>
-                            </div>
-                            <div className="px-3 py-2 text-sm font-medium text-foreground bg-surface shadow-sm rounded-md border border-table-border">
-                                Всего записей: {total}
-                            </div>
-                        </div>
                         <TransactionTable
                             data={paginatedItems}
                             total={total}
@@ -313,6 +322,13 @@ export function TransactionsPage() {
                             onPageSizeChange={handlePageSizeChange}
                             operatorOptions={operatorOptions}
                             appOptions={appOptions}
+                            syncState={{
+                                isSyncing: syncProgress.status === 'running',
+                                progress: syncProgress,
+                                lastSyncAt: lastSyncAt ? new Date(lastSyncAt).getTime() : null,
+                                isOfflineReady,
+                                onSync: syncFromServer,
+                            }}
                         />
                     </div>
                 </div>

@@ -72,6 +72,13 @@ interface TransactionTableProps {
     onPageSizeChange: (size: number) => void;
     operatorOptions?: string[];
     appOptions?: string[];
+    syncState?: {
+        isSyncing?: boolean;
+        progress?: { downloaded?: number; total?: number; status?: string };
+        lastSyncAt?: number | null;
+        isOfflineReady?: boolean;
+        onSync?: () => void;
+    };
 }
 
 // Types for Styling
@@ -202,6 +209,7 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
     onPageSizeChange,
     operatorOptions = [],
     appOptions = [],
+    syncState,
 }) => {
     const [sorting, setSorting] = useState<SortingState>([{ id: 'transaction_date', desc: false }]);
     const [columnFilters, setColumnFilters] = useState<ColumnFiltersState>([]);
@@ -212,6 +220,7 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
     // Search State
     const [globalFilter, setGlobalFilter] = useState('');
     const [searchValue, setSearchValue] = useState('');
+    const [searchHelpOpen, setSearchHelpOpen] = useState(false);
     const [density, setDensity] = useState<'compact' | 'standard' | 'comfortable'>('standard');
     const [viewMenuOpen, setViewMenuOpen] = useState(false);
     const [exportMenuOpen, setExportMenuOpen] = useState(false);
@@ -233,6 +242,9 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
     const restoredStateRef = React.useRef(false);
     const loadAttemptedRef = React.useRef(false);
     const saveTimeoutRef = React.useRef<number | null>(null);
+    const searchHelpRef = useRef<HTMLDivElement | null>(null);
+    const exportMenuRef = useRef<HTMLDivElement | null>(null);
+    const viewMenuRef = useRef<HTMLDivElement | null>(null);
 
     const ensureLockedVisibility = useCallback((visibility: Record<string, boolean>) => {
         const next = { ...visibility };
@@ -249,6 +261,24 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
         }, 300);
         return () => clearTimeout(timeout);
     }, [searchValue]);
+
+    // Close popovers on outside click
+    useEffect(() => {
+        const handler = (e: MouseEvent) => {
+            const target = e.target as Node;
+            if (searchHelpOpen && searchHelpRef.current && !searchHelpRef.current.contains(target)) {
+                setSearchHelpOpen(false);
+            }
+            if (exportMenuOpen && exportMenuRef.current && !exportMenuRef.current.contains(target)) {
+                setExportMenuOpen(false);
+            }
+            if (viewMenuOpen && viewMenuRef.current && !viewMenuRef.current.contains(target)) {
+                setViewMenuOpen(false);
+            }
+        };
+        document.addEventListener('mousedown', handler);
+        return () => document.removeEventListener('mousedown', handler);
+    }, [searchHelpOpen, exportMenuOpen, viewMenuOpen]);
 
     const sortFieldMap = useMemo<Record<string, string>>(() => ({
         date_time: 'transaction_date',
@@ -854,25 +884,23 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
     }, [rowCount, virtualizationActive, isDev]);
 
     const PaginationControls: React.FC<{ className?: string }> = ({ className }) => (
-        <div className={`flex items-center justify-between text-sm text-foreground px-3 py-2 border border-border rounded-md bg-surface-2 shadow-sm ${className || ''}`}>
-            <div className="font-medium">
-                Строк: {rowCount}
-            </div>
-            <div className="flex items-center gap-3">
+        <div className={`flex items-center gap-3 text-sm ${className || ''}`}>
+            <span className="text-foreground-secondary">Строк: {rowCount}</span>
+            <div className="flex items-center gap-2 bg-surface px-2 py-1 rounded-md border border-border">
                 <button
                     onClick={() => table.previousPage()}
                     disabled={!table.getCanPreviousPage()}
-                    className="px-3 py-1 rounded-md border border-primary bg-primary text-foreground-inverse hover:bg-primary-dark disabled:opacity-50 disabled:cursor-not-allowed"
+                    className="px-2.5 py-1 rounded-md border border-border bg-surface-2 text-foreground hover:bg-surface-3 disabled:opacity-50 disabled:cursor-not-allowed"
                 >
                     ← Пред
                 </button>
-                <span className="font-semibold">
+                <span className="font-semibold text-foreground">
                     Стр. {table.getState().pagination.pageIndex + 1} из {table.getPageCount()}
                 </span>
                 <button
                     onClick={() => table.nextPage()}
                     disabled={!table.getCanNextPage()}
-                    className="px-3 py-1 rounded-md border border-primary bg-primary text-foreground-inverse hover:bg-primary-dark disabled:opacity-50 disabled:cursor-not-allowed"
+                    className="px-2.5 py-1 rounded-md border border-border bg-surface-2 text-foreground hover:bg-surface-3 disabled:opacity-50 disabled:cursor-not-allowed"
                 >
                     След →
                 </button>
@@ -1282,13 +1310,16 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
         });
     }, [exportAllRows, exportViewRows, table, columnStyles, cellStyles, buildExportColumns]);
 
-    if (isLoading) {
-        return (
-            <div className="flex items-center justify-center py-12">
-                <div className="text-foreground-secondary">Загрузка данных...</div>
-            </div>
-        );
-    }
+    const selectedRowIds = useMemo(() => {
+        const rows = new Set<number>();
+        selectedCells.forEach((key) => {
+            const rowId = Number(key.split(':')[0]);
+            rows.add(rowId);
+        });
+        return Array.from(rows);
+    }, [selectedCells]);
+
+    // Applied filter chips intentionally removed per latest request
 
     return (
         <div className="flex flex-col h-full space-y-4 p-4" onClick={() => {
@@ -1308,101 +1339,101 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
                 />
             )}
 
-            {/* Currency Tabs */}
-            <div className="flex space-x-1 bg-surface-2 p-1 rounded-lg w-fit mb-4">
-                {[
-                    { key: 'ALL', label: 'Все' },
-                    { key: 'UZS', label: 'UZS' },
-                    { key: 'USD', label: 'USD' },
-                ].map((item) => (
-                    <button
-                        key={item.key}
-                        onClick={() => setActiveFilters({ ...activeFilters, currency: item.key as any })}
-                        className={`px-4 py-2 text-sm font-medium rounded-md transition-all focus:outline-none focus:ring-2 focus:ring-primary ${activeFilters.currency === item.key
-                            ? 'bg-surface text-foreground shadow-sm'
-                            : 'text-foreground-secondary hover:text-foreground'
-                            }`}
-                    >
-                        {item.label}
-                    </button>
-                ))}
-            </div>
-
-            {/* Smart Search Bar */}
-            <div className="relative mb-4">
-                <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
-                    <Search className="h-5 w-5 text-foreground-muted" />
-                </div>
-                <input
-                    type="text"
-                    value={searchValue}
-                    onChange={(e) => setSearchValue(e.target.value)}
-                    className="block w-full pl-10 pr-3 py-2 border border-border rounded-md leading-5 bg-surface placeholder-text-muted text-foreground focus:outline-none focus:placeholder-text-secondary focus:ring-1 focus:ring-primary focus:border-primary sm:text-sm transition duration-150 ease-in-out shadow-sm"
-                    placeholder="Поиск по всем колонкам (сумма, продавец, дата)..."
-                />
-            </div>
-
-            {/* Toolbar */}
-            <div className="flex items-center gap-2 mb-4">
-                <div className="relative">
-                    <button
-                        onClick={() => setExportMenuOpen(prev => !prev)}
-                        className="flex items-center gap-2 px-3 py-1.5 text-sm font-medium text-foreground bg-surface border border-border rounded hover:bg-surface-2 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-primary"
-                    >
-                        <FileText className="w-4 h-4" />
-                        Экспорт
-                    </button>
-                    {exportMenuOpen && (
-                        <div className="absolute top-full left-0 mt-1 w-52 bg-surface border border-border rounded-md shadow-lg z-50">
-                            <button
-                                onClick={() => { exportCurrentView(); setExportMenuOpen(false); }}
-                                className="w-full text-left px-3 py-2 text-sm hover:bg-surface-2"
-                            >
-                                Экспорт текущего вида
-                            </button>
-                            <button
-                                onClick={() => { exportAll(); setExportMenuOpen(false); }}
-                                className="w-full text-left px-3 py-2 text-sm hover:bg-surface-2"
-                            >
-                                Экспорт всех транзакций
-                            </button>
+            {/* Top controls */}
+            <div className="space-y-3 mb-3">
+                {/* Toolbar */}
+                <div className="flex flex-wrap gap-2 items-center">
+                    <div className="relative flex-1 min-w-[280px]" ref={searchHelpRef}>
+                        <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
+                            <Search className="h-5 w-5 text-foreground-muted" />
                         </div>
-                    )}
-                </div>
-                <button
-                    onClick={onAddClick}
-                    className="flex items-center gap-2 px-3 py-1.5 text-sm font-medium text-foreground bg-primary text-white border border-primary rounded hover:bg-primary-dark focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-primary"
-                >
-                    Добавить
-                </button>
-                <button
-                    onClick={() => setFilterDrawerOpen(true)}
-                    className={`flex items-center gap-2 px-3 py-1.5 text-sm font-medium border rounded hover:bg-surface-2 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-primary ${activeFilterCount > 0 ? 'bg-primary-light text-primary border-primary/30' : 'text-foreground bg-surface border-border'}`}
-                >
-                    <Filter className="w-4 h-4" />
-                    Фильтры
-                    {activeFilterCount > 0 && (
-                        <span className="flex items-center justify-center w-5 h-5 ml-1 text-xs font-bold text-foreground-inverse bg-primary rounded-full">
-                            {activeFilterCount}
-                        </span>
-                    )}
-                </button>
-                <div className="relative">
-                    <button
-                        onClick={() => setViewMenuOpen(!viewMenuOpen)}
-                        className="flex items-center gap-2 px-3 py-1.5 text-sm font-medium text-foreground bg-surface border border-border rounded hover:bg-surface-2 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-primary"
-                    >
-                        <Eye className="w-4 h-4" />
-                        Вид
-                    </button>
-                    {viewMenuOpen && (
-                        <div className="absolute top-full left-0 mt-1 w-96 bg-surface border border-border rounded-md shadow-lg z-50">
-                            <div className="p-2 border-b border-border">
-                                <div className="text-xs font-semibold text-foreground-muted mb-2 px-2">Столбцы</div>
-                                <div className="flex items-center gap-2 px-2 mb-2">
+                        <input
+                            type="text"
+                            value={searchValue}
+                            onChange={(e) => setSearchValue(e.target.value)}
+                            className="block w-full pl-10 pr-10 py-2 border border-border rounded-md leading-5 bg-surface placeholder-text-muted text-foreground focus:outline-none focus:ring-1 focus:ring-primary focus:border-primary sm:text-sm transition duration-150 ease-in-out shadow-sm"
+                            placeholder='Напр: 1250000, "Korzinka", 2026-01-28, status:ошибка, -status:дубликат'
+                        />
+                        <button
+                            className="absolute inset-y-0 right-2 px-2 text-foreground-muted hover:text-foreground"
+                            onClick={() => setSearchHelpOpen((v) => !v)}
+                            title="Как искать"
+                        >
+                            ?
+                        </button>
+                        {searchHelpOpen && (
+                            <div className="absolute mt-2 right-0 w-72 p-3 bg-surface border border-border rounded-md shadow-lg text-sm z-50">
+                                <div className="font-semibold mb-2">Как искать</div>
+                                <ul className="space-y-1 text-foreground-muted">
+                                    <li><span className="font-mono">amount:100000</span> — точная сумма</li>
+                                    <li><span className="font-mono">date:2026-01-28</span> — дата</li>
+                                    <li><span className="font-mono">status:ошибка</span> — статус/метка</li>
+                                    <li><span className="font-mono">seller:korzinka</span> — оператор/продавец</li>
+                                    <li><span className="font-mono">-status:дубликат</span> — исключить статус</li>
+                                    <li>Кавычки для фраз: <span className="font-mono">"Korzinka Market"</span></li>
+                                </ul>
+                            </div>
+                        )}
+                    </div>
+
+                    <div className="flex items-center gap-2 ml-auto">
+                        <button
+                            onClick={onAddClick}
+                            className="flex items-center gap-2 px-3 py-2 text-sm font-medium text-foreground bg-primary text-white border border-primary rounded hover:bg-primary-dark focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-primary"
+                        >
+                            Добавить
+                        </button>
+
+                        <div className="relative" ref={exportMenuRef}>
+                            <button
+                                onClick={() => setExportMenuOpen(prev => !prev)}
+                                className="flex items-center gap-2 px-3 py-2 text-sm font-medium text-foreground bg-surface border border-border rounded hover:bg-surface-2 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-primary"
+                            >
+                                <FileText className="w-4 h-4" />
+                                Экспорт
+                            </button>
+                            {exportMenuOpen && (
+                                <div className="absolute top-full right-0 mt-1 w-52 bg-surface border border-border rounded-md shadow-lg z-50">
                                     <button
-                                        className="px-2 py-1 text-xs border border-border rounded hover:bg-surface-2"
-                                        onClick={showAllColumns}
+                                        onClick={() => { exportCurrentView(); setExportMenuOpen(false); }}
+                                        className="w-full text-left px-3 py-2 text-sm hover:bg-surface-2"
+                                    >
+                                        Экспорт текущего вида
+                                    </button>
+                                    <button
+                                        onClick={() => { exportAll(); setExportMenuOpen(false); }}
+                                        className="w-full text-left px-3 py-2 text-sm hover:bg-surface-2"
+                                    >
+                                        Экспорт всех транзакций
+                                    </button>
+                                </div>
+                            )}
+                        </div>
+
+                        <button
+                            onClick={() => setFilterDrawerOpen(true)}
+                            className={`flex items-center gap-2 px-3 py-2 text-sm font-medium border rounded hover:bg-surface-2 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-primary ${activeFilterCount > 0 ? 'bg-primary-light text-primary border-primary/30' : 'text-foreground bg-surface border-border'}`}
+                        >
+                            <Filter className="w-4 h-4" />
+                            Фильтры{activeFilterCount > 0 ? ` (${activeFilterCount})` : ''}
+                        </button>
+
+                        <div className="relative" ref={viewMenuRef}>
+                            <button
+                                onClick={() => setViewMenuOpen(!viewMenuOpen)}
+                                className="flex items-center gap-2 px-3 py-2 text-sm font-medium text-foreground bg-surface border border-border rounded hover:bg-surface-2 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-primary"
+                            >
+                                <Eye className="w-4 h-4" />
+                                Вид
+                            </button>
+                            {viewMenuOpen && (
+                                <div className="absolute top-full right-0 mt-1 w-96 bg-surface border border-border rounded-md shadow-lg z-50">
+                                    <div className="p-2 border-b border-border">
+                                        <div className="text-xs font-semibold text-foreground-muted mb-2 px-2">Столбцы</div>
+                                        <div className="flex items-center gap-2 px-2 mb-2">
+                                            <button
+                                                className="px-2 py-1 text-xs border border-border rounded hover:bg-surface-2"
+                                                onClick={showAllColumns}
                                     >
                                         Показать все
                                     </button>
@@ -1433,112 +1464,215 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
                                     })}
                                 </div>
                             </div>
-                            <div className="p-2 border-b border-border">
-                                <div className="text-xs font-semibold text-foreground-muted mb-2 px-2">Плотность строк</div>
-                                <button
-                                    onClick={() => { setDensity('compact'); setViewMenuOpen(false); }}
-                                    className={`w-full text-left px-2 py-1 text-sm rounded focus:outline-none focus:ring-2 focus:ring-primary ${density === 'compact' ? 'bg-primary-light text-primary' : 'hover:bg-surface-2'}`}
-                                >
-                                    Компактный
-                                </button>
-                                <button
-                                    onClick={() => { setDensity('standard'); setViewMenuOpen(false); }}
-                                    className={`w-full text-left px-2 py-1 text-sm rounded focus:outline-none focus:ring-2 focus:ring-primary ${density === 'standard' ? 'bg-primary-light text-primary' : 'hover:bg-surface-2'}`}
-                                >
-                                    Средний
-                                </button>
-                                <button
-                                    onClick={() => { setDensity('comfortable'); setViewMenuOpen(false); }}
-                                    className={`w-full text-left px-2 py-1 text-sm rounded focus:outline-none focus:ring-2 focus:ring-primary ${density === 'comfortable' ? 'bg-primary-light text-primary' : 'hover:bg-surface-2'}`}
-                                >
-                                    Крупный
-                                </button>
-                            </div>
-                            <div className="p-2 border-b border-border">
-                                <div className="text-xs font-semibold text-foreground-muted mb-2 px-2">Сохраненные виды</div>
-                                <div className="flex items-center gap-2 px-2 mb-2">
-                                    <input
-                                        type="text"
-                                        value={presetName}
-                                        onChange={(e) => setPresetName(e.target.value)}
-                                        placeholder="Название вида"
-                                        className="flex-1 px-2 py-1 text-sm border border-border rounded bg-surface"
-                                    />
-                                    <button
-                                        className="px-2 py-1 text-xs border border-border rounded hover:bg-surface-2"
-                                        onClick={() => handleSavePreset(false)}
-                                    >
-                                        Сохранить
-                                    </button>
-                                    <button
-                                        className="px-2 py-1 text-xs border border-border rounded hover:bg-surface-2"
-                                        onClick={() => handleSavePreset(true)}
-                                    >
-                                        Сохранить и по умолчанию
-                                    </button>
+                                    <div className="p-2 border-b border-border">
+                                        <div className="text-xs font-semibold text-foreground-muted mb-2 px-2">Плотность строк</div>
+                                        <button
+                                            onClick={() => { setDensity('compact'); setViewMenuOpen(false); }}
+                                            className={`w-full text-left px-2 py-1 text-sm rounded focus:outline-none focus:ring-2 focus:ring-primary ${density === 'compact' ? 'bg-primary-light text-primary' : 'hover:bg-surface-2'}`}
+                                        >
+                                            Компактный
+                                        </button>
+                                        <button
+                                            onClick={() => { setDensity('standard'); setViewMenuOpen(false); }}
+                                            className={`w-full text-left px-2 py-1 text-sm rounded focus:outline-none focus:ring-2 focus:ring-primary ${density === 'standard' ? 'bg-primary-light text-primary' : 'hover:bg-surface-2'}`}
+                                        >
+                                            Средний
+                                        </button>
+                                        <button
+                                            onClick={() => { setDensity('comfortable'); setViewMenuOpen(false); }}
+                                            className={`w-full text-left px-2 py-1 text-sm rounded focus:outline-none focus:ring-2 focus:ring-primary ${density === 'comfortable' ? 'bg-primary-light text-primary' : 'hover:bg-surface-2'}`}
+                                        >
+                                            Крупный
+                                        </button>
+                                    </div>
+                                    <div className="p-2 border-b border-border">
+                                        <div className="text-xs font-semibold text-foreground-muted mb-2 px-2">Сохраненные виды</div>
+                                        <div className="flex items-center gap-2 px-2 mb-2">
+                                            <input
+                                                type="text"
+                                                value={presetName}
+                                                onChange={(e) => setPresetName(e.target.value)}
+                                                placeholder="Название вида"
+                                                className="flex-1 px-2 py-1 text-sm border border-border rounded bg-surface"
+                                            />
+                                            <button
+                                                className="px-2 py-1 text-xs border border-border rounded hover:bg-surface-2"
+                                                onClick={() => handleSavePreset(false)}
+                                            >
+                                                Сохранить
+                                            </button>
+                                            <button
+                                                className="px-2 py-1 text-xs border border-border rounded hover:bg-surface-2"
+                                                onClick={() => handleSavePreset(true)}
+                                            >
+                                                Сохранить и по умолчанию
+                                            </button>
+                                        </div>
+                                        <div className="max-h-48 overflow-auto flex flex-col gap-2 px-2">
+                                            {presets.length === 0 ? (
+                                                <div className="text-xs text-foreground-muted px-1">Пока нет сохраненных видов</div>
+                                            ) : (
+                                                presets.map((preset) => (
+                                                    <div key={preset.name} className="flex items-center justify-between gap-2 px-2 py-1 rounded hover:bg-surface-2 border border-transparent hover:border-border">
+                                                        <div className="flex flex-col">
+                                                            <span className="text-sm font-medium text-foreground">{preset.name}</span>
+                                                            {preset.isDefault && <span className="text-[11px] text-primary">По умолчанию</span>}
+                                                        </div>
+                                                        <div className="flex items-center gap-1">
+                                                            <button
+                                                                className="px-2 py-1 text-xs border border-border rounded hover:bg-surface-3"
+                                                                onClick={() => handleLoadPreset(preset.name)}
+                                                            >
+                                                                Загрузить
+                                                            </button>
+                                                            <button
+                                                                className="px-2 py-1 text-xs border border-border rounded hover:bg-surface-3"
+                                                                onClick={() => handleRenamePreset(preset.name)}
+                                                            >
+                                                                Имя
+                                                            </button>
+                                                            <button
+                                                                className={`px-2 py-1 text-xs border rounded ${preset.isDefault ? 'border-primary text-primary' : 'border-border hover:bg-surface-3'}`}
+                                                                onClick={() => handleSetDefaultPreset(preset.name)}
+                                                            >
+                                                                По умолчанию
+                                                            </button>
+                                                            <button
+                                                                className="px-2 py-1 text-xs border border-border rounded hover:bg-danger-light text-danger"
+                                                                onClick={() => handleDeletePreset(preset.name)}
+                                                            >
+                                                                Удалить
+                                                            </button>
+                                                        </div>
+                                                    </div>
+                                                ))
+                                            )}
+                                        </div>
+                                    </div>
+                                    <div className="p-2">
+                                        <button
+                                            onClick={() => {
+                                                setColumnFilters([]);
+                                                setGlobalFilter('');
+                                                setSearchValue('');
+                                                setSorting([]);
+                                                setActiveFilters({});
+                                                setViewMenuOpen(false);
+                                            }}
+                                            className="w-full text-left px-2 py-1 text-sm text-danger rounded hover:bg-danger-light"
+                                        >
+                                            Сбросить все фильтры
+                                        </button>
+                                    </div>
                                 </div>
-                                <div className="max-h-48 overflow-auto flex flex-col gap-2 px-2">
-                                    {presets.length === 0 ? (
-                                        <div className="text-xs text-foreground-muted px-1">Пока нет сохраненных видов</div>
-                                    ) : (
-                                        presets.map((preset) => (
-                                            <div key={preset.name} className="flex items-center justify-between gap-2 px-2 py-1 rounded hover:bg-surface-2 border border-transparent hover:border-border">
-                                                <div className="flex flex-col">
-                                                    <span className="text-sm font-medium text-foreground">{preset.name}</span>
-                                                    {preset.isDefault && <span className="text-[11px] text-primary">По умолчанию</span>}
-                                                </div>
-                                                <div className="flex items-center gap-1">
-                                                    <button
-                                                        className="px-2 py-1 text-xs border border-border rounded hover:bg-surface-3"
-                                                        onClick={() => handleLoadPreset(preset.name)}
-                                                    >
-                                                        Загрузить
-                                                    </button>
-                                                    <button
-                                                        className="px-2 py-1 text-xs border border-border rounded hover:bg-surface-3"
-                                                        onClick={() => handleRenamePreset(preset.name)}
-                                                    >
-                                                        Имя
-                                                    </button>
-                                                    <button
-                                                        className={`px-2 py-1 text-xs border rounded ${preset.isDefault ? 'border-primary text-primary' : 'border-border hover:bg-surface-3'}`}
-                                                        onClick={() => handleSetDefaultPreset(preset.name)}
-                                                    >
-                                                        По умолчанию
-                                                    </button>
-                                                    <button
-                                                        className="px-2 py-1 text-xs border border-border rounded hover:bg-danger-light text-danger"
-                                                        onClick={() => handleDeletePreset(preset.name)}
-                                                    >
-                                                        Удалить
-                                                    </button>
-                                                </div>
-                                            </div>
-                                        ))
-                                    )}
-                                </div>
-                            </div>
-                            <div className="p-2">
-                                <button
-                                    onClick={() => {
-                                        setColumnFilters([]);
-                                        setGlobalFilter('');
-                                        setSearchValue('');
-                                        setSorting([]);
-                                        setActiveFilters({});
-                                        setViewMenuOpen(false);
-                                    }}
-                                    className="w-full text-left px-2 py-1 text-sm text-danger rounded hover:bg-danger-light"
-                                >
-                                    Сбросить все фильтры
-                                </button>
-                            </div>
+                            )}
+                        </div>
+                    </div>
+
+                </div>
+
+                {/* Status + pagination + currency */}
+                <div className="flex flex-wrap items-center gap-3 text-sm px-3 py-2 bg-surface-2 border border-border rounded-md">
+                    <div className="flex items-center gap-2 text-foreground">
+                        {syncState?.isSyncing ? (
+                            <div className="h-2 w-2 rounded-full bg-primary animate-pulse" />
+                        ) : (
+                            <div className="h-2 w-2 rounded-full bg-success" />
+                        )}
+                        <span>
+                            {syncState?.isSyncing
+                                ? `Синхронизация… ${syncState?.progress?.downloaded ?? 0}${syncState?.progress?.total ? `/${syncState.progress.total}` : ''}`
+                                : syncState?.isOfflineReady
+                                    ? 'Данные синхронизированы'
+                                    : isLoading
+                                        ? 'Загрузка локального кеша…'
+                                        : 'Кеш отсутствует'}
+                        </span>
+                    </div>
+                    <div className="text-foreground-secondary">
+                        Последнее обновление:{' '}
+                        {syncState?.lastSyncAt ? new Date(syncState.lastSyncAt).toLocaleTimeString() : '—'}
+                    </div>
+                    <div className="flex space-x-1 bg-surface p-1 rounded-lg border border-border">
+                        {[
+                            { key: 'ALL', label: 'Все' },
+                            { key: 'UZS', label: 'UZS' },
+                            { key: 'USD', label: 'USD' },
+                        ].map((item) => (
+                            <button
+                                key={item.key}
+                                onClick={() => setActiveFilters({ ...activeFilters, currency: item.key as any })}
+                                className={`px-3 py-1.5 text-sm font-medium rounded-md transition-all focus:outline-none focus:ring-2 focus:ring-primary ${activeFilters.currency === item.key
+                                    ? 'bg-surface-2 text-foreground shadow-sm border border-border'
+                                    : 'text-foreground-secondary hover:text-foreground'
+                                    }`}
+                            >
+                                {item.label}
+                            </button>
+                        ))}
+                    </div>
+
+                    <PaginationControls className="ml-auto" />
+
+                    <button
+                        onClick={syncState?.onSync}
+                        disabled={syncState?.isSyncing}
+                        className="flex items-center gap-2 px-3 py-1.5 text-sm font-medium border rounded bg-surface hover:bg-surface-2 disabled:opacity-60"
+                    >
+                        {syncState?.isSyncing && <div className="animate-spin h-4 w-4 border-2 border-primary border-t-transparent rounded-full" />}
+                        {syncState?.isSyncing ? 'Синхронизация…' : 'Синхронизировать'}
+                    </button>
+                    {isSaving && (
+                        <div className="flex items-center gap-2 text-foreground-secondary">
+                            <div className="animate-spin h-4 w-4 border-2 border-primary border-t-transparent rounded-full"></div>
+                            <span>Сохранение…</span>
                         </div>
                     )}
                 </div>
 
-                {/* Undo/Redo Buttons */}
-                <div className="flex items-center gap-1 ml-2 border-l pl-2 border-border">
+                {/* Applied filters */}
+                {/* Applied filters hidden per request */}
+
+                {/* Selection bar */}
+                {selectedRowIds.length > 0 && (
+                    <div className="flex flex-wrap items-center gap-2 px-3 py-2 bg-surface-2 border border-border rounded-md">
+                        <div className="text-sm font-medium">Выбрано: {selectedRowIds.length}</div>
+                        <button
+                            onClick={() => handleDeleteSelected()}
+                            className="flex items-center gap-1 px-3 py-1.5 text-sm font-medium text-danger bg-surface border border-border rounded hover:bg-danger/10 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-danger"
+                        >
+                            <Trash2 className="w-4 h-4" />
+                            Удалить
+                        </button>
+                        <button
+                            onClick={() => {
+                                const rowsToUse = data.filter((r) => selectedRowIds.includes(r.id));
+                                if (!rowsToUse.length) return;
+                                exportTransactionsToExcel({
+                                    rows: rowsToUse,
+                                    columns: buildExportColumns(),
+                                    columnStyles: columnStyles as any,
+                                    cellStyles: cellStyles as any,
+                                    fileName: `transactions_selected_${new Date().toISOString().slice(0, 10)}.xlsx`,
+                                    includeAlternating: true,
+                                });
+                            }}
+                            className="flex items-center gap-1 px-3 py-1.5 text-sm font-medium text-foreground bg-surface border border-border rounded hover:bg-surface-2"
+                        >
+                            <FileText className="w-4 h-4" />
+                            Экспорт
+                        </button>
+                        <button
+                            onClick={() => setSelectedCells(new Set())}
+                            className="text-sm text-foreground-secondary hover:text-foreground"
+                        >
+                            Снять выделение
+                        </button>
+                    </div>
+                )}
+
+                {/* Undo/Redo (kept but tucked to right) */}
+                <div className="flex items-center gap-1">
                     <button
                         onClick={() => undo()}
                         disabled={!canUndo}
@@ -1556,37 +1690,7 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
                         <Redo2 className="w-4 h-4" />
                     </button>
                 </div>
-
-                {/* Delete + selection count */}
-                <div className="flex items-center gap-2 ml-2 border-l pl-2 border-border">
-                    <div className="text-xs text-foreground-secondary">
-                        Выбрано строк: {Array.from(selectedCells).reduce((acc, key) => {
-                            const rowId = Number(key.split(':')[0]);
-                            return acc.add(rowId);
-                        }, new Set<number>()).size}
-                    </div>
-                    <button
-                        onClick={() => handleDeleteSelected()}
-                        disabled={selectedCells.size === 0}
-                        className="flex items-center gap-1 px-3 py-1.5 text-sm font-medium text-danger bg-surface border border-border rounded hover:bg-danger/10 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-danger disabled:opacity-50 disabled:cursor-not-allowed"
-                        title="Удалить выбранные"
-                    >
-                        <Trash2 className="w-4 h-4" />
-                        Удалить
-                    </button>
-                </div>
-
-                {/* Saving Indicator */}
-                {isSaving && (
-                    <div className="flex items-center gap-2 ml-auto text-sm text-foreground-secondary">
-                        <div className="animate-spin h-4 w-4 border-2 border-primary border-t-transparent rounded-full"></div>
-                        <span>Сохранение...</span>
-                    </div>
-                )}
             </div>
-
-            {/* Pagination (top) */}
-            <PaginationControls className="mb-3" />
 
             <FilterDrawer
                 isOpen={filterDrawerOpen}
@@ -1740,9 +1844,6 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
                     </table>
                 </div>
             </DndContext>
-
-            {/* Pagination */}
-            <PaginationControls className="mt-4 mb-3" />
 
             {/* Details Drawer */}
             {detailRow && (

@@ -109,7 +109,15 @@ export const BurgerMenu: React.FC<BurgerMenuProps> = ({ isOpen, onClose }) => {
                             }}
                         />
                         <div className="pt-4 mt-4 border-t border-border">
-                            <MenuItem icon={<Settings size={20} />} label="Настройки" />
+                            <MenuItem
+                                icon={<Settings size={20} />}
+                                label="Настройки"
+                                isActive={location.pathname === '/settings'}
+                                onClick={() => {
+                                    navigate('/settings');
+                                    onClose();
+                                }}
+                            />
                         </div>
                     </nav>
                 </div>

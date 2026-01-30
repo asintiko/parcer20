@@ -1,8 +1,8 @@
 /**
  * Main Application Component with Routing
  */
-import { useState, useEffect } from 'react';
-import { BrowserRouter, Routes, Route, useLocation, useNavigate } from 'react-router-dom';
+import { useState, useEffect, ComponentType, ReactNode } from 'react';
+import { BrowserRouter, HashRouter, Routes, Route, useLocation, useNavigate } from 'react-router-dom';
 import { Menu, Loader2, CheckCircle2 } from 'lucide-react';
 import { BurgerMenu } from './components/BurgerMenu';
 import { TransactionsPage } from './pages/TransactionsPage';
@@ -10,6 +10,7 @@ import { ReferencePage } from './pages/ReferencePage';
 import { AutomationPage } from './pages/AutomationPage';
 import { UserbotPage } from './pages/UserbotPage';
 import { LogsPage } from './pages/LogsPage';
+import { SettingsPage } from './pages/SettingsPage';
 import { useAutomationStatus } from './hooks/useAutomationStatus';
 
 const LAST_PAGE_KEY = 'last_visited_page';
@@ -108,6 +109,7 @@ function AppContent() {
                     <Route path="/automation" element={<AutomationPage />} />
                     <Route path="/userbot" element={<UserbotPage />} />
                     <Route path="/logs" element={<LogsPage />} />
+                    <Route path="/settings" element={<SettingsPage />} />
                 </Routes>
             </div>
         </div>
@@ -115,10 +117,18 @@ function AppContent() {
 }
 
 function App() {
+    // Detect Electron to avoid file:// routing issues in packaged app
+    const isElectron =
+        typeof window !== 'undefined' &&
+        (Boolean((window as any).electronAPI?.isElectron) ||
+            navigator.userAgent.toLowerCase().includes('electron'));
+
+    const Router: ComponentType<{ children: ReactNode }> = isElectron ? HashRouter : BrowserRouter;
+
     return (
-        <BrowserRouter>
+        <Router>
             <AppContent />
-        </BrowserRouter>
+        </Router>
     );
 }
 
