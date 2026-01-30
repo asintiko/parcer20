@@ -46,7 +46,7 @@ const parseDate = (value: unknown): Date | null => {
 };
 
 /**
- * Formats a date as MM.DD.YYYY
+ * Formats a date as DD.MM.YYYY
  * 
  * @param value - Date object, date string, or timestamp
  * @returns Formatted date string or dash for invalid/missing values
@@ -63,11 +63,11 @@ export const formatDate = (value: unknown): string => {
         return EMPTY_VALUE;
     }
 
-    const month = padZero(date.getMonth() + 1);
     const day = padZero(date.getDate());
+    const month = padZero(date.getMonth() + 1);
     const year = date.getFullYear();
 
-    return `${month}.${day}.${year}`;
+    return `${day}.${month}.${year}`;
 };
 
 /**
@@ -143,4 +143,3 @@ export const formatDateTimeValue = (
  * Empty value constant for consistent display of missing values
  */
 export { EMPTY_VALUE };
-

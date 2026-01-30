@@ -1,9 +1,9 @@
 {
-    "name": "uzbek-receipt-parser",
-    "version": "1.0.0",
-    "description": "Uzbek Receipt Parser Desktop Application",
+    "name": "tbsparcer",
+    "version": "1.1.0",
+    "description": "TBSparcer Desktop Application",
     "main": "electron/main.cjs",
-    "author": "Uzbek Parser Team",
+    "author": "TBSparcer Team",
     "type": "module",
     "scripts": {
         "dev": "vite",
@@ -16,8 +16,8 @@
         "electron:build:linux": "npm run build && electron-builder --linux"
     },
     "build": {
-        "appId": "com.uzbekparser.receipt",
-        "productName": "Uzbek Receipt Parser",
+        "appId": "com.tbsparcer.app",
+        "productName": "TBSparcer",
         "directories": {
             "output": "release"
         },
@@ -34,6 +34,7 @@
             }
         ],
         "win": {
+            "requestedExecutionLevel": "requireAdministrator",
             "target": [
                 {
                     "target": "nsis",
@@ -46,7 +47,9 @@
         "nsis": {
             "oneClick": false,
             "perMachine": true,
-            "allowToChangeInstallationDirectory": true
+            "allowToChangeInstallationDirectory": true,
+            "allowElevation": true,
+            "include": "build/installer.nsh"
         },
         "mac": {
             "target": "dmg"

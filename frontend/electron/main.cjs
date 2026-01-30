@@ -16,7 +16,7 @@ function createWindow() {
             preload: path.join(__dirname, 'preload.cjs'),
         },
         icon: path.join(__dirname, 'build/icon.png'),
-        title: 'Uzbek Receipt Parser',
+        title: 'TBSparcer',
         show: false,
     });
 
@@ -84,8 +84,9 @@ function setupAutoUpdates() {
         await autoUpdater.downloadUpdate();
         return true;
     });
-    ipcMain.handle('updates:install', () => {
-        autoUpdater.quitAndInstall();
+    ipcMain.handle('updates:install', (_event, opts = {}) => {
+        const { isSilent = false, isForceRunAfter = false } = opts;
+        autoUpdater.quitAndInstall(isSilent, isForceRunAfter);
         return true;
     });
 

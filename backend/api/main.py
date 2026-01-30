@@ -81,11 +81,14 @@ app.add_middleware(ErrorHandlingMiddleware)
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
 CORS_ORIGINS = os.getenv("CORS_ORIGINS", "").split(",") if os.getenv("CORS_ORIGINS") else []
 
-# Default allowed origins (localhost only for development)
+# Default allowed origins — расширяем для dev/desktop, чтобы избежать ошибок preflight
 allowed_origins = [
     FRONTEND_URL,
     "http://localhost:5173",
     "http://127.0.0.1:5173",
+    "http://localhost:3000",
+    "file://",  # electron
+    "*",        # допуск всех при необходимости
 ]
 
 # Add any additional origins from environment
@@ -96,8 +99,8 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,
     allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allow_headers=["Authorization", "Content-Type", "Accept"],
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
@@ -172,4 +175,3 @@ app.include_router(logs.router, prefix="/api/logs", tags=["Logs"])
 app.include_router(automation.router, tags=["Automation"])
 app.include_router(userbot.router, tags=["Userbot"])
 app.include_router(telegram_client.router, tags=["Telegram"])
-

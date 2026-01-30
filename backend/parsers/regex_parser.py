@@ -19,7 +19,7 @@ class RegexParser:
         self.patterns = {
             'humo_notification': {
                 'amount': r'[➖➕💸]\s*([\d\s\.,]+)\s*(UZS|USD)',
-                'transaction_type': r'(Оплата|Пополнение|Операция|Конверсия)',
+                'transaction_type': r'(Оплата|Пополнение|Операция|Конверсия|Счет по карте изменен.*|Счёт по карте изменён.*|Снятие наличных)',
                 'card': r'(?:HUMO-?CARD|HUMOCARD|💳)\s*([\d\*]{6,})',
                 'operator': r'📍\s*(.+)',
                 'datetime': r'[🕓🕘]\s*(?:(\d{2}:\d{2})\s+(\d{2}\.\d{2}\.\d{2,4})|(\d{2}\.\d{2}\.\d{2,4})\s+(\d{2}:\d{2}))',
@@ -252,15 +252,25 @@ class RegexParser:
         amount_currency = amount_match.group(2) if amount_match.lastindex and amount_match.lastindex >= 2 else None
         
         # Extract transaction type
-        type_match = re.search(patterns['transaction_type'], text)
+        type_match = re.search(patterns['transaction_type'], text, re.IGNORECASE)
         type_map = {
-            'Оплата': 'DEBIT',
-            'Пополнение': 'CREDIT',
-            'Операция': 'DEBIT',
-            'Конверсия': 'CONVERSION'
+            'оплата': 'DEBIT',
+            'пополнение': 'CREDIT',
+            'операция': 'DEBIT',
+            'конверсия': 'CONVERSION',
+            'счет по карте изменен': 'DEBIT',
+            'счёт по карте изменён': 'DEBIT',
+            'снятие наличных': 'DEBIT',
         }
         if type_match:
-            transaction_type = type_map.get(type_match.group(1), 'DEBIT')
+            matched_raw = type_match.group(1).strip().lower()
+            transaction_type = None
+            for key, val in type_map.items():
+                if matched_raw.startswith(key):
+                    transaction_type = val
+                    break
+            if transaction_type is None:
+                transaction_type = 'DEBIT'
         else:
             upper_text = text.upper()
             if "OTMENA" in upper_text:
@@ -276,6 +286,20 @@ class RegexParser:
         # Extract operator
         operator_match = re.search(patterns['operator'], text)
         operator_raw = operator_match.group(1).strip() if operator_match else None
+        # Fallback: если оператор не найден, но видно карту — ставим понятный ярлык
+        upper_text = text.upper()
+        if not operator_raw:
+            if 'HUMO' in upper_text:
+                operator_raw = 'HUMOCARD'
+            elif 'UZCARD' in upper_text:
+                operator_raw = 'UZCARD'
+            elif 'ИЗМЕНЕН' in upper_text or 'ИЗМЕНЁН' in upper_text:
+                operator_raw = 'BALANCE CHANGE'
+        # Специальный случай: изменение счёта по карте — гарантируем понятные тип и оператор
+        if 'СЧЕТ ПО КАРТЕ ИЗМЕН' in upper_text or 'СЧЁТ ПО КАРТЕ ИЗМЕН' in upper_text:
+            transaction_type = 'DEBIT'
+            if not operator_raw or operator_raw.upper() not in ['HUMOCARD', 'UZCARD', 'BALANCE CHANGE']:
+                operator_raw = 'BALANCE CHANGE'
         
         # Extract datetime
         datetime_match = re.search(patterns['datetime'], text)

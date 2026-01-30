@@ -1,5 +1,6 @@
 import ExcelJS from 'exceljs';
 import { Transaction } from './api';
+import { formatDate, formatTime, formatDateTime } from '../utils/dateTimeFormatters';
 
 type Alignment = 'left' | 'center' | 'right';
 
@@ -54,9 +55,9 @@ const formatExcelValue = (row: Transaction, columnId: string, rowIndex: number) 
     if (columnId === 'row_number') {
         return rowIndex + 1;
     }
-    if (columnId === 'date_time') return txDate || '';
-    if (columnId === 'transaction_date') return txDate || '';
-    if (columnId === 'time') return txDate || '';
+    if (columnId === 'date_time') return txDate ? formatDateTime(txDate) : '';
+    if (columnId === 'transaction_date') return txDate ? formatDate(txDate) : '';
+    if (columnId === 'time') return txDate ? formatTime(txDate) : '';
     if (columnId === 'day') {
         const days = ['вс', 'пн', 'вт', 'ср', 'чт', 'пт', 'сб'];
         return txDate ? days[txDate.getDay()] : '';
@@ -174,6 +175,37 @@ export const exportTransactionsToExcel = async (options: ExportOptions) => {
 
             if (colStyle.fontWeight === 'bold' || cellStyle.fontWeight === 'bold') {
                 excelCell.font = { ...(excelCell.font || {}), bold: true };
+            }
+        });
+    });
+
+    // Auto-fit column widths by content length (header + cells)
+    sheet.columns.forEach((col, idx) => {
+        const values = sheet.getColumn(idx + 1).values
+            .map(v => (v === null || v === undefined) ? '' : String(v));
+        const headerLength = String(col.header ?? '').length;
+        // Cyrillic и цифры считаем одинаково, небольшое увеличение коэффициентом
+        const maxLen = values.reduce((max, val) => Math.max(max, val.length), headerLength);
+        const fitted = Math.max(col.width ?? 10, Math.min(Math.round(maxLen * 1.2) + 2, 80));
+        col.width = fitted;
+    });
+
+    // Strict horizontal alignment per column position (1-based):
+    // 1-center 2-center 3-center 4-center 5-center 6-left 7-center 8-center
+    // 9-center 10-right 11-right 12-center 13-center 14-left 15-center 16-center
+    const alignmentMap: Record<number, Alignment> = {
+        1: 'center', 2: 'center', 3: 'center', 4: 'center', 5: 'center',
+        6: 'left', 7: 'center', 8: 'center', 9: 'center',
+        10: 'right', 11: 'right',
+        12: 'center', 13: 'center',
+        14: 'left',
+        15: 'center', 16: 'center',
+    };
+    sheet.eachRow((row) => {
+        row.eachCell({ includeEmpty: true }, (cell, colNumber) => {
+            const desired = alignmentMap[colNumber];
+            if (desired) {
+                cell.alignment = { ...(cell.alignment || {}), horizontal: desired };
             }
         });
     });

@@ -1132,7 +1132,13 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
             .map(row => row.map(v => String(v ?? '')).join('\t'))
             .join('\n');
 
-        navigator.clipboard.writeText(tsv).then(
+        const clip = (navigator as any)?.clipboard;
+        if (!clip || typeof clip.writeText !== 'function') {
+            showToast('error', 'Буфер обмена недоступен в этом окружении');
+            return;
+        }
+
+        clip.writeText(tsv).then(
             () => showToast('success', 'Скопировано в буфер обмена'),
             () => showToast('error', 'Не удалось скопировать')
         );
@@ -1142,8 +1148,14 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
         if (selectedCells.size === 0) return;
 
         try {
-            const text = await navigator.clipboard.readText();
-            const rows = text.split('\n').map(row => row.split('\t'));
+            const clip = (navigator as any)?.clipboard;
+            if (!clip || typeof clip.readText !== 'function') {
+                showToast('error', 'Чтение буфера обмена недоступно');
+                return;
+            }
+
+            const text = await clip.readText();
+            const rows = text.split('\n').map((row: string) => row.split('\t'));
 
             // Find anchor cell (first selected)
             const firstCell = Array.from(selectedCells)[0];

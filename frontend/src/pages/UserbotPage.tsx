@@ -75,6 +75,12 @@ const formatDateTime = (date?: string | null) => {
     });
 };
 
+const MAX_MESSAGE_ITEMS = 300;
+const RECEIPT_STATUS_CHUNK = 50;
+const STATUS_COOLDOWN_MS = 60_000;
+const SERVER_MESSAGE_LIMIT = 200; // backend enforces le=200
+const MUTATION_COOLDOWN_MS = 500; // throttle hide/unhide bursts
+
 export const UserbotPage: React.FC = () => {
     const { showToast } = useToast();
     const queryClient = useQueryClient();
@@ -92,7 +98,8 @@ export const UserbotPage: React.FC = () => {
     const [selectedMessageIds, setSelectedMessageIds] = useState<Set<number>>(new Set());
     const [statuses, setStatuses] = useState<Record<number, TelegramProcessResult>>({});
     // Deprecated local polling toggle; server monitor toggle is used now.
-    const [liveRefresh] = useState(true);
+    // Keep local polling off by default to avoid hammering the API.
+    const [liveRefresh] = useState(false);
     const [previewUrl, setPreviewUrl] = useState<string | null>(null);
     const [processingId, setProcessingId] = useState<number | null>(null);
     const [batchProcessing, setBatchProcessing] = useState(false);
@@ -125,7 +132,13 @@ export const UserbotPage: React.FC = () => {
     const { data: authStatus, isLoading: authLoading, refetch: refetchStatus } = useQuery<TelegramAuthStatus>({
         queryKey: ['tg-status'],
         queryFn: telegramClientApi.getStatus,
-        refetchInterval: (query) => (query.state.data?.state === 'ready' ? 30000 : 5000),
+        refetchInterval: (query) => {
+            if (query.state.error) return false; // при 429 или другой ошибке не долбим сервер
+            return query.state.data?.state === 'ready' ? 60000 : 15000;
+        },
+        staleTime: 15000,
+        retry: false,
+        refetchOnWindowFocus: false,
     });
 
     const chatsQuery = useQuery({
@@ -143,16 +156,21 @@ export const UserbotPage: React.FC = () => {
 
     const messagesQuery = useQuery({
         queryKey: ['tg-messages', selectedChatId],
-        queryFn: () => telegramClientApi.getMessages(selectedChatId!, { all: true }),
+        queryFn: () =>
+            telegramClientApi.getMessages(selectedChatId!, {
+                limit: Math.min(MAX_MESSAGE_ITEMS, SERVER_MESSAGE_LIMIT),
+            }),
         enabled: !!selectedChatId && authStatus?.state === 'ready',
-        refetchInterval: liveRefresh ? 5000 : false,
+        refetchInterval: liveRefresh ? 15000 : false,
     });
 
     const monitorStatusQuery = useQuery<TelegramMonitorStatus>({
         queryKey: ['tg-monitor-status'],
         queryFn: telegramClientApi.getMonitorStatus,
         enabled: authStatus?.state === 'ready',
-        refetchInterval: (query) => (query.state.data?.running ? 7000 : 12000),
+        refetchInterval: (query) => (query.state.data?.running ? 15000 : 30000),
+        refetchOnWindowFocus: false,
+        retry: false,
     });
 
     const monitorToggleMutation = useMutation({
@@ -193,7 +211,8 @@ export const UserbotPage: React.FC = () => {
                 const bTime = b?.date ? new Date(b.date).getTime() : 0;
                 return aTime - bTime;
             });
-            setMessagesState(sorted);
+            const limited = sorted.slice(-MAX_MESSAGE_ITEMS);
+            setMessagesState(limited);
         }
     }, [messagesQuery.data]);
 
@@ -216,7 +235,7 @@ export const UserbotPage: React.FC = () => {
                 .filter((id): id is number => typeof id === 'number');
             if (!ids.length) return;
             try {
-                const chunks = chunkArray(ids, 200);
+                const chunks = chunkArray(ids, RECEIPT_STATUS_CHUNK);
                 const results = await Promise.all(
                     chunks.map((chunk) => telegramClientApi.getReceiptStatus(selectedChatId, chunk))
                 );
@@ -229,10 +248,17 @@ export const UserbotPage: React.FC = () => {
                 setStatuses(merged);
             } catch (err) {
                 console.error('Failed to fetch receipt status', err);
+                const status = (err as any)?.response?.status;
+                if (status === 429) {
+                    showToast(
+                        'error',
+                        'Слишком частые запросы к статусам чеков — автообновление остановлено на минуту'
+                    );
+                }
             }
         };
         void loadStatuses();
-    }, [messagesState, selectedChatId]);
+    }, [messagesState, selectedChatId, showToast]);
 
     // Live refresh statuses when enabled
     useEffect(() => {
@@ -242,13 +268,16 @@ export const UserbotPage: React.FC = () => {
             for (let i = 0; i < arr.length; i += size) res.push(arr.slice(i, i + size));
             return res;
         };
+        let cooldownUntil = 0;
         const interval = setInterval(async () => {
+            const now = Date.now();
+            if (now < cooldownUntil) return;
             const ids = messagesState
                 .map((m) => m.id)
                 .filter((id): id is number => typeof id === 'number');
             if (!ids.length) return;
             try {
-                const chunks = chunkArray(ids, 200);
+                const chunks = chunkArray(ids, RECEIPT_STATUS_CHUNK);
                 const results = await Promise.all(
                     chunks.map((chunk) => telegramClientApi.getReceiptStatus(selectedChatId, chunk))
                 );
@@ -263,10 +292,15 @@ export const UserbotPage: React.FC = () => {
                 });
             } catch (err) {
                 console.error('Failed to refresh receipt status', err);
+                const status = (err as any)?.response?.status;
+                if (status === 429) {
+                    cooldownUntil = now + STATUS_COOLDOWN_MS;
+                    showToast('error', '429 от сервера: автообновление пауза 60 сек');
+                }
             }
-        }, 5000);
+        }, 15000);
         return () => clearInterval(interval);
-    }, [liveRefresh, selectedChatId, messagesState]);
+    }, [liveRefresh, selectedChatId, messagesState, showToast]);
 
     // Auto-scroll to bottom when messages change (newest at bottom)
     useEffect(() => {
@@ -413,7 +447,10 @@ export const UserbotPage: React.FC = () => {
             const allIds = (chatsQuery.data?.items || []).map((c) => c.chat_id);
             const toHide = allIds.filter((id) => !keepIds.includes(id));
             if (!toHide.length) return;
-            await Promise.all(toHide.map((id) => telegramClientApi.hideChat(id)));
+            for (const id of toHide) {
+                await telegramClientApi.hideChat(id);
+                await new Promise((r) => setTimeout(r, MUTATION_COOLDOWN_MS));
+            }
         },
         onSuccess: async () => {
             setKeepSelection(new Set());
@@ -427,14 +464,18 @@ export const UserbotPage: React.FC = () => {
         mutationFn: (chatId: number) => telegramClientApi.hideChat(chatId),
         onSuccess: async () => {
             await queryClient.invalidateQueries({ queryKey: ['tg-chats'] });
+            showToast('success', 'Чат скрыт');
         },
+        onError: () => showToast('error', 'Не удалось скрыть чат'),
     });
 
     const unhideChatMutation = useMutation({
         mutationFn: (chatId: number) => telegramClientApi.unhideChat(chatId),
         onSuccess: async () => {
             await queryClient.invalidateQueries({ queryKey: ['tg-chats'] });
+            showToast('success', 'Чат показан');
         },
+        onError: () => showToast('error', 'Не удалось показать чат'),
     });
 
     const sendMessageMutation = useMutation({
@@ -948,7 +989,8 @@ export const UserbotPage: React.FC = () => {
                                                                     e.stopPropagation();
                                                                     hideChatMutation.mutate(chat.chat_id);
                                                                 }}
-                                                                className="text-xs px-2 py-1 rounded-md border border-border text-foreground-secondary hover:bg-surface-2"
+                                                                disabled={hideChatMutation.isPending || unhideChatMutation.isPending}
+                                                                className="text-xs px-2 py-1 rounded-md border border-border text-foreground-secondary hover:bg-surface-2 disabled:opacity-60"
                                                             >
                                                                 Скрыть
                                                             </button>
@@ -958,7 +1000,8 @@ export const UserbotPage: React.FC = () => {
                                                                     e.stopPropagation();
                                                                     unhideChatMutation.mutate(chat.chat_id);
                                                                 }}
-                                                                className="text-xs px-2 py-1 rounded-md border border-primary text-primary hover:bg-primary-light/40"
+                                                                disabled={unhideChatMutation.isPending || hideChatMutation.isPending}
+                                                                className="text-xs px-2 py-1 rounded-md border border-primary text-primary hover:bg-primary-light/40 disabled:opacity-60"
                                                             >
                                                                 Показать
                                                             </button>
@@ -994,22 +1037,23 @@ export const UserbotPage: React.FC = () => {
                                         </div>
                                     </div>
                                     {currentChat && (
-                                        <div className="flex items-center gap-2 flex-wrap justify-end">
-                                            <button
-                                                onClick={() => {
-                                                    if (!currentChat) return;
+                                                <div className="flex items-center gap-2 flex-wrap justify-end">
+                                                    <button
+                                                        onClick={() => {
+                                                            if (!currentChat) return;
                                                     const enable = !currentChat.monitor_enabled;
                                                     monitorToggleMutation.mutate({ chatId: currentChat.chat_id, enabled: enable });
-                                                }}
-                                                className={`flex items-center gap-2 px-3 py-2 rounded-md text-xs border ${currentChat?.monitor_enabled
-                                                    ? 'border-success text-success bg-success/10'
-                                                    : 'border-border text-foreground-secondary hover:bg-surface-2'
-                                                    }`}
-                                            >
-                                                {currentChat?.monitor_enabled ? <Pause className="w-4 h-4" /> : <Play className="w-4 h-4" />}
-                                                {currentChat?.monitor_enabled ? 'Серверный монитор вкл' : 'Включить монитор'}
-                                            </button>
-                                            <button
+                                                        }}
+                                                        className={`flex items-center gap-2 px-3 py-2 rounded-md text-xs border ${currentChat?.monitor_enabled
+                                                            ? 'border-success text-success bg-success/10'
+                                                            : 'border-border text-foreground-secondary hover:bg-surface-2'
+                                                            }`}
+                                                        disabled={monitorToggleMutation.isPending}
+                                                    >
+                                                        {currentChat?.monitor_enabled ? <Pause className="w-4 h-4" /> : <Play className="w-4 h-4" />}
+                                                        {currentChat?.monitor_enabled ? 'Серверный монитор вкл' : 'Включить монитор'}
+                                                    </button>
+                                                    <button
                                                 onClick={() => messagesQuery.refetch()}
                                                 disabled={messagesQuery.isFetching}
                                                 className="flex items-center gap-1 px-3 py-2 rounded-md border border-border text-foreground-secondary text-xs hover:bg-surface-2 disabled:opacity-60"
@@ -1017,23 +1061,25 @@ export const UserbotPage: React.FC = () => {
                                                 <RefreshCcw className={`w-4 h-4 ${messagesQuery.isFetching ? 'animate-spin' : ''}`} />
                                                 Обновить чат
                                             </button>
-                                            {currentChat.is_hidden ? (
-                                                <button
-                                                    onClick={() => unhideChatMutation.mutate(currentChat.chat_id)}
-                                                    className="flex items-center gap-1 px-3 py-2 rounded-md border border-primary text-primary text-xs hover:bg-primary-light/30"
-                                                >
-                                                    <Eye className="w-4 h-4" />
-                                                    Показать
-                                                </button>
-                                            ) : (
-                                                <button
-                                                    onClick={() => hideChatMutation.mutate(currentChat.chat_id)}
-                                                    className="flex items-center gap-1 px-3 py-2 rounded-md border border-border text-foreground-secondary text-xs hover:bg-surface-2"
-                                                >
-                                                    <EyeOff className="w-4 h-4" />
-                                                    Скрыть
-                                                </button>
-                                            )}
+                                                    {currentChat.is_hidden ? (
+                                                        <button
+                                                            onClick={() => unhideChatMutation.mutate(currentChat.chat_id)}
+                                                            disabled={unhideChatMutation.isPending || hideChatMutation.isPending}
+                                                            className="flex items-center gap-1 px-3 py-2 rounded-md border border-primary text-primary text-xs hover:bg-primary-light/30 disabled:opacity-60"
+                                                        >
+                                                            <Eye className="w-4 h-4" />
+                                                            Показать
+                                                        </button>
+                                                    ) : (
+                                                        <button
+                                                            onClick={() => hideChatMutation.mutate(currentChat.chat_id)}
+                                                            disabled={hideChatMutation.isPending || unhideChatMutation.isPending}
+                                                            className="flex items-center gap-1 px-3 py-2 rounded-md border border-border text-foreground-secondary text-xs hover:bg-surface-2 disabled:opacity-60"
+                                                        >
+                                                            <EyeOff className="w-4 h-4" />
+                                                            Скрыть
+                                                        </button>
+                                                    )}
                                         </div>
                                     )}
                                 </div>

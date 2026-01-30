@@ -112,8 +112,23 @@ def test_balance_changed_notification(parser):
 🕘 17:46 04.04.2025"""
     res = parser.parse(text)
     assert res
+    assert res["transaction_type"] == "DEBIT"
     assert res["amount"] == Decimal("6935000.00")
 
+
+def test_cash_withdrawal(parser):
+    text = """🏧 Снятие наличных
+➖ 505.000,00 UZS
+📍 URTACHIRCHIK AT HALK
+💳 HUMOCARD *4428
+🕓 12:10 31.12.2025
+💰 4.914,00 UZS"""
+    res = parser.parse(text)
+    assert res
+    assert res["transaction_type"] == "DEBIT"
+    assert res["operator_raw"] == "URTACHIRCHIK AT HALK"
+    assert res["card_last_4"] == "4428"
+    assert res["amount"] == Decimal("505000.00")
 
 def test_card_mask_middle(parser):
     text = """💸 Конверсия

@@ -84,7 +84,7 @@ export function useUpdater() {
 
     const install = useCallback(() => {
         if (!isElectron) return;
-        (window as any).electronAPI.updates.install();
+        (window as any).electronAPI.updates.install({ isSilent: false, isForceRunAfter: false });
     }, [isElectron]);
 
     return {

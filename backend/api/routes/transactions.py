@@ -141,8 +141,7 @@ def compute_weekday_label(dt: datetime) -> str:
 
 
 def compute_date_display(dt: datetime) -> str:
-    months = ['янв', 'фев', 'мар', 'апр', 'май', 'июн', 'июл', 'авг', 'сен', 'окт', 'ноя', 'дек']
-    return f"{dt.day} {months[dt.month - 1]}"
+    return dt.strftime("%d.%m.%Y")
 
 
 def compute_time_display(dt: datetime) -> str:
@@ -153,7 +152,15 @@ def get_source_display(channel: str) -> str:
     return SOURCE_DISPLAY_MAP.get(channel, SOURCE_DISPLAY_MAP["SMS"])
 
 
-def get_transaction_type_display(tx_type: str) -> str:
+def get_transaction_type_display(tx_type: str, raw_message: Optional[str] = None) -> str:
+    """
+    Возвращает человеко-читаемый текст типа транзакции.
+    Для уведомлений «Счет по карте изменен» хотим видеть «Изменение счета»,
+    но при этом сохраняем canonical tx_type=DEBIT (ограничение схемы).
+    """
+    upper = (raw_message or "").upper()
+    if "СЧЕТ ПО КАРТЕ ИЗМЕН" in upper or "СЧЁТ ПО КАРТЕ ИЗМЕН" in upper:
+        return "Изменение счета"
     return TRANSACTION_TYPE_DISPLAY_MAP.get(tx_type, TRANSACTION_TYPE_DISPLAY_MAP["DEBIT"])
 
 router = APIRouter()
@@ -273,6 +280,8 @@ def build_transaction_response(c: Transaction) -> TransactionResponse:
         raw_message
     )
 
+    display = get_transaction_type_display(canonical_type, raw_message)
+
     return TransactionResponse(
         id=c.id,
         transaction_date=tx_date,
@@ -282,7 +291,7 @@ def build_transaction_response(c: Transaction) -> TransactionResponse:
         operator_raw=operator_raw,
         application_mapped=app_mapped,
         transaction_type=canonical_type,
-        transaction_type_display=get_transaction_type_display(canonical_type),
+        transaction_type_display=display,
         balance_after=normalize_optional_amount_for_response(balance_val),
         receiver_name=getattr(c, "receiver_name", None),
         receiver_card=getattr(c, "receiver_card", None),

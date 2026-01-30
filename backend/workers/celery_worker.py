@@ -55,8 +55,7 @@ def compute_weekday_label(dt: datetime) -> str:
 
 
 def compute_date_display(dt: datetime) -> str:
-    months = ['янв', 'фев', 'мар', 'апр', 'май', 'июн', 'июл', 'авг', 'сен', 'окт', 'ноя', 'дек']
-    return f"{dt.day} {months[dt.month - 1]}"
+    return dt.strftime("%d.%m.%Y")
 
 
 def compute_time_display(dt: datetime) -> str:
