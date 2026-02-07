@@ -53,6 +53,7 @@ yarn-error.log*
 # Frontend Build
 frontend/dist/
 frontend/build/
+frontend/release/
 
 # Database
 *.db
