@@ -15,10 +15,50 @@ type StyleMap = Record<string, { backgroundColor?: string; textAlign?: Alignment
 
 const HEADER_FILL = 'FFE5E7EB'; // gray-200
 const BORDER_SIDE = { style: 'thin', color: { argb: 'FFCBD5E1' } } as const; // slate-300
+const DATA_FONT_SIZE = 10;
+const HEADER_FONT_SIZE = 10;
 
-const pxToExcelWidth = (px?: number) => {
-    if (!px) return 14;
-    return Math.max(12, Math.round(px / 7));
+/** Alignment mapping by column ID (not position — safe with reorder/hide) */
+const COLUMN_ALIGNMENT: Record<string, Alignment> = {
+    row_number: 'center',
+    date_time: 'center',
+    transaction_date: 'center',
+    time: 'center',
+    day: 'center',
+    operator_raw: 'left',
+    application_mapped: 'center',
+    receiver_name: 'left',
+    receiver_card: 'center',
+    amount: 'right',
+    balance_after: 'right',
+    card_last_4: 'center',
+    is_p2p: 'center',
+    transaction_type: 'center',
+    currency: 'center',
+    source_type: 'center',
+    parsing_method: 'center',
+    parsing_confidence: 'center',
+};
+
+/** Calculate display width of a string (cyrillic chars are ~1.2x wider) */
+const calcTextWidth = (text: string): number => {
+    let width = 0;
+    for (let i = 0; i < text.length; i++) {
+        const code = text.charCodeAt(i);
+        // Cyrillic range: U+0400–U+04FF
+        if (code >= 0x0400 && code <= 0x04FF) {
+            width += 1.2;
+        } else if (code >= 0x30 && code <= 0x39) {
+            // Digits 0-9
+            width += 0.9;
+        } else if (code === 0x20) {
+            // Space
+            width += 0.6;
+        } else {
+            width += 1.0;
+        }
+    }
+    return width;
 };
 
 const colorToARGB = (color?: string) => {
@@ -41,11 +81,6 @@ const colorToARGB = (color?: string) => {
         return `${toHex(a)}${toHex(r)}${toHex(g)}${toHex(b)}`;
     }
     return undefined;
-};
-
-const getAlignment = (align?: Alignment) => {
-    if (!align) return undefined;
-    return { horizontal: align as any };
 };
 
 const formatExcelValue = (row: Transaction, columnId: string, rowIndex: number) => {
@@ -119,14 +154,15 @@ export const exportTransactionsToExcel = async (options: ExportOptions) => {
     const { rows, columns, columnStyles = {}, cellStyles = {}, fileName = 'transactions.xlsx', includeAlternating = false } = options;
     const workbook = new ExcelJS.Workbook();
     const sheet = workbook.addWorksheet('Транзакции', {
-        properties: { defaultRowHeight: 18 },
+        properties: { defaultRowHeight: 15 },
         pageSetup: { fitToPage: true },
     });
 
+    // Initial columns — width will be auto-fitted later
     sheet.columns = columns.map(col => ({
         header: col.header,
         key: col.id,
-        width: pxToExcelWidth(col.widthPx),
+        width: 10, // placeholder, auto-fit below
     }));
 
     // Freeze header row and enable autofilter
@@ -136,80 +172,87 @@ export const exportTransactionsToExcel = async (options: ExportOptions) => {
         to: { row: 1, column: columns.length },
     };
 
+    // --- Header row ---
     const headerRow = sheet.getRow(1);
-    headerRow.font = { bold: true, color: { argb: 'FF0F172A' } };
+    headerRow.font = { bold: true, size: HEADER_FONT_SIZE, color: { argb: 'FF0F172A' } };
     headerRow.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: HEADER_FILL } };
-    headerRow.alignment = { vertical: 'middle' };
-    headerRow.height = 22;
-    headerRow.eachCell((cell) => {
+    headerRow.alignment = { vertical: 'middle', wrapText: false };
+    headerRow.height = 18;
+    headerRow.eachCell((cell, colNumber) => {
         cell.border = { top: BORDER_SIDE, left: BORDER_SIDE, bottom: BORDER_SIDE, right: BORDER_SIDE } as ExcelJS.Borders;
+        const colId = columns[colNumber - 1]?.id;
+        const desired = colId ? COLUMN_ALIGNMENT[colId] : undefined;
+        cell.alignment = { vertical: 'middle', horizontal: desired || 'center', wrapText: false };
     });
 
+    // --- Data rows ---
     rows.forEach((row, rowIdx) => {
         const excelRow = sheet.addRow(
             columns.map(col => formatExcelValue(row, col.id, rowIdx))
         );
+        excelRow.height = 15;
         const isEven = rowIdx % 2 === 1;
+
         columns.forEach((col, colIdx) => {
             const excelCell = excelRow.getCell(colIdx + 1);
             const colStyle = columnStyles[col.id] || {};
             const cellKey = `${row.id}:${col.id}`;
             const cellStyle = cellStyles[cellKey] || {};
 
+            // Font
+            const isBold = colStyle.fontWeight === 'bold' || cellStyle.fontWeight === 'bold';
+            excelCell.font = { size: DATA_FONT_SIZE, ...(isBold ? { bold: true } : {}) };
+
+            // Background
             const bg = colorToARGB(cellStyle.backgroundColor || colStyle.backgroundColor);
             if (bg) {
                 excelCell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: bg } };
             } else if (includeAlternating && isEven) {
-                excelCell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFF8FAFC' } }; // slate-50
+                excelCell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFF8FAFC' } };
             }
 
-            const alignment = getAlignment(cellStyle.textAlign || colStyle.textAlign) || { horizontal: 'left' as const };
-            excelCell.alignment = alignment;
+            // Alignment — by column ID, single-line
+            const desired = COLUMN_ALIGNMENT[col.id] || 'left';
+            excelCell.alignment = { horizontal: desired, vertical: 'middle', wrapText: false };
 
+            // Number format
             const numFmt = getNumberFormat(col.id);
             if (numFmt) {
                 excelCell.numFmt = numFmt;
             }
 
+            // Border
             excelCell.border = { top: BORDER_SIDE, left: BORDER_SIDE, bottom: BORDER_SIDE, right: BORDER_SIDE } as ExcelJS.Borders;
-
-            if (colStyle.fontWeight === 'bold' || cellStyle.fontWeight === 'bold') {
-                excelCell.font = { ...(excelCell.font || {}), bold: true };
-            }
         });
     });
 
-    // Auto-fit column widths by content length (header + cells)
+    // --- Auto-fit column widths by actual content ---
     sheet.columns.forEach((col, idx) => {
-        const values = sheet.getColumn(idx + 1).values
-            .map(v => (v === null || v === undefined) ? '' : String(v));
-        const headerLength = String(col.header ?? '').length;
-        // Cyrillic и цифры считаем одинаково, небольшое увеличение коэффициентом
-        const maxLen = values.reduce((max, val) => Math.max(max, val.length), headerLength);
-        const fitted = Math.max(col.width ?? 10, Math.min(Math.round(maxLen * 1.2) + 2, 80));
-        col.width = fitted;
-    });
+        const colId = columns[idx]?.id;
+        const headerText = String(col.header ?? '');
+        let maxWidth = calcTextWidth(headerText);
 
-    // Strict horizontal alignment per column position (1-based):
-    // 1-center 2-center 3-center 4-center 5-center 6-left 7-center 8-center
-    // 9-center 10-right 11-right 12-center 13-center 14-left 15-center 16-center
-    const alignmentMap: Record<number, Alignment> = {
-        1: 'center', 2: 'center', 3: 'center', 4: 'center', 5: 'center',
-        6: 'left', 7: 'center', 8: 'center', 9: 'center',
-        10: 'right', 11: 'right',
-        12: 'center', 13: 'center',
-        14: 'left',
-        15: 'center', 16: 'center',
-    };
-    sheet.eachRow((row) => {
-        row.eachCell({ includeEmpty: true }, (cell, colNumber) => {
-            const desired = alignmentMap[colNumber];
-            if (desired) {
-                cell.alignment = { ...(cell.alignment || {}), horizontal: desired };
-            }
+        // Scan all data values in this column
+        const excelCol = sheet.getColumn(idx + 1);
+        excelCol.eachCell({ includeEmpty: false }, (cell, rowNumber) => {
+            if (rowNumber === 1) return; // skip header, already counted
+            const val = cell.value;
+            const text = val === null || val === undefined ? '' : String(val);
+            const w = calcTextWidth(text);
+            if (w > maxWidth) maxWidth = w;
         });
+
+        // For numbers with format (#,##0.00), account for thousand separators
+        if (colId === 'amount' || colId === 'balance_after') {
+            maxWidth = Math.max(maxWidth, 12); // minimum for formatted numbers
+        }
+
+        // Add padding and clamp
+        const fitted = Math.min(Math.ceil(maxWidth) + 3, 50);
+        col.width = Math.max(fitted, 4);
     });
 
+    // --- Write & download ---
     const buffer = await workbook.xlsx.writeBuffer();
     const blob = new Blob([buffer], {
         type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
