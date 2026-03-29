@@ -2,7 +2,7 @@
 API Routes for Userbot Management
 Manages Telegram userbot configuration and connection
 """
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel, Field
 from typing import List, Optional
 import os
@@ -10,7 +10,13 @@ from dotenv import load_dotenv, set_key, find_dotenv
 
 load_dotenv()
 
-router = APIRouter(prefix="/api/userbot", tags=["userbot"])
+from api.dependencies import require_sources_scope, require_tab_access
+
+router = APIRouter(
+    prefix="/api/userbot",
+    tags=["userbot"],
+    dependencies=[Depends(require_tab_access("userbot")), Depends(require_sources_scope)],
+)
 
 # Request/Response Models
 class UserbotConfig(BaseModel):

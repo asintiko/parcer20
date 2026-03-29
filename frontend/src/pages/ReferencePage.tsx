@@ -83,7 +83,12 @@ export function ReferencePage() {
         mutationFn: referenceApi.importFromExcel,
         onSuccess: (res) => {
             showToast('success', `Импортировано: ${res.imported}, пропущено: ${res.skipped}`);
-            if (res.errors?.length) console.error(res.errors);
+            if (res.errors?.length) {
+                showToast('warning', `Импорт завершён с ошибками: ${res.errors.length}`, {
+                    duration: 8000,
+                    details: res.errors.join('\n'),
+                });
+            }
             queryClient.invalidateQueries({ queryKey: ['reference-list'] });
         },
         onError: () => showToast('error', 'Ошибка импорта'),
@@ -94,7 +99,7 @@ export function ReferencePage() {
     };
 
     const handleDelete = (id: number) => {
-        if (confirm('Удалить запись?')) {
+        if (confirm('Удалить запись? Это действие необратимо.')) {
             deleteMutation.mutate(id);
         }
     };
@@ -133,18 +138,21 @@ export function ReferencePage() {
                 <div className="flex flex-wrap gap-2">
                     <button
                         onClick={() => fileInputRef.current?.click()}
+                        aria-label="Импортировать справочник из Excel"
                         className="inline-flex items-center gap-2 px-4 py-2 rounded-md bg-surface border border-border text-sm hover:bg-surface-2"
                     >
                         <Upload className="w-4 h-4" /> Импорт Excel
                     </button>
                     <button
                         onClick={handleExport}
+                        aria-label="Экспортировать справочник в Excel"
                         className="inline-flex items-center gap-2 px-4 py-2 rounded-md bg-surface border border-border text-sm hover:bg-surface-2"
                     >
                         <Download className="w-4 h-4" /> Экспорт Excel
                     </button>
                     <button
                         onClick={() => setIsAddOpen(true)}
+                        aria-label="Добавить новую запись в справочник"
                         className="inline-flex items-center gap-2 px-4 py-2 rounded-md bg-primary text-foreground-inverse text-sm hover:bg-primary-hover"
                     >
                         <Plus className="w-4 h-4" /> Добавить
@@ -162,6 +170,7 @@ export function ReferencePage() {
                                 setSearch(e.target.value);
                                 setPage(1);
                             }}
+                            aria-label="Поиск по справочнику операторов"
                             placeholder="Поиск по оператору или приложению"
                             className="w-full pl-9 pr-3 py-2 border border-border rounded-md bg-input-bg text-input-text focus:ring-2 focus:ring-primary"
                         />
@@ -175,6 +184,7 @@ export function ReferencePage() {
                                 setApplicationFilter(e.target.value);
                                 setPage(1);
                             }}
+                            aria-label="Фильтр по приложению"
                             className="px-3 py-2 border border-border rounded-md bg-input-bg text-sm text-input-text"
                         >
                             <option value="">Все приложения</option>
@@ -194,6 +204,7 @@ export function ReferencePage() {
                                 setActiveOnly(e.target.checked);
                                 setPage(1);
                             }}
+                            aria-label="Показывать только активные записи"
                             className="w-4 h-4 text-primary border-border rounded"
                         />
                         Только активные
@@ -207,6 +218,7 @@ export function ReferencePage() {
                                 setP2pOnly(e.target.checked);
                                 setPage(1);
                             }}
+                            aria-label="Показывать только P2P записи"
                             className="w-4 h-4 text-primary border-border rounded"
                         />
                         Только P2P

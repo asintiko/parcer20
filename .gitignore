@@ -32,6 +32,12 @@ wheels/
 .env.local
 .env.production
 
+# Runtime access configs
+security/client-access.json
+security/root-access.server.json
+frontend/client-access.json
+frontend/public/client-access.json
+
 # IDEs
 .vscode/
 .idea/

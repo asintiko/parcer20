@@ -1,183 +1,239 @@
-import React, { useState, useEffect } from 'react';
+import React, { useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { Loader2, AlertCircle, CheckCircle, QrCode, Send } from 'lucide-react';
-import { authApi } from '../services/api';
+import { AlertCircle, CheckCircle, Send } from 'lucide-react';
+import { useAuth } from '../contexts/AuthContext';
+import { TwoFactorSetup } from '../components/TwoFactorSetup';
+import { QRLoginPanel } from '../components/QRLoginPanel';
+
+const routeByTab: Record<string, string> = {
+    dashboard: '/',
+    reference: '/reference',
+    automation: '/automation',
+    userbot: '/userbot',
+    logs: '/logs',
+    admin: '/settings',
+};
+
+const orderedTabs = ['dashboard', 'reference', 'automation', 'userbot', 'logs', 'admin'];
+
+const resolveFirstRoute = (tabs: string[], role: string): string => {
+    if (role === 'admin') return '/';
+    const allowed = new Set(tabs || []);
+    for (const tab of orderedTabs) {
+        if (allowed.has(tab) && routeByTab[tab]) {
+            return routeByTab[tab];
+        }
+    }
+    return '/';
+};
 
 export const LoginPage: React.FC = () => {
     const navigate = useNavigate();
-    const [qrCode, setQrCode] = useState<string | null>(null);
-    const [sessionId, setSessionId] = useState<string | null>(null);
-    const [status, setStatus] = useState<'idle' | 'loading' | 'qr_ready' | 'authenticating' | 'error'>('idle');
+    const { login, login2fa } = useAuth();
+
+    const [username, setUsername] = useState('');
+    const [password, setPassword] = useState('');
+    const [twoFactorCode, setTwoFactorCode] = useState('');
+    const [tempToken, setTempToken] = useState<string | null>(null);
+    const [requiresSetup, setRequiresSetup] = useState(false);
+    const [step, setStep] = useState<'credentials' | 'two_factor'>('credentials');
+    const [status, setStatus] = useState<'idle' | 'loading' | 'authenticating' | 'error'>('idle');
     const [error, setError] = useState<string | null>(null);
-    const [statusMessage, setStatusMessage] = useState<string>('');
+    const [attemptsLeft, setAttemptsLeft] = useState<number | null>(null);
 
-    useEffect(() => {
-        // Generate QR code on mount
-        generateQRCode();
-    }, []);
+    const lockHint = useMemo(() => {
+        if (attemptsLeft === null) return null;
+        if (attemptsLeft <= 0) return 'Лимит попыток исчерпан';
+        return `Осталось попыток: ${attemptsLeft}`;
+    }, [attemptsLeft]);
 
-    useEffect(() => {
-        // Poll for authentication status
-        if (sessionId && status === 'qr_ready') {
-            const interval = setInterval(checkLoginStatus, 2000);
-            return () => clearInterval(interval);
-        }
-    }, [sessionId, status]);
-
-    const generateQRCode = async () => {
+    const handleLogin = async (e: React.FormEvent) => {
+        e.preventDefault();
         setStatus('loading');
         setError(null);
+        setAttemptsLeft(null);
 
         try {
-            const response = await authApi.generateQR();
-            setQrCode(response.qr_code);
-            setSessionId(response.session_id);
-            setStatus('qr_ready');
-            setStatusMessage('Отсканируйте QR-код с помощью Telegram');
+            const user = await login(username.trim(), password);
+            setStatus('authenticating');
+            const target = resolveFirstRoute(user.allowed_tabs || [], user.role);
+            navigate(target, { replace: true });
         } catch (err: any) {
-            setError(err.response?.data?.detail || 'Не удалось сгенерировать QR-код');
-            setStatus('error');
-        }
-    };
-
-    const checkLoginStatus = async () => {
-        if (!sessionId) return;
-
-        try {
-            const response = await authApi.checkQRStatus(sessionId);
-
-            if (response.status === 'authenticated' && response.token) {
-                setStatus('authenticating');
-                setStatusMessage('Авторизация успешна! Перенаправление...');
-
-                // Save token
-                localStorage.setItem('auth_token', response.token);
-
-                // Redirect to main page
-                setTimeout(() => {
-                    navigate('/');
-                    window.location.reload(); // Reload to update auth context
-                }, 1000);
-            } else if (response.status === 'pending') {
-                setStatusMessage('Ожидание сканирования QR-кода...');
-            } else if (response.status === 'error' || response.status === 'expired') {
-                setError(response.message || 'Сессия истекла');
-                setStatus('error');
+            if (err?.code === 'requires_2fa') {
+                setStatus('idle');
+                setStep('two_factor');
+                setTempToken(err?.temp_token || null);
+                setRequiresSetup(Boolean(err?.requires_2fa_setup));
+                setError(null);
+                return;
             }
-        } catch (err: any) {
-            console.error('Error checking login status:', err);
+            setStatus('error');
+            const code = err?.code || err?.response?.data?.error;
+            const detail = err?.response?.data;
+            setAttemptsLeft(detail?.attempts_left ?? err?.attempts_left ?? null);
+            if (code === 'locked') {
+                const seconds = detail?.locked_seconds ?? err?.locked_seconds;
+                setError(seconds ? `Пользователь временно заблокирован (${seconds} сек)` : 'Пользователь временно заблокирован');
+                return;
+            }
+            if (code === 'inactive_user') {
+                setError('Пользователь отключен администратором');
+                return;
+            }
+            setError('Неверный логин или пароль');
         }
     };
 
-    const handleRetry = () => {
-        setQrCode(null);
-        setSessionId(null);
+    const handleLogin2fa = async (e: React.FormEvent) => {
+        e.preventDefault();
+        if (!tempToken || !twoFactorCode.trim()) return;
+        setStatus('loading');
         setError(null);
-        setStatusMessage('');
-        generateQRCode();
+        try {
+            const user = await login2fa(tempToken, twoFactorCode.trim());
+            setStatus('authenticating');
+            const target = resolveFirstRoute(user.allowed_tabs || [], user.role);
+            navigate(target, { replace: true });
+        } catch (err: any) {
+            setStatus('error');
+            const detail = err?.response?.data?.detail;
+            if (typeof detail === 'object' && detail?.locked_seconds) {
+                setError(`Слишком много попыток. Повторите через ${detail.locked_seconds} сек`);
+            } else if (typeof detail === 'string') {
+                setError(detail === 'requires_2fa_setup' ? 'Сначала завершите настройку 2FA' : detail);
+            } else {
+                setError('Неверный 2FA код');
+            }
+        }
     };
 
     return (
-        <div className="min-h-screen w-full flex items-center justify-center bg-bg">
-            <div className="w-full max-w-md p-8">
-                {/* Logo and Title */}
+        <div className="min-h-screen w-full flex items-center justify-center bg-bg p-4">
+            <div className="w-full max-w-md p-6">
                 <div className="text-center mb-8">
                     <div className="inline-flex items-center justify-center w-16 h-16 bg-primary rounded-2xl mb-4">
                         <Send className="w-8 h-8 text-foreground-inverse" />
                     </div>
-                    <h1 className="text-3xl font-semibold tracking-wide text-foreground mb-2">
-                        PARCER 2.0
-                    </h1>
-                    <p className="text-foreground-secondary">
-                        Вход через Telegram
-                    </p>
+                    <h1 className="text-3xl font-semibold tracking-wide text-foreground mb-2">PARCER 2.0</h1>
+                    <p className="text-foreground-secondary">Персональный вход</p>
                 </div>
 
-                {/* Main Card */}
-                <div className="bg-surface rounded-2xl shadow-xl p-8 border border-border">
-                    {/* QR Code Display */}
-                    {status === 'loading' && (
-                        <div className="flex flex-col items-center justify-center py-12">
-                            <Loader2 className="w-12 h-12 text-primary animate-spin mb-4" />
-                            <p className="text-foreground-secondary">Генерация QR-кода...</p>
-                        </div>
-                    )}
-
-                    {status === 'qr_ready' && qrCode && (
-                        <div className="flex flex-col items-center">
-                            <div className="bg-surface-2 p-4 rounded-xl border-2 border-border mb-4">
-                                <img
-                                    src={qrCode}
-                                    alt="QR Code"
-                                    className="w-64 h-64"
+                <div className="bg-surface rounded-2xl shadow-xl p-8 border border-border space-y-6">
+                    {step === 'credentials' ? (
+                        <form onSubmit={handleLogin} className="space-y-4">
+                            <div>
+                                <label className="block text-sm text-foreground-secondary mb-2">Логин</label>
+                                <input
+                                    value={username}
+                                    onChange={(e) => setUsername(e.target.value)}
+                                    className="w-full px-3 py-2 rounded-lg border border-border bg-input-bg text-input-text"
+                                    placeholder="username"
+                                    autoComplete="username"
+                                />
+                            </div>
+                            <div>
+                                <label className="block text-sm text-foreground-secondary mb-2">Пароль</label>
+                                <input
+                                    type="password"
+                                    value={password}
+                                    onChange={(e) => setPassword(e.target.value)}
+                                    className="w-full px-3 py-2 rounded-lg border border-border bg-input-bg text-input-text"
+                                    placeholder="password"
+                                    autoComplete="current-password"
                                 />
                             </div>
 
-                            <div className="flex items-center gap-2 text-primary mb-2">
-                                <QrCode className="w-5 h-5" />
-                                <span className="font-medium">Сканируйте QR-код</span>
-                            </div>
-
-                            <p className="text-sm text-foreground-secondary text-center mb-4">
-                                {statusMessage}
-                            </p>
-
-                            <div className="w-full bg-info-light rounded-lg p-4 mt-4 border border-info/30">
-                                <p className="text-sm text-info font-medium mb-2">
-                                    Как войти:
-                                </p>
-                                <ol className="text-xs text-info space-y-1 list-decimal list-inside">
-                                    <li>Откройте Telegram на телефоне</li>
-                                    <li>Перейдите в Настройки → Устройства</li>
-                                    <li>Нажмите "Подключить устройство"</li>
-                                    <li>Отсканируйте этот QR-код</li>
-                                </ol>
-                            </div>
+                            {status === 'error' && error ? (
+                                <div className="text-sm text-danger flex items-center gap-2">
+                                    <AlertCircle className="w-4 h-4" />
+                                    <span>{error}</span>
+                                </div>
+                            ) : null}
+                            {lockHint ? <div className="text-xs text-foreground-muted">{lockHint}</div> : null}
 
                             <button
-                                onClick={handleRetry}
-                                className="mt-4 text-sm text-foreground-secondary hover:text-foreground underline focus:outline-none focus:ring-2 focus:ring-primary rounded"
+                                type="submit"
+                                disabled={status === 'loading' || !username.trim() || !password}
+                                className="w-full px-4 py-2 rounded-lg bg-primary text-foreground-inverse hover:bg-primary-hover disabled:opacity-60"
                             >
-                                Обновить QR-код
+                                {status === 'loading' ? 'Вход...' : 'Войти'}
                             </button>
-                        </div>
+                        </form>
+                    ) : (
+                        <form onSubmit={handleLogin2fa} className="space-y-4">
+                            <div className="text-sm text-foreground-secondary">Введите код из приложения-аутентификатора.</div>
+                            {requiresSetup ? (
+                                <TwoFactorSetup
+                                    tempToken={tempToken}
+                                    onCompleted={() => {
+                                        setRequiresSetup(false);
+                                        setError(null);
+                                    }}
+                                />
+                            ) : null}
+                            <input
+                                value={twoFactorCode}
+                                onChange={(e) => setTwoFactorCode(e.target.value)}
+                                className="w-full px-3 py-2 rounded-lg border border-border bg-input-bg text-input-text"
+                                placeholder="123456"
+                                autoComplete="one-time-code"
+                            />
+                            {status === 'error' && error ? (
+                                <div className="text-sm text-danger flex items-center gap-2">
+                                    <AlertCircle className="w-4 h-4" />
+                                    <span>{error}</span>
+                                </div>
+                            ) : null}
+                            <div className="flex gap-2">
+                                <button
+                                    type="button"
+                                    onClick={() => {
+                                        setStep('credentials');
+                                        setTwoFactorCode('');
+                                        setTempToken(null);
+                                        setRequiresSetup(false);
+                                        setError(null);
+                                        setStatus('idle');
+                                    }}
+                                    className="flex-1 px-4 py-2 rounded-lg border border-border bg-surface hover:bg-surface-2"
+                                >
+                                    Назад
+                                </button>
+                                <button
+                                    type="submit"
+                                    disabled={status === 'loading' || !tempToken || !twoFactorCode.trim() || requiresSetup}
+                                    className="flex-1 px-4 py-2 rounded-lg bg-primary text-foreground-inverse hover:bg-primary-hover disabled:opacity-60"
+                                >
+                                    {status === 'loading' ? 'Проверка...' : 'Подтвердить'}
+                                </button>
+                            </div>
+                        </form>
                     )}
 
-                    {status === 'authenticating' && (
-                        <div className="flex flex-col items-center justify-center py-12">
-                            <CheckCircle className="w-16 h-16 text-success mb-4" />
-                            <p className="text-lg font-medium text-foreground mb-2">
-                                Успешно!
-                            </p>
-                            <p className="text-sm text-foreground-secondary">
-                                {statusMessage}
-                            </p>
+                    {status === 'authenticating' ? (
+                        <div className="flex items-center gap-2 text-success text-sm">
+                            <CheckCircle className="w-4 h-4" />
+                            <span>Успешный вход</span>
                         </div>
-                    )}
+                    ) : null}
 
-                    {status === 'error' && (
-                        <div className="flex flex-col items-center justify-center py-12">
-                            <AlertCircle className="w-16 h-16 text-danger mb-4" />
-                            <p className="text-lg font-medium text-foreground mb-2">
-                                Ошибка
-                            </p>
-                            <p className="text-sm text-foreground-secondary text-center mb-6">
-                                {error}
-                            </p>
-                            <button
-                                onClick={handleRetry}
-                                className="px-6 py-2 bg-primary text-foreground-inverse rounded-lg hover:bg-primary-hover transition-colors focus:outline-none focus:ring-2 focus:ring-primary focus:ring-offset-2 focus:ring-offset-surface"
-                            >
-                                Попробовать снова
-                            </button>
-                        </div>
+                    {step === 'credentials' && status !== 'authenticating' && (
+                        <>
+                            <div className="flex items-center gap-3">
+                                <div className="flex-1 h-px bg-border" />
+                                <span className="text-xs text-foreground-muted">или</span>
+                                <div className="flex-1 h-px bg-border" />
+                            </div>
+                            <QRLoginPanel
+                                onSuccess={(user) => {
+                                    setStatus('authenticating');
+                                    const target = resolveFirstRoute(user?.allowed_tabs || [], user?.role || '');
+                                    navigate(target, { replace: true });
+                                }}
+                            />
+                        </>
                     )}
                 </div>
-
-                {/* Footer */}
-                <p className="text-center text-sm text-foreground-muted mt-6">
-                    Безопасная авторизация через Telegram
-                </p>
             </div>
         </div>
     );

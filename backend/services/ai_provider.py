@@ -1,0 +1,194 @@
+from __future__ import annotations
+
+import json
+import logging
+from typing import Any, Dict, Iterable, List, Optional
+
+from openai import AsyncOpenAI, OpenAI
+
+from config.ai_models import (
+    AI_REQUEST_TIMEOUT_SECONDS,
+    AI_RETRY_COUNT,
+    DEEPSEEK_API_KEY,
+    DEEPSEEK_BASE_URL,
+    DEEPSEEK_TEXT_MODEL,
+)
+
+logger = logging.getLogger(__name__)
+
+
+JsonDict = Dict[str, Any]
+MessageList = List[Dict[str, Any]]
+
+
+class DeepSeekTextProvider:
+    """Shared OpenAI-compatible text provider backed by DeepSeek."""
+
+    def __init__(
+        self,
+        *,
+        api_key: Optional[str] = None,
+        base_url: Optional[str] = None,
+        default_model: Optional[str] = None,
+        timeout_seconds: Optional[float] = None,
+    ) -> None:
+        self.api_key = (api_key or DEEPSEEK_API_KEY).strip()
+        self.base_url = (base_url or DEEPSEEK_BASE_URL).strip()
+        self.default_model = (default_model or DEEPSEEK_TEXT_MODEL).strip() or "deepseek-chat"
+        self.timeout_seconds = float(timeout_seconds or AI_REQUEST_TIMEOUT_SECONDS)
+        self.enabled = bool(self.api_key)
+        self._async_client: Optional[AsyncOpenAI] = None
+        self._sync_client: Optional[OpenAI] = None
+
+    def _get_async_client(self) -> AsyncOpenAI:
+        if not self.enabled:
+            raise RuntimeError("deepseek_not_configured")
+        if self._async_client is None:
+            self._async_client = AsyncOpenAI(
+                api_key=self.api_key,
+                base_url=self.base_url,
+                timeout=self.timeout_seconds,
+            )
+        return self._async_client
+
+    def _get_sync_client(self) -> OpenAI:
+        if not self.enabled:
+            raise RuntimeError("deepseek_not_configured")
+        if self._sync_client is None:
+            self._sync_client = OpenAI(
+                api_key=self.api_key,
+                base_url=self.base_url,
+                timeout=self.timeout_seconds,
+            )
+        return self._sync_client
+
+    @staticmethod
+    def _extract_text_content(raw_content: Any) -> str:
+        if raw_content is None:
+            return ""
+        if isinstance(raw_content, str):
+            return raw_content.strip()
+        if isinstance(raw_content, list):
+            parts: List[str] = []
+            for item in raw_content:
+                if isinstance(item, dict) and item.get("type") == "text":
+                    parts.append(str(item.get("text") or ""))
+                elif isinstance(item, str):
+                    parts.append(item)
+            return "\n".join(part for part in parts if part).strip()
+        return str(raw_content).strip()
+
+    @staticmethod
+    def _coerce_json_object(content: str) -> JsonDict:
+        if not content:
+            raise ValueError("empty_ai_response")
+        try:
+            payload = json.loads(content)
+            if isinstance(payload, dict):
+                return payload
+        except Exception:
+            pass
+
+        start = content.find("{")
+        while start != -1:
+            depth = 0
+            for idx in range(start, len(content)):
+                ch = content[idx]
+                if ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        candidate = content[start:idx + 1]
+                        payload = json.loads(candidate)
+                        if isinstance(payload, dict):
+                            return payload
+                        break
+            start = content.find("{", start + 1)
+        raise ValueError("invalid_json_ai_response")
+
+    async def complete_json(
+        self,
+        *,
+        messages: MessageList,
+        model: Optional[str] = None,
+        temperature: float = 0.1,
+        max_tokens: Optional[int] = None,
+    ) -> JsonDict:
+        retry_count = max(0, int(AI_RETRY_COUNT))
+        last_error: Optional[Exception] = None
+        for attempt in range(retry_count + 1):
+            try:
+                response = await self._get_async_client().chat.completions.create(
+                    model=model or self.default_model,
+                    messages=messages,
+                    response_format={"type": "json_object"},
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
+                content = self._extract_text_content(response.choices[0].message.content)
+                return self._coerce_json_object(content)
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+                logger.warning("DeepSeek JSON completion failed on attempt %s: %s", attempt + 1, exc)
+        raise RuntimeError(str(last_error or "deepseek_request_failed"))
+
+    async def complete_text(
+        self,
+        *,
+        messages: MessageList,
+        model: Optional[str] = None,
+        temperature: float = 0.2,
+        max_tokens: Optional[int] = None,
+    ) -> str:
+        retry_count = max(0, int(AI_RETRY_COUNT))
+        last_error: Optional[Exception] = None
+        for attempt in range(retry_count + 1):
+            try:
+                response = await self._get_async_client().chat.completions.create(
+                    model=model or self.default_model,
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
+                return self._extract_text_content(response.choices[0].message.content)
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+                logger.warning("DeepSeek text completion failed on attempt %s: %s", attempt + 1, exc)
+        raise RuntimeError(str(last_error or "deepseek_request_failed"))
+
+    def complete_json_sync(
+        self,
+        *,
+        messages: MessageList,
+        model: Optional[str] = None,
+        temperature: float = 0.1,
+        max_tokens: Optional[int] = None,
+    ) -> JsonDict:
+        retry_count = max(0, int(AI_RETRY_COUNT))
+        last_error: Optional[Exception] = None
+        for attempt in range(retry_count + 1):
+            try:
+                response = self._get_sync_client().chat.completions.create(
+                    model=model or self.default_model,
+                    messages=messages,
+                    response_format={"type": "json_object"},
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
+                content = self._extract_text_content(response.choices[0].message.content)
+                return self._coerce_json_object(content)
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+                logger.warning("DeepSeek sync JSON completion failed on attempt %s: %s", attempt + 1, exc)
+        raise RuntimeError(str(last_error or "deepseek_request_failed"))
+
+
+_default_provider: Optional[DeepSeekTextProvider] = None
+
+
+def get_text_ai_provider() -> DeepSeekTextProvider:
+    global _default_provider
+    if _default_provider is None:
+        _default_provider = DeepSeekTextProvider()
+    return _default_provider

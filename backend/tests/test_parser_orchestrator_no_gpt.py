@@ -6,3 +6,5 @@ def test_orchestrator_without_openai_returns_none():
     text = "Unparsable text without known format"
     res = orchestrator.process(text)
     assert res is None
+    assert orchestrator.last_rejection_reason is not None
+    assert "gpt" in orchestrator.last_rejection_reason.lower()

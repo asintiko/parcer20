@@ -1,0 +1,20 @@
+services:
+  backend:
+    volumes:
+      - ./backend:/app
+
+  userbot:
+    volumes:
+      - ./backend:/app
+
+  telegram_bot:
+    volumes:
+      - ./backend:/app
+
+  auth_bot:
+    volumes:
+      - ./backend:/app
+
+  celery_worker:
+    volumes:
+      - ./backend:/app

@@ -9,14 +9,16 @@ from sqlalchemy import desc, or_
 from typing import List, Optional
 from pydantic import BaseModel
 from io import BytesIO
+import logging
 import openpyxl
 from openpyxl.styles import Font, PatternFill
 
 from database.connection import get_db_session
 from database.models import OperatorReference
-from api.dependencies import get_current_user
+from api.dependencies import require_tab_access
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 # Pydantic schemas
@@ -52,7 +54,8 @@ class OperatorReferenceListResponse(BaseModel):
     items: List[OperatorReferenceResponse]
 
 
-@router.get("/", response_model=OperatorReferenceListResponse)
+@router.get("", response_model=OperatorReferenceListResponse)
+@router.get("/", response_model=OperatorReferenceListResponse, include_in_schema=False)
 async def get_operators(
     page: int = Query(1, ge=1, description="Page number"),
     page_size: Optional[int] = Query(50, ge=1, description="Items per page (ignored when all=true)"),
@@ -62,7 +65,7 @@ async def get_operators(
     is_active: Optional[bool] = Query(None, description="Filter by active status (None = all)"),
     all_param: Optional[str] = Query(None, alias="all", description="Return full list without pagination"),
     db: Session = Depends(get_db_session),
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(require_tab_access("reference")),
 ):
     """Get list of operators with optional pagination"""
     # Convert string parameter to boolean (handles "true", "1", "yes", "on")
@@ -115,11 +118,12 @@ async def get_operators(
     )
 
 
-@router.post("/", response_model=OperatorReferenceResponse)
+@router.post("", response_model=OperatorReferenceResponse)
+@router.post("/", response_model=OperatorReferenceResponse, include_in_schema=False)
 async def create_operator(
     operator: OperatorReferenceCreate,
     db: Session = Depends(get_db_session),
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(require_tab_access("reference")),
 ):
     """Create new operator reference"""
     try:
@@ -141,9 +145,9 @@ async def create_operator(
     except HTTPException:
         db.rollback()
         raise
-    except Exception as e:
+    except Exception:
         db.rollback()
-        print(f"Error creating operator: {e}")
+        logger.exception("Error creating operator")
         raise HTTPException(status_code=500, detail="Failed to create operator")
 
 
@@ -152,7 +156,7 @@ async def update_operator(
     operator_id: int,
     operator: OperatorReferenceUpdate,
     db: Session = Depends(get_db_session),
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(require_tab_access("reference")),
 ):
     """Update operator reference"""
     try:
@@ -173,9 +177,9 @@ async def update_operator(
     except HTTPException:
         db.rollback()
         raise
-    except Exception as e:
+    except Exception:
         db.rollback()
-        print(f"Error updating operator: {e}")
+        logger.exception("Error updating operator")
         raise HTTPException(status_code=500, detail="Failed to update operator")
 
 
@@ -183,7 +187,7 @@ async def update_operator(
 async def delete_operator(
     operator_id: int,
     db: Session = Depends(get_db_session),
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(require_tab_access("reference")),
 ):
     """Delete operator reference"""
     try:
@@ -199,16 +203,16 @@ async def delete_operator(
     except HTTPException:
         db.rollback()
         raise
-    except Exception as e:
+    except Exception:
         db.rollback()
-        print(f"Error deleting operator: {e}")
+        logger.exception("Error deleting operator")
         raise HTTPException(status_code=500, detail="Failed to delete operator")
 
 
 @router.get("/export/excel")
 async def export_to_excel(
     db: Session = Depends(get_db_session),
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(require_tab_access("reference")),
 ):
     """Export operators to Excel file"""
     # Get all active operators
@@ -260,7 +264,7 @@ async def export_to_excel(
 async def import_from_excel(
     file: UploadFile = File(...),
     db: Session = Depends(get_db_session),
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(require_tab_access("reference")),
 ):
     """Import operators from Excel file"""
     try:
@@ -337,16 +341,16 @@ async def import_from_excel(
             "errors": errors
         }
 
-    except Exception as e:
+    except Exception:
         db.rollback()
-        print(f"Import failed: {e}")
+        logger.exception("Import from excel failed")
         raise HTTPException(status_code=400, detail="Import failed")
 
 
 @router.get("/applications")
 async def get_applications(
     db: Session = Depends(get_db_session),
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(require_tab_access("reference")),
 ):
     """Get list of unique application names"""
     apps = db.query(OperatorReference.application_name).distinct().order_by(OperatorReference.application_name).all()

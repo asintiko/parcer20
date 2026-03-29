@@ -1,6 +1,8 @@
 """Shared receipt processing logic for TDLib messages."""
 import asyncio
-import hashlib
+import json
+import logging
+import os
 from datetime import datetime
 from decimal import Decimal
 from typing import Any, Dict, Optional, TYPE_CHECKING
@@ -9,23 +11,282 @@ import pytz
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
-from database.models import Transaction
+from database.models import DuplicateMergeLog, Transaction
 from parsers.parser_orchestrator import ParserOrchestrator
-from parsers.pdf_extractor import extract_text_from_pdf, render_pdf_pages_to_png_base64
+from parsers.pdf_extractor import (
+    extract_text_from_image_path,
+    extract_text_from_pdf,
+)
+from services.fingerprint import compute_fingerprint_candidates
 from services.telegram_tdlib_manager import TDLibUnavailableError, TelegramTDLibManager
+from database.connection import SessionLocal
 
 if TYPE_CHECKING:
     # Avoid runtime circular import
     from api.routes.transactions import ProcessReceiptResponse, ParsingInfo
 
+METHOD_QUALITY_BONUS = {
+    "REGEX_TRANSFER": 18.0,
+    "AI_TEXT": 14.0,
+    "REGEX_HUMO": 12.0,
+    "REGEX_CARDXABAR": 12.0,
+    "REGEX_SMS": 10.0,
+    "REGEX_SEMICOLON": 9.0,
+}
+DUPLICATE_LOG_BG_TIMEOUT_SEC = max(1.0, float(os.getenv("DUPLICATE_LOG_BG_TIMEOUT_SEC", "2.0")))
+DUPLICATE_LOG_BG_RETRIES = max(0, int(os.getenv("DUPLICATE_LOG_BG_RETRIES", "2")))
+logger = logging.getLogger(__name__)
 
-def compute_fingerprint(amount: Decimal, transaction_date: datetime, card_last4: str) -> str:
-    """Compute SHA256 fingerprint for duplicate detection."""
-    amount_str = str(abs(amount)) if amount else "0"
-    date_str = transaction_date.strftime("%Y-%m-%d %H:%M") if transaction_date else ""
-    card_str = str(card_last4)[-4:] if card_last4 else "0000"
-    data = f"{amount_str}|{date_str}|{card_str}"
-    return hashlib.sha256(data.encode()).hexdigest()
+def _has_value(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        normalized = value.strip()
+        if not normalized or normalized.upper() == "UNKNOWN":
+            return False
+        return True
+    return True
+
+
+def _value_richness(value: Any) -> int:
+    if not _has_value(value):
+        return 0
+    if isinstance(value, str):
+        return len(value.strip())
+    return 1
+
+
+def _method_bonus(parsing_method: Optional[str]) -> float:
+    key = (parsing_method or "").upper()
+    if key.startswith("GPT"):
+        key = "AI_TEXT"
+    return METHOD_QUALITY_BONUS.get(key, 0.0)
+
+
+def _append_duplicate_log(
+    *,
+    fingerprint: str,
+    existing_transaction_id: int,
+    source_chat_id: Optional[int],
+    source_message_id: Optional[int],
+    merged: bool,
+    candidate_method: Optional[str],
+    candidate_confidence: Optional[float],
+    existing_method: Optional[str],
+    existing_confidence: Optional[float],
+    details: Optional[Dict[str, Any]] = None,
+) -> DuplicateMergeLog:
+    row = DuplicateMergeLog(
+        fingerprint=fingerprint,
+        existing_transaction_id=int(existing_transaction_id),
+        source_chat_id=int(source_chat_id) if source_chat_id is not None else None,
+        source_message_id=int(source_message_id) if source_message_id is not None else None,
+        merged=bool(merged),
+        candidate_method=candidate_method,
+        candidate_confidence=float(candidate_confidence) if candidate_confidence is not None else None,
+        existing_method=existing_method,
+        existing_confidence=float(existing_confidence or 0.0),
+        details_json=json.dumps(details or {}, ensure_ascii=False) if details else None,
+    )
+    return row
+
+
+def _persist_duplicate_log_row(row: DuplicateMergeLog) -> None:
+    with SessionLocal() as bg_db:
+        bg_db.add(row)
+        bg_db.commit()
+
+
+async def _append_duplicate_log_background(
+    *,
+    fingerprint: str,
+    existing_transaction_id: int,
+    source_chat_id: Optional[int],
+    source_message_id: Optional[int],
+    merged: bool,
+    candidate_method: Optional[str],
+    candidate_confidence: Optional[float],
+    existing_method: Optional[str],
+    existing_confidence: Optional[float],
+    details: Optional[Dict[str, Any]] = None,
+) -> None:
+    last_error: Optional[Exception] = None
+    for attempt in range(DUPLICATE_LOG_BG_RETRIES + 1):
+        try:
+            row = _append_duplicate_log(
+                fingerprint=fingerprint,
+                existing_transaction_id=existing_transaction_id,
+                source_chat_id=source_chat_id,
+                source_message_id=source_message_id,
+                merged=merged,
+                candidate_method=candidate_method,
+                candidate_confidence=candidate_confidence,
+                existing_method=existing_method,
+                existing_confidence=existing_confidence,
+                details=details,
+            )
+            await asyncio.wait_for(
+                asyncio.to_thread(_persist_duplicate_log_row, row),
+                timeout=DUPLICATE_LOG_BG_TIMEOUT_SEC,
+            )
+            return
+        except Exception as exc:  # noqa: BLE001
+            last_error = exc
+            if attempt < DUPLICATE_LOG_BG_RETRIES:
+                await asyncio.sleep(min(0.2 * (attempt + 1), 0.75))
+    logger.warning(
+        "Failed to persist duplicate merge log after retries",
+        exc_info=last_error,
+    )
+
+
+def _tx_quality_score(
+    *,
+    parsing_confidence: Optional[float],
+    application_mapped: Optional[str],
+    balance_after: Optional[Any],
+    receiver_name: Optional[str],
+    receiver_card: Optional[str],
+    operator_raw: Optional[str],
+    card_last4: Optional[str],
+    parsing_method: Optional[str],
+    transaction_date: Optional[datetime] = None,
+) -> float:
+    score = float(parsing_confidence or 0.0) * 100.0
+    score += _method_bonus(parsing_method)
+    score += 8.0 if _has_value(application_mapped) else 0.0
+    score += 6.0 if _has_value(balance_after) else 0.0
+    score += 6.0 if _has_value(receiver_name) else 0.0
+    score += 6.0 if _has_value(receiver_card) else 0.0
+    score += 4.0 if _has_value(operator_raw) else 0.0
+    score += 3.0 if _has_value(card_last4) else 0.0
+    if transaction_date is not None and int(getattr(transaction_date, "second", 0) or 0) != 0:
+        score += 2.0
+    if (parsing_method or "").upper().startswith("GPT"):
+        score += 2.0
+    return score
+
+
+def _merge_duplicate_transaction(
+    existing: Transaction,
+    *,
+    candidate_transaction_date: datetime,
+    candidate_operator_raw: str,
+    candidate_application_mapped: Optional[str],
+    candidate_balance_after: Optional[Any],
+    candidate_receiver_name: Optional[str],
+    candidate_receiver_card: Optional[str],
+    candidate_raw_message: str,
+    candidate_is_p2p: Optional[bool],
+    candidate_parsing_method: Optional[str],
+    candidate_parsing_confidence: Optional[float],
+    candidate_is_gpt: bool,
+    candidate_source_type: Optional[str] = None,
+) -> bool:
+    existing_score = _tx_quality_score(
+        parsing_confidence=getattr(existing, "parsing_confidence", None),
+        application_mapped=getattr(existing, "application_mapped", None),
+        balance_after=getattr(existing, "balance_after", None),
+        receiver_name=getattr(existing, "receiver_name", None),
+        receiver_card=getattr(existing, "receiver_card", None),
+        operator_raw=getattr(existing, "operator_raw", None),
+        card_last4=getattr(existing, "card_last_4", None),
+        parsing_method=getattr(existing, "parsing_method", None),
+        transaction_date=getattr(existing, "transaction_date", None),
+    )
+    candidate_score = _tx_quality_score(
+        parsing_confidence=candidate_parsing_confidence,
+        application_mapped=candidate_application_mapped,
+        balance_after=candidate_balance_after,
+        receiver_name=candidate_receiver_name,
+        receiver_card=candidate_receiver_card,
+        operator_raw=candidate_operator_raw,
+        card_last4=getattr(existing, "card_last_4", None),
+        parsing_method=candidate_parsing_method,
+        transaction_date=candidate_transaction_date,
+    )
+
+    existing_conf = float(getattr(existing, "parsing_confidence", 0.0) or 0.0)
+    candidate_conf = float(candidate_parsing_confidence or 0.0)
+    candidate_is_better = candidate_score > (existing_score + 0.5)
+    candidate_conf_is_better = candidate_conf >= existing_conf
+    updated = False
+
+    if _has_value(candidate_application_mapped) and (
+        not _has_value(existing.application_mapped)
+        or (_value_richness(candidate_application_mapped) > _value_richness(existing.application_mapped) and candidate_conf_is_better)
+        or candidate_is_better
+    ):
+        existing.application_mapped = candidate_application_mapped
+        updated = True
+    if _has_value(candidate_balance_after) and (
+        not _has_value(existing.balance_after)
+        or (candidate_conf_is_better and candidate_is_better)
+    ):
+        existing.balance_after = candidate_balance_after
+        updated = True
+    if _has_value(candidate_receiver_name) and (
+        not _has_value(existing.receiver_name)
+        or (_value_richness(candidate_receiver_name) > _value_richness(existing.receiver_name) and candidate_conf_is_better)
+        or candidate_is_better
+    ):
+        existing.receiver_name = candidate_receiver_name
+        updated = True
+    if _has_value(candidate_receiver_card) and (
+        not _has_value(existing.receiver_card)
+        or _value_richness(candidate_receiver_card) > _value_richness(existing.receiver_card)
+        or candidate_is_better
+    ):
+        existing.receiver_card = candidate_receiver_card
+        updated = True
+    if _has_value(candidate_operator_raw) and (
+        not _has_value(existing.operator_raw)
+        or str(existing.operator_raw).upper() == "UNKNOWN"
+        or (_value_richness(candidate_operator_raw) > _value_richness(existing.operator_raw) and candidate_conf_is_better)
+        or candidate_is_better
+    ):
+        existing.operator_raw = candidate_operator_raw
+        updated = True
+    if candidate_is_p2p is not None and (existing.is_p2p is None or candidate_is_better):
+        existing.is_p2p = candidate_is_p2p
+        updated = True
+
+    if candidate_transaction_date and not existing.transaction_date:
+        existing.transaction_date = candidate_transaction_date
+        updated = True
+    elif candidate_transaction_date and existing.transaction_date:
+        same_minute = existing.transaction_date.strftime("%Y-%m-%d %H:%M") == candidate_transaction_date.strftime("%Y-%m-%d %H:%M")
+        better_second_precision = int(getattr(existing.transaction_date, "second", 0) or 0) == 0 and int(getattr(candidate_transaction_date, "second", 0) or 0) != 0
+        if same_minute and (
+            candidate_transaction_date.second != existing.transaction_date.second
+            and (better_second_precision or candidate_is_better)
+        ):
+            existing.transaction_date = candidate_transaction_date
+            updated = True
+
+    if len(candidate_raw_message or "") > len(existing.raw_message or ""):
+        existing.raw_message = candidate_raw_message
+        updated = True
+
+    if candidate_parsing_method and (not _has_value(existing.parsing_method) or candidate_is_better):
+        existing.parsing_method = candidate_parsing_method
+        updated = True
+
+    if candidate_source_type:
+        source_priority = {"MANUAL": 1, "SMS": 2, "AUTO": 3}
+        current_source = str(getattr(existing, "source_type", "MANUAL") or "MANUAL").upper()
+        candidate_source = str(candidate_source_type).upper()
+        current_score = source_priority.get(current_source, 0)
+        candidate_score = source_priority.get(candidate_source, 0)
+        if candidate_score and (candidate_is_better or current_score == 0) and candidate_score >= current_score:
+            existing.source_type = candidate_source
+            updated = True
+
+    existing.parsing_confidence = max(existing_conf, candidate_conf)
+    existing.is_gpt_parsed = bool(existing.is_gpt_parsed or candidate_is_gpt)
+    if updated:
+        existing.updated_at = datetime.utcnow()
+    return updated
 
 
 async def process_tdlib_message(
@@ -79,33 +340,49 @@ async def process_tdlib_message(
     file_id: Optional[int] = None
     mime_type: Optional[str] = None
     file_name: Optional[str] = None
+    image_file_id: Optional[int] = None
+    image_mime_type: Optional[str] = None
+    image_file_name: Optional[str] = None
     parsing_notes: Optional[str] = None
     caption = text
 
     document = message.get("document") or {}
+    photo = message.get("photo") or {}
     if document:
         mime_type = document.get("mime_type")
         file_name = document.get("file_name")
         file_id = document.get("file_id")
         text = text or ""
         if mime_type and mime_type != "application/pdf":
-            raise HTTPException(status_code=400, detail=f"Unsupported document type: {mime_type}")
+            if str(mime_type).lower().startswith("image/"):
+                image_file_id = file_id
+                image_mime_type = mime_type
+                image_file_name = file_name
+                file_id = None
+                mime_type = None
+                file_name = None
+            else:
+                raise HTTPException(status_code=400, detail=f"Unsupported document type: {mime_type}")
+
+    if photo and photo.get("file_id"):
+        image_file_id = photo.get("file_id")
+        image_mime_type = photo.get("mime_type") or "image/jpeg"
+        image_file_name = photo.get("file_name") or "photo.jpg"
 
     try:
         orchestrator = ParserOrchestrator(db)
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"Parser initialization failed: {exc}")
 
-    gpt_parser = orchestrator.gpt_parser
-
     raw_text_for_parser = text
     parsed: Optional[Dict[str, Any]] = None
-    vision_used = False
 
-    # Handle PDF documents
+    # Handle documents/images
     is_pdf = (mime_type or "").lower() == "application/pdf" or (file_name or "").lower().endswith(".pdf")
+    is_image = bool(image_file_id) or str(image_mime_type or "").lower().startswith("image/")
     extracted_text: Optional[str] = None
     pdf_path: Optional[str] = None
+    image_path: Optional[str] = None
 
     if is_pdf and file_id:
         try:
@@ -121,59 +398,65 @@ async def process_tdlib_message(
             raise HTTPException(status_code=404, detail="PDF file not found")
 
         try:
-            extracted_text = extract_text_from_pdf(pdf_path, max_pages=2)
-        except ImportError as exc:
-            raise HTTPException(status_code=500, detail=str(exc))
-        except Exception as exc:  # noqa: BLE001
-            parsing_notes = f"PDF text extraction failed: {exc}"
-            extracted_text = ""
-
-        combined_text = "\n\n".join([p for p in [caption, extracted_text] if p]).strip()
-        raw_text_for_parser = combined_text or caption or ""
-
-        # Try text-first parsing when we have meaningful text
-        if extracted_text and len(extracted_text) >= 80:
-            parsed = orchestrator.process(raw_text_for_parser)
-            conf = parsed.get("parsing_confidence") if parsed else None
-            if conf is None or conf < 0.75:
-                parsing_notes = (parsing_notes + "; " if parsing_notes else "") + "Text parse confidence low, trying vision"
-                parsed = None
-
-        # Vision fallback if text absent/short or parsing low confidence
-        if not parsed:
-            vision_used = True
             try:
-                images_b64 = render_pdf_pages_to_png_base64(pdf_path, max_pages=2, dpi=150)
+                extracted_text = extract_text_from_pdf(pdf_path, max_pages=2)
             except ImportError as exc:
                 raise HTTPException(status_code=500, detail=str(exc))
             except Exception as exc:  # noqa: BLE001
-                raise HTTPException(status_code=500, detail=f"Failed to render PDF: {exc}")
+                parsing_notes = f"PDF text extraction failed: {exc}"
+                extracted_text = ""
 
-            if not gpt_parser or not getattr(gpt_parser, "enabled", False):
-                raise HTTPException(
-                    status_code=503,
-                    detail="OpenAI API key not configured; cannot run vision parsing for PDF receipt",
-                )
+            combined_text = "\n\n".join([p for p in [caption, extracted_text] if p]).strip()
+            raw_text_for_parser = combined_text or caption or ""
 
-            parsed = gpt_parser.parse_from_images(images_b64, caption or extracted_text or "")
-            if not parsed:
-                raise HTTPException(status_code=422, detail="Cannot parse receipt from PDF images")
+            # Try text-first parsing when we have meaningful text
+            if extracted_text and len(extracted_text) >= 80:
+                parsed = orchestrator.process(raw_text_for_parser)
+                conf = parsed.get("parsing_confidence") if parsed else None
+                if conf is None or conf < 0.75:
+                    parsing_notes = (parsing_notes + "; " if parsing_notes else "") + "Text parse confidence low after OCR"
+                    parsed = None
+        finally:
+            try:
+                if pdf_path and os.path.isfile(pdf_path):
+                    os.unlink(pdf_path)
+            except Exception:
+                pass
 
-            # Apply operator mapping manually for vision path
-            if parsed.get("operator_raw") and orchestrator.operator_mapper:
-                try:
-                    match = orchestrator.operator_mapper.map_operator_details(parsed["operator_raw"])
-                    if match:
-                        parsed["application_mapped"] = match.get("application_name")
-                        if match.get("is_p2p") is not None:
-                            parsed["is_p2p"] = match.get("is_p2p")
-                    else:
-                        parsed["application_mapped"] = None
-                except Exception:
-                    parsed["application_mapped"] = None
+    elif is_image and image_file_id:
+        try:
+            image_path = await manager.download_file(image_file_id)
+        except TDLibUnavailableError as exc:
+            raise HTTPException(status_code=503, detail=str(exc))
+        except asyncio.TimeoutError:
+            raise HTTPException(status_code=504, detail="Timed out downloading image from TDLib")
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=500, detail=f"Failed to download image: {exc}")
 
+        if not image_path:
+            raise HTTPException(status_code=404, detail="Image file not found")
+
+        try:
+            extracted_text = extract_text_from_image_path(image_path)
+            combined_text = "\n\n".join([p for p in [caption, extracted_text] if p]).strip()
+            raw_text_for_parser = combined_text or caption or ""
+
+            if raw_text_for_parser:
+                parsed = orchestrator.process(raw_text_for_parser)
+                conf = parsed.get("parsing_confidence") if parsed else None
+                if conf is None or conf < 0.75:
+                    parsed = None
+
+            if not parsed and not raw_text_for_parser:
+                raise HTTPException(status_code=422, detail="Cannot parse receipt from screenshot")
             if not raw_text_for_parser:
-                raw_text_for_parser = caption or "[vision parsed PDF]"
+                raw_text_for_parser = caption or extracted_text or f"[screenshot:{image_file_name or 'image'}]"
+        finally:
+            try:
+                if image_path and os.path.isfile(image_path):
+                    os.unlink(image_path)
+            except Exception:
+                pass
 
     else:
         raw_text_for_parser = text
@@ -182,7 +465,7 @@ async def process_tdlib_message(
         parsed = orchestrator.process(raw_text_for_parser)
 
     if not parsed:
-        raise HTTPException(status_code=422, detail="Cannot parse receipt")
+        raise HTTPException(status_code=422, detail="Cannot parse receipt after OCR/text extraction")
 
     transaction_date = parsed.get("transaction_date")
     if isinstance(transaction_date, str):
@@ -198,6 +481,8 @@ async def process_tdlib_message(
         transaction_date = transaction_date.astimezone(tz)
     else:
         transaction_date = tz.localize(transaction_date)
+    # Strip timezone info so naive local time goes to DB without UTC conversion
+    transaction_date = transaction_date.replace(tzinfo=None)
 
     amount_val = parsed.get("amount")
     if amount_val is None:
@@ -213,27 +498,68 @@ async def process_tdlib_message(
     application_mapped = parsed.get("application_mapped")
     currency = parsed.get("currency") or "UZS"
 
-    is_gpt_parsed = (parsed.get("parsing_method") or "").upper().startswith("GPT")
+    legacy_ai_parsed_flag = (parsed.get("parsing_method") or "").upper().startswith("GPT")
     parsed_is_p2p = parsed.get("is_p2p")
 
-    # Compute fingerprint for duplicate detection
-    fp = compute_fingerprint(amount, transaction_date, card_last4)
-    
-    # Check if fingerprint already exists (duplicate content)
-    existing_by_fp = (
-        db.query(Transaction)
-        .filter(Transaction.fingerprint == fp)
-        .first()
+    # Compute fingerprint candidates for duplicate detection (legacy + v2 in dual mode).
+    fp_candidates = compute_fingerprint_candidates(
+        amount=amount,
+        transaction_date=transaction_date,
+        card_last4=card_last4,
+        operator_raw=operator_raw,
     )
+    fp = fp_candidates[0]
+
+    # Check duplicates by all candidates to keep backward compatibility during transition.
+    existing_by_fp = db.query(Transaction).filter(Transaction.fingerprint.in_(fp_candidates)).first()
     if existing_by_fp and not force:
+        original_method = getattr(existing_by_fp, "parsing_method", None)
+        original_conf = float(getattr(existing_by_fp, "parsing_confidence", 0.0) or 0.0)
+        merged = _merge_duplicate_transaction(
+            existing_by_fp,
+            candidate_transaction_date=transaction_date,
+            candidate_operator_raw=operator_raw,
+            candidate_application_mapped=application_mapped,
+            candidate_balance_after=balance_after,
+            candidate_receiver_name=parsed.get("receiver_name"),
+            candidate_receiver_card=parsed.get("receiver_card"),
+            candidate_raw_message=raw_text_for_parser,
+            candidate_is_p2p=parsed_is_p2p if parsed_is_p2p is not None else "P2P" in operator_raw.upper(),
+            candidate_parsing_method=parsed.get("parsing_method"),
+            candidate_parsing_confidence=parsed.get("parsing_confidence"),
+            candidate_is_gpt=legacy_ai_parsed_flag,
+            candidate_source_type="AUTO",
+        )
+        duplicate_log_payload = {
+            "fingerprint": fp,
+            "existing_transaction_id": int(existing_by_fp.id),
+            "source_chat_id": chat_id,
+            "source_message_id": message_id,
+            "merged": merged,
+            "candidate_method": parsed.get("parsing_method"),
+            "candidate_confidence": parsed.get("parsing_confidence"),
+            "existing_method": original_method,
+            "existing_confidence": original_conf,
+            "details": {
+                "original_method": original_method,
+                "original_confidence": original_conf,
+                "candidate_method": parsed.get("parsing_method"),
+                "candidate_confidence": parsed.get("parsing_confidence"),
+                "candidate_has_receiver": bool(parsed.get("receiver_name") or parsed.get("receiver_card")),
+                "candidate_has_balance": parsed.get("balance_after") is not None,
+            },
+        }
+        db.commit()
+        db.refresh(existing_by_fp)
+        asyncio.create_task(_append_duplicate_log_background(**duplicate_log_payload))
         return ProcessReceiptResponse(
             created=False,
             duplicate=True,
             transaction=build_transaction_response(existing_by_fp),
             parsing=ParsingInfo(
                 method=getattr(existing_by_fp, "parsing_method", None),
-                confidence=None,
-                notes="Duplicate detected by fingerprint",
+                confidence=getattr(existing_by_fp, "parsing_confidence", None),
+                notes="Duplicate detected by fingerprint; merged richer fields" if merged else "Duplicate detected by fingerprint",
             ),
         )
 
@@ -253,7 +579,7 @@ async def process_tdlib_message(
         raw_message=raw_text_for_parser,
         parsing_method=parsed.get("parsing_method"),
         parsing_confidence=parsed.get("parsing_confidence"),
-        is_gpt_parsed=is_gpt_parsed,
+        is_gpt_parsed=legacy_ai_parsed_flag,
         source_chat_id=int(chat_id),
         source_message_id=int(message_id),
         fingerprint=fp,

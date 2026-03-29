@@ -4,7 +4,8 @@ export type TableViewState = {
     columnOrder: string[];
     columnSizing: Record<string, number>;
     columnVisibility: Record<string, boolean>;
-    density: 'compact' | 'standard' | 'comfortable';
+    density: 'ultra-compact' | 'compact' | 'standard' | 'comfortable';
+    pinnedCount?: 0 | 1 | 2 | 3;
     activeFilters: any;
     globalFilter: string;
     columnStyles: Record<string, any>;
@@ -18,11 +19,12 @@ export type TableViewPreset = {
     createdAt: number;
 };
 
-const STORAGE_KEY = 'transactionTablePresets';
+const STORAGE_KEY_PREFIX = 'transactionTablePresets:v4';
+const DEFAULT_SCOPE = 'anonymous@unknown-host';
 
-const loadFromStorage = (): TableViewPreset[] => {
+const loadFromStorage = (storageKey: string): TableViewPreset[] => {
     try {
-        const raw = localStorage.getItem(STORAGE_KEY);
+        const raw = localStorage.getItem(storageKey);
         if (!raw) return [];
         const parsed = JSON.parse(raw);
         if (!Array.isArray(parsed)) return [];
@@ -32,16 +34,26 @@ const loadFromStorage = (): TableViewPreset[] => {
     }
 };
 
-const persist = (presets: TableViewPreset[]) => {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(presets));
+const persist = (storageKey: string, presets: TableViewPreset[]) => {
+    localStorage.setItem(storageKey, JSON.stringify(presets));
 };
 
-export const useTableViewPresets = () => {
-    const [presets, setPresets] = useState<TableViewPreset[]>(() => loadFromStorage());
+export const useTableViewPresets = (scopeKey?: string) => {
+    const resolvedScope = (scopeKey || '').trim() || DEFAULT_SCOPE;
+    const storageKey = useMemo(() => `${STORAGE_KEY_PREFIX}:${resolvedScope}`, [resolvedScope]);
+    const [presets, setPresets] = useState<TableViewPreset[]>(() => loadFromStorage(storageKey));
+    const [hydratedKey, setHydratedKey] = useState(storageKey);
+    const isHydrated = hydratedKey === storageKey;
 
     useEffect(() => {
-        persist(presets);
-    }, [presets]);
+        setPresets(loadFromStorage(storageKey));
+        setHydratedKey(storageKey);
+    }, [storageKey]);
+
+    useEffect(() => {
+        if (hydratedKey !== storageKey) return;
+        persist(storageKey, presets);
+    }, [storageKey, presets, hydratedKey]);
 
     const defaultPreset = useMemo(() => presets.find(p => p.isDefault), [presets]);
 
@@ -86,6 +98,7 @@ export const useTableViewPresets = () => {
     return {
         presets,
         defaultPreset,
+        isHydrated,
         savePreset,
         deletePreset,
         renamePreset,

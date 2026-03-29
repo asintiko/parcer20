@@ -14,14 +14,15 @@ import {
     ColumnOrderState,
     Header,
     PaginationState,
+    type ColumnPinningState,
 } from '@tanstack/react-table';
-import { useVirtualizer } from '@tanstack/react-virtual';
 import { Transaction } from '../services/api';
 import { formatDate, formatTime, formatDateTime, EMPTY_VALUE as DATE_EMPTY } from '../utils/dateTimeFormatters';
 import { ChevronUp, ChevronDown, Search, FileText, Filter, Eye, Undo2, Redo2, X, Trash2 } from 'lucide-react';
 import { ContextMenu } from './ContextMenu';
 import { FilterDrawer } from './FilterDrawer';
 import { EditableCell, CellType, SelectOption } from './EditableCell';
+import { EmptyState } from './ui';
 import { useInlineEdit } from '../hooks/useInlineEdit';
 import { useHistory, HistoryAction } from '../hooks/useHistory';
 import { useKeyboardShortcuts } from '../hooks/useKeyboardShortcuts';
@@ -29,6 +30,8 @@ import { useToast } from './Toast';
 import { transactionsApi } from '../services/api';
 import { useTableViewPresets, type TableViewState } from '../hooks/useTableViewPresets';
 import { exportTransactionsToExcel } from '../services/excelExport';
+import { formatAmount } from '../utils/formatAmount';
+import { OverflowTooltip } from './OverflowTooltip';
 
 // DnD Imports
 import {
@@ -39,6 +42,7 @@ import {
     useSensor,
     useSensors,
     DragEndEvent,
+    DragOverEvent,
 } from '@dnd-kit/core';
 import {
     arrayMove,
@@ -49,15 +53,29 @@ import {
 } from '@dnd-kit/sortable';
 import { CSS } from '@dnd-kit/utilities';
 
+type TableDensity = 'ultra-compact' | 'compact' | 'standard' | 'comfortable';
+
 interface TransactionTableProps {
     data: Transaction[];
     total: number;
     page: number;
     pageSize: number;
+    stateScopeKey: string;
+    resetViewStateToken?: number;
+    selectedYear: number | null;
+    availableYears: number[];
+    onYearChange: (year: number | null) => void;
+    serverModeActive?: boolean;
+    scrollToLastRowToken?: number;
     isLoading?: boolean;
     exportViewRows?: Transaction[];
     exportAllRows?: Transaction[];
+    onServerExportAll?: (columns?: string[]) => Promise<void> | void;
+    onServerExportByPeriod?: (dateFrom: string, dateTo: string, columns?: string[]) => Promise<void> | void;
     highlightRowId?: number | null;
+    highlightRowIds?: number[] | null;
+    focusColumnId?: string | null;
+    focusColumnToken?: number;
     onAddClick?: () => void;
     onTransactionsUpdated?: (txs: Transaction[]) => void;
     onTransactionsDeleted?: (ids: number[]) => void;
@@ -72,6 +90,7 @@ interface TransactionTableProps {
     onPageSizeChange: (size: number) => void;
     operatorOptions?: string[];
     appOptions?: string[];
+    telegramSourceOptions?: Array<{ chat_id: number; title: string; chat_type?: 'bot' | 'group' | 'supergroup' | 'channel' | 'private' | null; count: number }>;
     syncState?: {
         isSyncing?: boolean;
         progress?: { downloaded?: number; total?: number; status?: string };
@@ -89,15 +108,44 @@ interface CellStyle {
     fontWeight?: 'normal' | 'bold';
 }
 
-const ROW_HEIGHT_BY_DENSITY: Record<'compact' | 'standard' | 'comfortable', number> = {
+const VALID_DENSITIES: TableDensity[] = ['ultra-compact', 'compact', 'standard', 'comfortable'];
+const DEFAULT_TABLE_DENSITY: TableDensity = 'compact';
+const DEFAULT_PINNED_COUNT: 0 | 1 | 2 | 3 = 3;
+const MIN_PERSISTED_COLUMN_WIDTH = 20;
+const MAX_PERSISTED_COLUMN_WIDTH = 6000;
+const ROW_HEIGHT_BY_DENSITY: Record<TableDensity, number> = {
+    'ultra-compact': 22,
     compact: 28,
     standard: 40,
     comfortable: 52,
 };
-const VIRTUAL_WARN_THRESHOLD = 2000;
 const LOW_CONFIDENCE_THRESHOLD = 0.6;
-const LOCKED_COLUMNS = new Set(['row_number', 'day']);
-const TABLE_STATE_STORAGE_KEY = 'transactionsTableState:v1';
+const LOCKED_COLUMNS = new Set(['row_number']);
+const TABLE_STATE_STORAGE_VERSION = 'transactionsTableState:v6';
+const OPERATION_NUMBER_COLUMN_ID = 'operation_number';
+const OPERATION_NUMBER_ANCHOR_ID = 'row_number';
+const DEFAULT_SORTING_STATE: SortingState = [{ id: 'transaction_date', desc: false }];
+const DEFAULT_ACTIVE_FILTERS: ActiveFilters = { currency: 'ALL' };
+const DEFAULT_COLUMN_ORDER: string[] = [
+    'row_number',
+    'operation_number',
+    'date_time',
+    'transaction_date',
+    'time',
+    'day',
+    'operator_raw',
+    'application_mapped',
+    'receiver_name',
+    'receiver_card',
+    'amount',
+    'balance_after',
+    'card_last_4',
+    'is_p2p',
+    'transaction_type',
+    'currency',
+    'source_type',
+];
+const AVAILABLE_COLUMN_IDS = new Set(DEFAULT_COLUMN_ORDER);
 const TRANSACTION_TYPE_LABELS: Record<string, string> = {
     DEBIT: 'Списание',
     CREDIT: 'Пополнение',
@@ -114,11 +162,25 @@ const resolveTransactionTypeDisplay = (tx: Transaction) =>
     tx.transaction_type_display || TRANSACTION_TYPE_LABELS[tx.transaction_type] || tx.transaction_type;
 
 const resolveSourceDisplay = (tx: Transaction) => {
+    if (tx.source_chat_title) return tx.source_chat_title;
     if (tx.source_display) return tx.source_display;
     if (tx.source_channel && SOURCE_CHANNEL_LABELS[tx.source_channel]) return SOURCE_CHANNEL_LABELS[tx.source_channel];
     if (tx.source_type === 'MANUAL') return SOURCE_CHANNEL_LABELS.MANUAL;
     return SOURCE_CHANNEL_LABELS.SMS;
 };
+
+const buildDefaultColumnVisibility = (): Record<string, boolean> => {
+    const next: Record<string, boolean> = {};
+    LOCKED_COLUMNS.forEach((col) => {
+        next[col] = true;
+    });
+    next[OPERATION_NUMBER_COLUMN_ID] = true;
+    return next;
+};
+
+const buildDefaultSortingState = (): SortingState => DEFAULT_SORTING_STATE.map((item) => ({ ...item }));
+const buildDefaultColumnOrder = (): ColumnOrderState => [...DEFAULT_COLUMN_ORDER];
+const buildDefaultActiveFilters = (): ActiveFilters => ({ ...DEFAULT_ACTIVE_FILTERS });
 
 type ActiveFilters = {
     dateFrom?: string;
@@ -131,6 +193,7 @@ type ActiveFilters = {
     operators?: string[];
     apps?: string[];
     sourceType?: 'ALL' | 'TELEGRAM' | 'SMS' | 'MANUAL';
+    telegramSourceIds?: number[];
     cardId?: string;
 };
 
@@ -140,11 +203,13 @@ const DraggableTableHeader = ({
     children,
     onContextMenu,
     paddingClass,
+    pinnedStyle,
 }: {
     header: Header<Transaction, unknown>;
     children: React.ReactNode;
     onContextMenu: (e: React.MouseEvent) => void;
     paddingClass: string;
+    pinnedStyle?: CSSProperties;
 }) => {
     const {
         attributes,
@@ -158,24 +223,27 @@ const DraggableTableHeader = ({
     });
 
     const style: React.CSSProperties = {
-        transform: CSS.Translate.toString(transform),
+        transform: isDragging && transform ? CSS.Translate.toString(transform) : undefined,
         transition,
         width: header.getSize(),
+        minWidth: typeof header.column.columnDef.minSize === 'number' ? header.column.columnDef.minSize : undefined,
+        maxWidth: typeof header.column.columnDef.maxSize === 'number' ? header.column.columnDef.maxSize : undefined,
         zIndex: isDragging ? 100 : 'auto',
         opacity: isDragging ? 0.8 : 1,
+        ...(pinnedStyle || {}),
     };
 
     return (
         <th
             ref={setNodeRef}
             style={style}
-            className={`relative group bg-table-header font-semibold text-foreground border border-table-border select-none ${paddingClass} ${isDragging ? 'shadow-xl bg-primary-light border-primary z-50' : ''}`}
+            className={`relative group bg-table-header font-semibold text-foreground border border-table-border select-none ${isDragging ? 'shadow-xl bg-primary-light border-primary z-50' : ''}`}
             onContextMenu={onContextMenu}
         >
             <div
                 {...attributes}
                 {...listeners}
-                className="px-2 py-1 h-full w-full cursor-grab active:cursor-grabbing"
+                className={`${paddingClass} h-full w-full min-w-0 cursor-grab active:cursor-grabbing truncate`}
             >
                 {children}
             </div>
@@ -196,10 +264,22 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
     total,
     page,
     pageSize,
+    stateScopeKey,
+    resetViewStateToken,
+    selectedYear,
+    availableYears,
+    onYearChange,
+    serverModeActive = false,
+    scrollToLastRowToken = 0,
     isLoading,
     exportViewRows,
     exportAllRows,
+    onServerExportAll,
+    onServerExportByPeriod,
     highlightRowId,
+    highlightRowIds,
+    focusColumnId,
+    focusColumnToken,
     onAddClick,
     onTransactionsUpdated,
     onTransactionsDeleted,
@@ -209,26 +289,33 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
     onPageSizeChange,
     operatorOptions = [],
     appOptions = [],
+    telegramSourceOptions = [],
     syncState,
 }) => {
-    const [sorting, setSorting] = useState<SortingState>([{ id: 'transaction_date', desc: false }]);
+    const [sorting, setSorting] = useState<SortingState>(() => buildDefaultSortingState());
     const [columnFilters, setColumnFilters] = useState<ColumnFiltersState>([]);
-    const [columnOrder, setColumnOrder] = useState<ColumnOrderState>([]);
-    const [columnVisibility, setColumnVisibility] = useState<Record<string, boolean>>({});
+    const [columnOrder, setColumnOrder] = useState<ColumnOrderState>(() => buildDefaultColumnOrder());
+    const [columnVisibility, setColumnVisibility] = useState<Record<string, boolean>>(() => buildDefaultColumnVisibility());
     const [columnSizing, setColumnSizing] = useState<Record<string, number>>({});
 
     // Search State
     const [globalFilter, setGlobalFilter] = useState('');
     const [searchValue, setSearchValue] = useState('');
     const [searchHelpOpen, setSearchHelpOpen] = useState(false);
-    const [density, setDensity] = useState<'compact' | 'standard' | 'comfortable'>('standard');
+    const [density, setDensity] = useState<TableDensity>(DEFAULT_TABLE_DENSITY);
+    const [pinnedCount, setPinnedCount] = useState<0 | 1 | 2 | 3>(DEFAULT_PINNED_COUNT);
+    const [serverExportPending, setServerExportPending] = useState(false);
     const [viewMenuOpen, setViewMenuOpen] = useState(false);
     const [exportMenuOpen, setExportMenuOpen] = useState(false);
+    const [exportPeriodOpen, setExportPeriodOpen] = useState(false);
+    const [exportDateFrom, setExportDateFrom] = useState('');
+    const [exportDateTo, setExportDateTo] = useState('');
     const [presetName, setPresetName] = useState('');
+    const [highlightedColumnId, setHighlightedColumnId] = useState<string | null>(null);
 
     // Advanced Filters State
     const [filterDrawerOpen, setFilterDrawerOpen] = useState(false);
-    const [activeFilters, setActiveFilters] = useState<ActiveFilters>({ currency: 'ALL' }); // Default all currencies
+    const [activeFilters, setActiveFilters] = useState<ActiveFilters>(() => buildDefaultActiveFilters());
     const activeFilterCount = Object.keys(activeFilters).filter(k => {
         const v = (activeFilters as any)[k];
         if (k === 'currency') return false; // Don't count currency as active filter
@@ -240,19 +327,53 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
 
     const appliedDefaultStateRef = React.useRef(false);
     const restoredStateRef = React.useRef(false);
-    const loadAttemptedRef = React.useRef(false);
+    const hydrationSettledRef = React.useRef(false);
+    const lastResetTokenRef = React.useRef<number | undefined>(resetViewStateToken);
     const saveTimeoutRef = React.useRef<number | null>(null);
     const searchHelpRef = useRef<HTMLDivElement | null>(null);
     const exportMenuRef = useRef<HTMLDivElement | null>(null);
     const viewMenuRef = useRef<HTMLDivElement | null>(null);
+    const normalizedHighlightRowIds = useMemo(
+        () =>
+            Array.from(
+                new Set(
+                    [highlightRowId, ...(highlightRowIds || [])]
+                        .map((value) => Number(value))
+                        .filter((value) => Number.isFinite(value) && value > 0),
+                ),
+            ),
+        [highlightRowId, highlightRowIds],
+    );
+    const tableStateStorageKey = useMemo(
+        () => `${TABLE_STATE_STORAGE_VERSION}:${stateScopeKey}`,
+        [stateScopeKey],
+    );
 
     const ensureLockedVisibility = useCallback((visibility: Record<string, boolean>) => {
-        const next = { ...visibility };
-        LOCKED_COLUMNS.forEach(col => {
-            next[col] = true;
-        });
+        const next = { ...buildDefaultColumnVisibility(), ...visibility };
         return next;
     }, []);
+
+    useEffect(() => {
+        if (!focusColumnId || !focusColumnToken || !AVAILABLE_COLUMN_IDS.has(focusColumnId)) return;
+        setColumnVisibility((prev) => ensureLockedVisibility({ ...prev, [focusColumnId]: true }));
+        setHighlightedColumnId(focusColumnId);
+        const timer = window.setTimeout(() => setHighlightedColumnId((current) => (current === focusColumnId ? null : current)), 3500);
+        return () => window.clearTimeout(timer);
+    }, [ensureLockedVisibility, focusColumnId, focusColumnToken]);
+
+    useEffect(() => {
+        if (!normalizedHighlightRowIds.length || !tableContainerRef.current) return;
+        const viewport = tableContainerRef.current;
+        const selector = normalizedHighlightRowIds
+            .map((value) => `tr[data-rowid="${value}"]`)
+            .join(', ');
+        const target = viewport.querySelector<HTMLTableRowElement>(selector);
+        if (!target) return;
+        window.requestAnimationFrame(() => {
+            target.scrollIntoView({ behavior: 'smooth', block: 'center', inline: 'nearest' });
+        });
+    }, [data.length, normalizedHighlightRowIds]);
 
     // Debounce Search
     useEffect(() => {
@@ -271,6 +392,7 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
             }
             if (exportMenuOpen && exportMenuRef.current && !exportMenuRef.current.contains(target)) {
                 setExportMenuOpen(false);
+                setExportPeriodOpen(false);
             }
             if (viewMenuOpen && viewMenuRef.current && !viewMenuRef.current.contains(target)) {
                 setViewMenuOpen(false);
@@ -281,11 +403,25 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
     }, [searchHelpOpen, exportMenuOpen, viewMenuOpen]);
 
     const sortFieldMap = useMemo<Record<string, string>>(() => ({
+        operation_number: 'transaction_date',
         date_time: 'transaction_date',
         transaction_date: 'transaction_date',
+        time: 'transaction_date',
+        day: 'transaction_date',
         amount: 'amount',
+        balance_after: 'balance_after',
+        operator_raw: 'operator_raw',
+        application_mapped: 'application_mapped',
+        receiver_name: 'receiver_name',
+        receiver_card: 'receiver_card',
+        card_last_4: 'card_last_4',
+        is_p2p: 'is_p2p',
+        transaction_type: 'transaction_type',
+        currency: 'currency',
+        source_type: 'source_type',
         created_at: 'created_at',
         parsing_confidence: 'parsing_confidence',
+        updated_at: 'updated_at',
     }), []);
 
     useEffect(() => {
@@ -308,9 +444,45 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
     const [isSelecting, setIsSelecting] = useState(false);
     const [selectionStart, setSelectionStart] = useState<{ rowId: string; colId: string; rowPos: number; colPos: number } | null>(null);
     const [detailRow, setDetailRow] = useState<Transaction | null>(null);
+    const [detailRawMessage, setDetailRawMessage] = useState<string | null>(null);
+    const [detailRawLoading, setDetailRawLoading] = useState(false);
 
     // Context Menu State
     const [contextMenu, setContextMenu] = useState<{ x: number; y: number; targetIdx: string; type: 'header' | 'cell' } | null>(null);
+
+    useEffect(() => {
+        if (!detailRow) {
+            setDetailRawMessage(null);
+            setDetailRawLoading(false);
+            return;
+        }
+        if (detailRow.raw_message) {
+            setDetailRawMessage(detailRow.raw_message);
+            setDetailRawLoading(false);
+            return;
+        }
+
+        let cancelled = false;
+        setDetailRawLoading(true);
+        transactionsApi
+            .getTransaction(detailRow.id)
+            .then((fullRow) => {
+                if (cancelled) return;
+                setDetailRawMessage(fullRow.raw_message || null);
+            })
+            .catch(() => {
+                if (cancelled) return;
+                setDetailRawMessage(null);
+            })
+            .finally(() => {
+                if (cancelled) return;
+                setDetailRawLoading(false);
+            });
+
+        return () => {
+            cancelled = true;
+        };
+    }, [detailRow]);
 
     // Toast for notifications
     const { showToast } = useToast();
@@ -323,30 +495,7 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
             }
         },
     });
-    const { presets, defaultPreset, savePreset, deletePreset, renamePreset, setDefaultPreset, getPreset } = useTableViewPresets();
-
-    const captureCurrentViewState = useCallback((): TableViewState => ({
-        columnOrder,
-        columnSizing,
-        columnVisibility: ensureLockedVisibility(columnVisibility),
-        density,
-        activeFilters,
-        globalFilter,
-        columnStyles,
-        cellStyles,
-    }), [activeFilters, cellStyles, columnOrder, columnSizing, columnStyles, columnVisibility, density, ensureLockedVisibility, globalFilter]);
-
-    const applyPresetState = useCallback((state: TableViewState) => {
-        setColumnOrder(state.columnOrder || []);
-        setColumnVisibility(ensureLockedVisibility(state.columnVisibility || {}));
-        setColumnSizing(state.columnSizing || {});
-        setDensity(state.density || 'standard');
-        setActiveFilters(state.activeFilters || {});
-        setSearchValue(state.globalFilter || '');
-        setGlobalFilter(state.globalFilter || '');
-        setColumnStyles(state.columnStyles || {});
-        setCellStyles(state.cellStyles || {});
-    }, [ensureLockedVisibility]);
+    const { presets, defaultPreset, isHydrated: presetsHydrated, savePreset, deletePreset, renamePreset, setDefaultPreset, getPreset } = useTableViewPresets(stateScopeKey);
 
     // History Hook (Undo/Redo)
     const { addAction, undo, redo, canUndo, canRedo } = useHistory({
@@ -377,6 +526,15 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
     });
 
     const tableContainerRef = useRef<HTMLDivElement>(null);
+    const temporaryExpandedColumnRef = useRef<{ columnId: string; previousSize: number } | null>(null);
+    const textMeasureCanvasRef = useRef<HTMLCanvasElement | null>(null);
+    const pendingScrollModeRef = useRef<'top' | 'bottom' | null>(null);
+    const lastAppliedScrollTokenRef = useRef<number>(0);
+
+    const scrollViewport = useCallback((mode: 'top' | 'bottom') => {
+        if (!tableContainerRef.current) return;
+        tableContainerRef.current.scrollTop = mode === 'bottom' ? tableContainerRef.current.scrollHeight : 0;
+    }, []);
 
     // Wrap saveEdit to track history
     const saveEdit = useCallback(
@@ -412,13 +570,36 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
                 id: 'row_number',
                 header: '№',
                 size: 60,
-                cell: (info) => <div className="font-mono text-table-xs">{(page - 1) * pageSize + info.row.index + 1}</div>,
+                enableSorting: false,
+                cell: (info) => {
+                    const rowNumber = Math.max(0, (page - 1) * pageSize) + info.row.index + 1;
+                    return <div className="font-mono text-table-xs">{rowNumber}</div>;
+                },
+            },
+            {
+                accessorFn: (row) => row.transaction_date ? new Date(row.transaction_date) : null,
+                id: 'operation_number',
+                header: '№ опер.',
+                size: 78,
+                minSize: 58,
+                cell: (info) => {
+                    const start = Math.max(0, (page - 1) * pageSize);
+                    const sortId = sorting[0]?.id;
+                    const isDateLinkedDescending =
+                        Boolean(sorting[0]?.desc) &&
+                        ['operation_number', 'date_time', 'transaction_date', 'time', 'day'].includes(sortId || '');
+                    const operationNumber = isDateLinkedDescending
+                        ? Math.max(total - start - info.row.index, 0)
+                        : start + info.row.index + 1;
+                    return <div className="font-mono text-table-xs">{operationNumber}</div>;
+                },
             },
             {
                 accessorFn: (row) => row.transaction_date ? new Date(row.transaction_date) : null,
                 id: 'date_time',
-                header: 'Дата и Время',
-                size: 140,
+                header: () => <div className="min-w-0 truncate">Дата и Время</div>,
+                size: 115,
+                minSize: 20,
                 cell: (info) => {
                     const date = info.getValue();
                     return <div className="font-mono text-table-xs">{formatDateTime(date)}</div>;
@@ -461,60 +642,84 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
             {
                 accessorKey: 'operator_raw',
                 id: 'operator_raw',
-                header: 'Оператор/Продавец',
-                size: 200,
-                cell: (info) => (
-                    <div className="truncate text-table-xs" title={info.getValue() as string}>
-                        {info.getValue() as string || '—'}
-                    </div>
-                ),
+                header: () => <div className="min-w-0 truncate">Оператор/Продавец</div>,
+                size: 140,
+                minSize: 20,
+                cell: (info) => {
+                    const operatorText = (info.getValue() as string | null)?.trim() || '';
+                    if (!operatorText) {
+                        return <div className="min-w-0 w-full truncate text-table-xs">—</div>;
+                    }
+                    return (
+                        <OverflowTooltip text={operatorText} className="block min-w-0 w-full truncate text-table-xs">
+                            {operatorText}
+                        </OverflowTooltip>
+                    );
+                },
             },
             {
                 accessorKey: 'application_mapped',
                 id: 'application_mapped',
-                header: 'Приложение',
+                header: () => <div className="min-w-0 truncate">Приложение</div>,
                 size: 120,
-                cell: (info) => (
-                    <div className="font-medium">
-                        {info.getValue() as string || '—'}
-                    </div>
-                ),
+                minSize: 20,
+                cell: (info) => {
+                    const value = (info.getValue() as string | null)?.trim() || '';
+                    if (!value) return <div className="min-w-0 w-full truncate text-table-xs">—</div>;
+                    return (
+                        <OverflowTooltip text={value} className="block min-w-0 w-full truncate font-medium text-table-xs">
+                            {value}
+                        </OverflowTooltip>
+                    );
+                },
             },
             {
                 accessorKey: 'receiver_name',
                 id: 'receiver_name',
-                header: 'Получатель',
-                size: 220,
-                cell: (info) => (
-                    <div className="truncate text-table-xs" title={info.getValue() as string}>
-                        {info.getValue() as string || '—'}
-                    </div>
-                ),
+                header: () => <div className="min-w-0 truncate">Получатель</div>,
+                size: 150,
+                minSize: 20,
+                cell: (info) => {
+                    const value = (info.getValue() as string | null)?.trim() || '';
+                    if (!value) return <div className="min-w-0 w-full truncate text-table-xs">—</div>;
+                    return (
+                        <OverflowTooltip text={value} className="block min-w-0 w-full truncate text-table-xs">
+                            {value}
+                        </OverflowTooltip>
+                    );
+                },
             },
             {
                 accessorKey: 'receiver_card',
                 id: 'receiver_card',
-                header: 'Карта получателя',
-                size: 160,
-                cell: (info) => (
-                    <div className="font-mono text-table-xs">
-                        {info.getValue() as string || '—'}
-                    </div>
-                ),
+                header: () => <div className="min-w-0 truncate">Карта получателя</div>,
+                size: 120,
+                minSize: 20,
+                cell: (info) => {
+                    const value = (info.getValue() as string | null)?.trim() || '';
+                    if (!value) return <div className="min-w-0 w-full truncate font-mono text-table-xs">—</div>;
+                    return (
+                        <OverflowTooltip text={value} className="block min-w-0 w-full truncate font-mono text-table-xs">
+                            {value}
+                        </OverflowTooltip>
+                    );
+                },
             },
             {
                 accessorKey: 'amount',
                 id: 'amount',
                 header: 'Сумма',
-                size: 120,
+                size: 100,
+                minSize: 30,
                 cell: (info) => {
                     const amount = parseFloat(info.getValue() as string);
                     if (isNaN(amount)) return <div className="font-mono font-medium">—</div>;
+                    const formattedAmount = formatAmount(amount);
 
                     return (
-                        <div className="font-mono font-medium">
-                            {Math.abs(amount).toFixed(2).replace('.', ',')}
-                        </div>
+                        <OverflowTooltip text={formattedAmount} className="block min-w-0 w-full truncate font-mono font-medium text-table-xs">
+                            {formattedAmount}
+                        </OverflowTooltip>
                     );
                 },
             },
@@ -528,10 +733,11 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
                     if (!balance) return <div className="text-foreground-muted">—</div>;
                     const balanceNum = parseFloat(balance);
                     if (isNaN(balanceNum)) return <div className="text-foreground-muted">—</div>;
+                    const formattedBalance = formatAmount(balanceNum);
                     return (
-                        <div className="font-mono text-table-xs">
-                            {Math.abs(balanceNum).toFixed(2).replace('.', ',')}
-                        </div>
+                        <OverflowTooltip text={formattedBalance} className="block min-w-0 w-full truncate font-mono text-table-xs">
+                            {formattedBalance}
+                        </OverflowTooltip>
                     );
                 },
             },
@@ -560,13 +766,18 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
             {
                 accessorKey: 'transaction_type',
                 id: 'transaction_type',
-                header: 'Тип',
+                header: () => <div className="min-w-0 truncate">Тип</div>,
                 size: 80,
-                cell: (info) => (
-                    <div className="text-table-xs">
-                        {resolveTransactionTypeDisplay(info.row.original)}
-                    </div>
-                ),
+                minSize: 20,
+                cell: (info) => {
+                    const value = resolveTransactionTypeDisplay(info.row.original) || '—';
+                    if (value === '—') return <div className="min-w-0 w-full truncate text-table-xs">—</div>;
+                    return (
+                        <OverflowTooltip text={value} className="block min-w-0 w-full truncate text-table-xs">
+                            {value}
+                        </OverflowTooltip>
+                    );
+                },
             },
             {
                 accessorKey: 'currency',
@@ -578,29 +789,21 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
             {
                 accessorKey: 'source_type',
                 id: 'source_type',
-                header: 'Источник',
+                header: () => <div className="min-w-0 truncate">Источник</div>,
                 size: 80,
-                cell: (info) => (
-                    <div className="text-table-xs">
-                        {resolveSourceDisplay(info.row.original) || '—'}
-                    </div>
-                ),
-            },
-            {
-                id: 'details',
-                header: '',
-                size: 80,
-                cell: (info) => (
-                    <button
-                        className="px-2 py-1 text-xs bg-surface-2 border border-border rounded hover:bg-surface-3 focus:outline-none focus:ring-2 focus:ring-primary"
-                        onClick={() => setDetailRow(info.row.original)}
-                    >
-                        Детали
-                    </button>
-                ),
+                minSize: 20,
+                cell: (info) => {
+                    const value = resolveSourceDisplay(info.row.original) || '—';
+                    if (value === '—') return <div className="min-w-0 w-full truncate text-table-xs">—</div>;
+                    return (
+                        <OverflowTooltip text={value} className="block min-w-0 w-full truncate text-table-xs">
+                            {value}
+                        </OverflowTooltip>
+                    );
+                },
             },
         ],
-        [page, pageSize]
+        [page, pageSize, sorting, total]
     );
 
     // Column Type Mapping for Inline Editing
@@ -631,72 +834,208 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
         currency: ['UZS', 'USD'],
         source_type: [
             { value: 'AUTO', label: 'Авто' },
+            { value: 'SMS', label: 'СМС' },
             { value: 'MANUAL', label: 'Ручной' },
         ],
     }), []);
 
     const ensureColumnOrderComplete = useCallback((order: string[]) => {
-        const allIds = columns.map(c => c.id as string);
-        const filtered = order.filter((id) => allIds.includes(id));
-        const missing = allIds.filter((id) => !filtered.includes(id));
-        return [...filtered, ...missing];
-    }, [columns]);
-
-    // Initial load column order
-    React.useEffect(() => {
-        if (columnOrder.length === 0) {
-            setColumnOrder(columns.map(c => c.id as string));
-        } else {
-            setColumnOrder(prev => ensureColumnOrderComplete(prev));
+        const filtered = order.filter((id) => AVAILABLE_COLUMN_IDS.has(id));
+        const normalized = [...filtered];
+        if (!normalized.includes(OPERATION_NUMBER_COLUMN_ID)) {
+            const anchorIndex = normalized.indexOf(OPERATION_NUMBER_ANCHOR_ID);
+            if (anchorIndex >= 0) {
+                normalized.splice(anchorIndex + 1, 0, OPERATION_NUMBER_COLUMN_ID);
+            } else {
+                normalized.unshift(OPERATION_NUMBER_COLUMN_ID);
+            }
         }
-    }, [columns, columnOrder.length, ensureColumnOrderComplete]);
+        const missing = DEFAULT_COLUMN_ORDER.filter((id) => !normalized.includes(id));
+        return [...normalized, ...missing];
+    }, []);
 
-    // Apply default preset on mount
-    React.useEffect(() => {
-        if (defaultPreset && !restoredStateRef.current) {
-            applyPresetState(defaultPreset.state);
+    const normalizeDensity = useCallback((value: unknown): TableDensity => {
+        return VALID_DENSITIES.includes(value as TableDensity)
+            ? value as TableDensity
+            : DEFAULT_TABLE_DENSITY;
+    }, []);
+
+    const normalizePinnedCount = useCallback((value: unknown): 0 | 1 | 2 | 3 => {
+        const nextPinned = Number(value);
+        if (Number.isFinite(nextPinned) && nextPinned >= 0 && nextPinned <= 3) {
+            return nextPinned as 0 | 1 | 2 | 3;
         }
-    }, [defaultPreset, applyPresetState]);
+        return DEFAULT_PINNED_COUNT;
+    }, []);
 
-    // Restore from localStorage
+    const normalizeColumnSizing = useCallback((value: unknown): Record<string, number> => {
+        if (!value || typeof value !== 'object') return {};
+        return Object.fromEntries(
+            Object.entries(value as Record<string, unknown>)
+                .filter(([columnId, width]) => (
+                    AVAILABLE_COLUMN_IDS.has(columnId) &&
+                    Number.isFinite(width) &&
+                    Number(width) >= MIN_PERSISTED_COLUMN_WIDTH &&
+                    Number(width) <= MAX_PERSISTED_COLUMN_WIDTH
+                ))
+                .map(([columnId, width]) => [columnId, Math.round(Number(width))])
+        );
+    }, []);
+
+    const normalizeColumnVisibility = useCallback((value: unknown): Record<string, boolean> => {
+        if (!value || typeof value !== 'object') {
+            return buildDefaultColumnVisibility();
+        }
+        const normalized = Object.fromEntries(
+            Object.entries(value as Record<string, unknown>)
+                .filter(([columnId, isVisible]) => AVAILABLE_COLUMN_IDS.has(columnId) && typeof isVisible === 'boolean')
+                .map(([columnId, isVisible]) => [columnId, Boolean(isVisible)])
+        );
+        return ensureLockedVisibility(normalized);
+    }, [ensureLockedVisibility]);
+
+    const normalizeSortingState = useCallback((value: unknown): SortingState => {
+        if (!Array.isArray(value)) {
+            return buildDefaultSortingState();
+        }
+        const normalized = value
+            .filter((item): item is { id: string; desc?: boolean } => Boolean(item && typeof item === 'object' && typeof (item as any).id === 'string'))
+            .map((item) => ({ id: item.id, desc: Boolean(item.desc) }))
+            .filter((item) => AVAILABLE_COLUMN_IDS.has(item.id));
+        return normalized.length > 0 ? normalized : buildDefaultSortingState();
+    }, []);
+
+    const applySafeDefaults = useCallback(() => {
+        setSorting(buildDefaultSortingState());
+        setColumnFilters([]);
+        setColumnOrder(buildDefaultColumnOrder());
+        setColumnVisibility(buildDefaultColumnVisibility());
+        setColumnSizing({});
+        setDensity(DEFAULT_TABLE_DENSITY);
+        setPinnedCount(DEFAULT_PINNED_COUNT);
+        setGlobalFilter('');
+        setSearchValue('');
+        setActiveFilters(buildDefaultActiveFilters());
+        setColumnStyles({});
+        setCellStyles({});
+    }, []);
+
+    const captureCurrentViewState = useCallback((): TableViewState => ({
+        columnOrder,
+        columnSizing,
+        columnVisibility: ensureLockedVisibility(columnVisibility),
+        density,
+        pinnedCount,
+        activeFilters,
+        globalFilter,
+        columnStyles,
+        cellStyles,
+    }), [activeFilters, cellStyles, columnOrder, columnSizing, columnStyles, columnVisibility, density, ensureLockedVisibility, globalFilter, pinnedCount]);
+
+    const applyPresetState = useCallback((state: TableViewState) => {
+        const nextOrder = Array.isArray(state?.columnOrder) ? state.columnOrder.filter((id) => AVAILABLE_COLUMN_IDS.has(id)) : [];
+        setColumnOrder(ensureColumnOrderComplete(nextOrder));
+        setColumnVisibility(normalizeColumnVisibility(state?.columnVisibility));
+        setColumnSizing(normalizeColumnSizing(state?.columnSizing));
+        setDensity(normalizeDensity(state?.density));
+        setPinnedCount(normalizePinnedCount(state?.pinnedCount));
+        setActiveFilters({ ...buildDefaultActiveFilters(), ...((state?.activeFilters && typeof state.activeFilters === 'object') ? state.activeFilters : {}) });
+        const nextGlobalFilter = typeof state?.globalFilter === 'string' ? state.globalFilter : '';
+        setSearchValue(nextGlobalFilter);
+        setGlobalFilter(nextGlobalFilter);
+        setColumnStyles((state?.columnStyles && typeof state.columnStyles === 'object') ? state.columnStyles : {});
+        setCellStyles((state?.cellStyles && typeof state.cellStyles === 'object') ? state.cellStyles : {});
+    }, [
+        ensureColumnOrderComplete,
+        normalizeColumnSizing,
+        normalizeColumnVisibility,
+        normalizeDensity,
+        normalizePinnedCount,
+    ]);
+
+    useEffect(() => {
+        applySafeDefaults();
+        appliedDefaultStateRef.current = false;
+        restoredStateRef.current = false;
+        hydrationSettledRef.current = false;
+    }, [tableStateStorageKey, applySafeDefaults]);
+
     React.useEffect(() => {
-        if (loadAttemptedRef.current) return;
-        loadAttemptedRef.current = true;
+        if (hydrationSettledRef.current) return;
+
         try {
-            const raw = localStorage.getItem(TABLE_STATE_STORAGE_KEY);
-            if (!raw) return;
-            const stored = JSON.parse(raw);
-            if (stored.sorting) setSorting(stored.sorting);
-            if (stored.columnOrder) setColumnOrder(ensureColumnOrderComplete(stored.columnOrder));
-            if (stored.columnVisibility) setColumnVisibility(ensureLockedVisibility(stored.columnVisibility));
-            if (stored.columnSizing) setColumnSizing(stored.columnSizing);
-            if (stored.density) setDensity(stored.density);
-            if (stored.globalFilter !== undefined) {
-                setGlobalFilter(stored.globalFilter);
-                setSearchValue(stored.globalFilter);
+            const raw = localStorage.getItem(tableStateStorageKey);
+            if (raw) {
+                const stored = JSON.parse(raw);
+                setSorting(normalizeSortingState(stored?.sorting));
+                setColumnOrder(
+                    ensureColumnOrderComplete(
+                        Array.isArray(stored?.columnOrder)
+                            ? stored.columnOrder.filter((id: unknown): id is string => typeof id === 'string' && AVAILABLE_COLUMN_IDS.has(id))
+                            : []
+                    )
+                );
+                setColumnVisibility(normalizeColumnVisibility(stored?.columnVisibility));
+                setColumnSizing(normalizeColumnSizing(stored?.columnSizing));
+                setDensity(normalizeDensity(stored?.density));
+                setPinnedCount(normalizePinnedCount(stored?.pinnedCount));
+                const nextGlobalFilter = typeof stored?.globalFilter === 'string' ? stored.globalFilter : '';
+                setGlobalFilter(nextGlobalFilter);
+                setSearchValue(nextGlobalFilter);
+                setActiveFilters({
+                    ...buildDefaultActiveFilters(),
+                    ...((stored?.activeFilters && typeof stored.activeFilters === 'object') ? stored.activeFilters : {}),
+                });
+                setColumnStyles((stored?.columnStyles && typeof stored.columnStyles === 'object') ? stored.columnStyles : {});
+                setCellStyles((stored?.cellStyles && typeof stored.cellStyles === 'object') ? stored.cellStyles : {});
+                if (Number.isFinite(stored?.pageSize) && stored.pageSize > 0 && stored.pageSize !== pageSize) {
+                    onPageSizeChange(stored.pageSize);
+                }
+                restoredStateRef.current = true;
+                appliedDefaultStateRef.current = true;
+                hydrationSettledRef.current = true;
+                return;
             }
-            if (stored.activeFilters) {
-                const restoredFilters = { currency: 'UZS', ...stored.activeFilters };
-                setActiveFilters(restoredFilters);
-            }
-            if (stored.columnStyles) setColumnStyles(stored.columnStyles);
-            if (stored.cellStyles) setCellStyles(stored.cellStyles);
-            if (stored.pageSize && stored.pageSize !== pageSize) {
-                onPageSizeChange(stored.pageSize);
-            }
-            if (stored.pageIndex !== undefined) {
-                onPageChange((stored.pageIndex || 0) + 1);
-            }
-            restoredStateRef.current = true;
-            appliedDefaultStateRef.current = true;
         } catch (error) {
+            try {
+                localStorage.removeItem(tableStateStorageKey);
+            } catch {
+                // no-op
+            }
             console.warn('Failed to restore table state', error);
         }
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, []);
+        if (!presetsHydrated) return;
+
+        if (defaultPreset) {
+            applyPresetState(defaultPreset.state);
+            appliedDefaultStateRef.current = true;
+        }
+        hydrationSettledRef.current = true;
+    }, [
+        tableStateStorageKey,
+        defaultPreset,
+        presetsHydrated,
+        pageSize,
+        onPageSizeChange,
+        applyPresetState,
+        ensureColumnOrderComplete,
+        normalizeColumnSizing,
+        normalizeColumnVisibility,
+        normalizeDensity,
+        normalizePinnedCount,
+        normalizeSortingState,
+    ]);
 
     // Manual Global Filter & Advanced Filters
     const paginationState = useMemo(() => ({ pageIndex: Math.max(page - 1, 0), pageSize }), [page, pageSize]);
+    const leftPinnedColumns = useMemo(() => {
+        const orderedIds = ensureColumnOrderComplete(
+            columnOrder.length > 0 ? columnOrder : columns.map((column) => column.id as string)
+        );
+        const visibleOrderedIds = orderedIds.filter((columnId) => columnVisibility[columnId] !== false);
+        return visibleOrderedIds.slice(0, pinnedCount);
+    }, [columnOrder, columns, columnVisibility, ensureColumnOrderComplete, pinnedCount]);
+    const columnPinning = useMemo<ColumnPinningState>(() => ({ left: [...leftPinnedColumns], right: [] }), [leftPinnedColumns]);
 
     const table = useReactTable({
         data,
@@ -707,12 +1046,14 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
             columnOrder,
             columnVisibility,
             columnSizing,
+            columnPinning,
             pagination: paginationState,
         },
         getRowId: (row) => String(row.id),
         manualPagination: true,
         manualSorting: true,
         manualFiltering: true,
+        enableColumnPinning: true,
         columnResizeMode: 'onChange',
         onSortingChange: setSorting,
         onColumnFiltersChange: setColumnFilters,
@@ -801,24 +1142,28 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
     const rowHeight = useMemo(() => ROW_HEIGHT_BY_DENSITY[density] || ROW_HEIGHT_BY_DENSITY.standard, [density]);
     const cellPadding = useMemo(() => {
         return {
-            compact: 'px-2 py-1',
-            standard: 'px-3 py-2',
-            comfortable: 'px-4 py-3',
+            'ultra-compact': 'px-1 py-0 text-[10px] leading-[1.15]',
+            compact: 'px-1.5 py-0.5 text-[11px] leading-tight',
+            standard: 'px-2 py-1 text-xs leading-4',
+            comfortable: 'px-3 py-1.5 text-sm leading-5',
         }[density];
     }, [density]);
     const rows = table.getRowModel().rows;
     const rowCount = rows.length;
+    const visibleLeafColumns = table.getVisibleLeafColumns();
+    const visibleColumnIndexMap = useMemo(() => {
+        const map: Record<string, number> = {};
+        visibleLeafColumns.forEach((column, index) => {
+            map[column.id] = index;
+        });
+        return map;
+    }, [visibleLeafColumns]);
 
     // Clamp/initialize pagination
     React.useEffect(() => {
         const maxPage = Math.max(1, Math.ceil(total / pageSize));
         if (page > maxPage) {
             onPageChange(maxPage);
-            return;
-        }
-        if (!restoredStateRef.current && !appliedDefaultStateRef.current && total > 0) {
-            onPageChange(maxPage);
-            appliedDefaultStateRef.current = true;
         }
     }, [total, pageSize, page, onPageChange]);
 
@@ -829,20 +1174,20 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
         }
         const stateToSave = {
             sorting,
-            pageIndex: Math.max(0, page - 1),
             pageSize,
             columnOrder,
             columnSizing,
             columnVisibility,
             density,
+            pinnedCount,
             globalFilter,
-            activeFilters: { currency: activeFilters.currency || 'UZS', ...activeFilters },
+            activeFilters: { currency: activeFilters.currency || 'ALL', ...activeFilters },
             columnStyles,
             cellStyles,
         };
         saveTimeoutRef.current = window.setTimeout(() => {
             try {
-                localStorage.setItem(TABLE_STATE_STORAGE_KEY, JSON.stringify(stateToSave));
+                localStorage.setItem(tableStateStorageKey, JSON.stringify(stateToSave));
             } catch (error) {
                 console.warn('Failed to persist table state', error);
             }
@@ -854,43 +1199,75 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
                 saveTimeoutRef.current = null;
             }
         };
-    }, [sorting, page, pageSize, columnOrder, columnSizing, columnVisibility, density, globalFilter, activeFilters, columnStyles, cellStyles]);
-
-    const rowVirtualizer = useVirtualizer({
-        count: rowCount,
-        getScrollElement: () => tableContainerRef.current,
-        estimateSize: () => rowHeight,
-        overscan: 10,
-        getItemKey: (index) => rows[index]?.id ?? index,
-    });
-
-    // Force virtualizer to recompute sizes when плотность меняется
-    useEffect(() => {
-        rowVirtualizer.measure();
-    }, [density, rowVirtualizer]);
-
-    const virtualRows = rowVirtualizer.getVirtualItems();
-    const totalSize = rowVirtualizer.getTotalSize();
-    const paddingTop = virtualRows.length > 0 ? virtualRows[0].start : 0;
-    const paddingBottom = virtualRows.length > 0 ? totalSize - virtualRows[virtualRows.length - 1].end : 0;
-    const virtualizationActive = virtualRows.length < rowCount;
-
-    const isDev = (import.meta as any)?.env?.DEV ?? false;
+    }, [sorting, pageSize, columnOrder, columnSizing, columnVisibility, density, pinnedCount, globalFilter, activeFilters, columnStyles, cellStyles, tableStateStorageKey]);
 
     useEffect(() => {
-        if (isDev && rowCount > VIRTUAL_WARN_THRESHOLD && !virtualizationActive) {
-            console.warn(`[TransactionTable] Rendering ${rowCount} rows without virtualization enabled`);
+        if (resetViewStateToken === undefined) return;
+        if (lastResetTokenRef.current === resetViewStateToken) return;
+        lastResetTokenRef.current = resetViewStateToken;
+        try {
+            localStorage.removeItem(tableStateStorageKey);
+        } catch {
+            // no-op
         }
-    }, [rowCount, virtualizationActive, isDev]);
+        applySafeDefaults();
+        onPageSizeChange(100);
+        appliedDefaultStateRef.current = true;
+        restoredStateRef.current = true;
+        hydrationSettledRef.current = true;
+    }, [
+        resetViewStateToken,
+        tableStateStorageKey,
+        applySafeDefaults,
+        onPageSizeChange,
+    ]);
+
+    useEffect(() => {
+        if (!hydrationSettledRef.current || !scrollToLastRowToken || rowCount <= 0 || !tableContainerRef.current) return;
+        if (lastAppliedScrollTokenRef.current === scrollToLastRowToken) return;
+        lastAppliedScrollTokenRef.current = scrollToLastRowToken;
+        requestAnimationFrame(() => {
+            scrollViewport('bottom');
+        });
+    }, [scrollToLastRowToken, rowCount, scrollViewport]);
+
+    useEffect(() => {
+        if (!hydrationSettledRef.current || !pendingScrollModeRef.current || rowCount <= 0) return;
+        const mode = pendingScrollModeRef.current;
+        pendingScrollModeRef.current = null;
+        requestAnimationFrame(() => {
+            scrollViewport(mode);
+        });
+    }, [page, rowCount, scrollViewport]);
+
+    const leftPinnedLeafColumns = table.getLeftLeafColumns();
+    const lastPinnedLeftId = leftPinnedLeafColumns[leftPinnedLeafColumns.length - 1]?.id;
+
+    const getPinnedStyles = useCallback(
+        (columnId: string, isHeader = false): CSSProperties => {
+            const column = table.getColumn(columnId);
+            if (!column || column.getIsPinned() !== 'left') return {};
+            const isLastPinned = lastPinnedLeftId === columnId;
+            return {
+                position: 'sticky',
+                left: column.getStart('left'),
+                zIndex: isHeader ? 50 : 20,
+                backgroundColor: isHeader ? 'var(--table-header)' : undefined,
+                borderRight: isLastPinned ? '1px solid var(--table-border, var(--border))' : undefined,
+                boxShadow: isLastPinned ? '2px 0 0 rgba(148, 163, 184, 0.35)' : undefined,
+            };
+        },
+        [table, lastPinnedLeftId]
+    );
 
     const PaginationControls: React.FC<{ className?: string }> = ({ className }) => (
-        <div className={`flex items-center gap-3 text-sm ${className || ''}`}>
+        <div className={`flex items-center gap-2 text-xs ${className || ''}`}>
             <span className="text-foreground-secondary">Строк: {rowCount}</span>
-            <div className="flex items-center gap-2 bg-surface px-2 py-1 rounded-md border border-border">
+            <div className="flex items-center gap-1 bg-surface px-1.5 py-0.5 rounded border border-border">
                 <button
                     onClick={() => table.previousPage()}
                     disabled={!table.getCanPreviousPage()}
-                    className="px-2.5 py-1 rounded-md border border-border bg-surface-2 text-foreground hover:bg-surface-3 disabled:opacity-50 disabled:cursor-not-allowed"
+                    className="px-2 py-0.5 rounded border border-border bg-surface-2 text-foreground hover:bg-surface-3 disabled:opacity-50 disabled:cursor-not-allowed"
                 >
                     ← Пред
                 </button>
@@ -900,13 +1277,35 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
                 <button
                     onClick={() => table.nextPage()}
                     disabled={!table.getCanNextPage()}
-                    className="px-2.5 py-1 rounded-md border border-border bg-surface-2 text-foreground hover:bg-surface-3 disabled:opacity-50 disabled:cursor-not-allowed"
+                    className="px-2 py-0.5 rounded border border-border bg-surface-2 text-foreground hover:bg-surface-3 disabled:opacity-50 disabled:cursor-not-allowed"
                 >
                     След →
                 </button>
             </div>
         </div>
     );
+
+    const handleJumpToLatest = useCallback(() => {
+        const isNewestFirst = Boolean(sorting[0]?.id === 'transaction_date' && sorting[0]?.desc);
+        const targetPage = isNewestFirst ? 1 : Math.max(1, Math.ceil(total / pageSize));
+        const mode: 'top' | 'bottom' = isNewestFirst ? 'top' : 'bottom';
+        if (page === targetPage) {
+            requestAnimationFrame(() => scrollViewport(mode));
+            return;
+        }
+        pendingScrollModeRef.current = mode;
+        onPageChange(targetPage);
+    }, [onPageChange, page, pageSize, scrollViewport, sorting, total]);
+
+    const handleNewestFirst = useCallback(() => {
+        setSorting([{ id: 'transaction_date', desc: true }]);
+        if (page === 1) {
+            requestAnimationFrame(() => scrollViewport('top'));
+            return;
+        }
+        pendingScrollModeRef.current = 'top';
+        onPageChange(1);
+    }, [onPageChange, page, scrollViewport]);
 
     // DnD Sensors
     const sensors = useSensors(
@@ -921,17 +1320,16 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
     );
 
     function handleDragEnd(event: DragEndEvent) {
-        const { active, over } = event;
-        if (active && over && active.id !== over.id) {
-            setColumnOrder((items) => {
-                const oldIndex = items.indexOf(active.id as string);
-                const newIndex = items.indexOf(over.id as string);
-                return arrayMove(items, oldIndex, newIndex);
-            });
-        }
+        void event;
     }
 
-    const handleDragOver = (event: DragEndEvent) => {
+    const isInteractiveTarget = useCallback((target: EventTarget | null) => {
+        return target instanceof HTMLElement && Boolean(
+            target.closest('button, input, select, textarea, a, [role="button"], [contenteditable="true"], .resizer')
+        );
+    }, []);
+
+    const handleDragOver = (event: DragOverEvent) => {
         const { active, over } = event;
         if (active && over && active.id !== over.id) {
             setColumnOrder((items) => {
@@ -966,6 +1364,7 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
     }, []);
 
     const handleCellMouseDown = (e: React.MouseEvent, rowId: string, colId: string, rowPos: number, colPos: number) => {
+        if (isInteractiveTarget(e.target)) return;
         // Left click only
         if (e.button !== 0) return;
 
@@ -1027,6 +1426,7 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
     };
 
     const handleCellClick = (e: React.MouseEvent, cellId: string) => {
+        if (isInteractiveTarget(e.target)) return;
         const isMulti = e.ctrlKey || e.metaKey;
         if (isMulti) {
             toggleCellSelection(cellId, true);
@@ -1035,6 +1435,96 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
         // but Click ensures we toggle if Ctrl is held.
         // For non-Ctrl click, mouse down already set exact cell.
     };
+
+    const estimateExpandedWidth = useCallback((text: string, fallbackWidth: number) => {
+        const normalized = text.replace(/\s+/g, ' ').trim();
+        if (!normalized) return fallbackWidth;
+        const fontSize =
+            density === 'ultra-compact' ? 10 :
+                density === 'compact' ? 11 :
+                    density === 'standard' ? 12 : 14;
+        const canvas = textMeasureCanvasRef.current || document.createElement('canvas');
+        textMeasureCanvasRef.current = canvas;
+        const context = canvas.getContext('2d');
+        if (!context) {
+            return Math.min(6000, Math.max(fallbackWidth, normalized.length * (fontSize * 0.72) + 44));
+        }
+        context.font = `${fontSize}px "Segoe UI", "Inter", sans-serif`;
+        const measured = Math.ceil(context.measureText(normalized).width) + 44;
+        return Math.min(6000, Math.max(fallbackWidth, measured));
+    }, [density]);
+
+    const restoreTemporaryExpandedColumn = useCallback(() => {
+        const expanded = temporaryExpandedColumnRef.current;
+        if (!expanded) return;
+        setColumnSizing((prev) => {
+            if (prev[expanded.columnId] === expanded.previousSize) {
+                return prev;
+            }
+            return {
+                ...prev,
+                [expanded.columnId]: expanded.previousSize,
+            };
+        });
+        temporaryExpandedColumnRef.current = null;
+    }, []);
+
+    const maybeExpandColumnForClippedCell = useCallback(
+        (event: React.MouseEvent<HTMLTableCellElement>, columnId: string) => {
+            const column = table.getColumn(columnId);
+            if (!column || !column.getCanResize()) {
+                restoreTemporaryExpandedColumn();
+                return;
+            }
+
+            const targetElement = event.target as HTMLElement | null;
+            const probe = targetElement?.closest('[data-overflow-probe="1"]') as HTMLElement | null;
+            const fallbackElement = event.currentTarget as HTMLElement;
+            const measuredElement = probe || fallbackElement;
+            const isOverflowed = measuredElement.scrollWidth > measuredElement.clientWidth;
+            const fullText = (probe?.dataset.fulltext || measuredElement.textContent || '').trim();
+
+            if (!isOverflowed || !fullText) {
+                restoreTemporaryExpandedColumn();
+                return;
+            }
+
+            const currentWidth = column.getSize();
+            const nextWidth = estimateExpandedWidth(fullText, currentWidth);
+            const expanded = temporaryExpandedColumnRef.current;
+
+            if (expanded && expanded.columnId !== columnId) {
+                const previousSizeForCurrent = columnSizing[columnId] ?? currentWidth;
+                setColumnSizing((prev) => ({
+                    ...prev,
+                    [expanded.columnId]: expanded.previousSize,
+                    [columnId]: nextWidth,
+                }));
+                temporaryExpandedColumnRef.current = {
+                    columnId,
+                    previousSize: previousSizeForCurrent,
+                };
+                return;
+            }
+
+            if (!expanded) {
+                temporaryExpandedColumnRef.current = {
+                    columnId,
+                    previousSize: columnSizing[columnId] ?? currentWidth,
+                };
+            }
+
+            setColumnSizing((prev) => ({
+                ...prev,
+                [columnId]: nextWidth,
+            }));
+        },
+        [table, restoreTemporaryExpandedColumn, estimateExpandedWidth, columnSizing]
+    );
+
+    useEffect(() => () => {
+        restoreTemporaryExpandedColumn();
+    }, [restoreTemporaryExpandedColumn]);
 
     const handleAlign = (alignment: Alignment) => {
         if (!contextMenu) return;
@@ -1278,7 +1768,7 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
     });
 
     const buildExportColumns = useCallback(() => {
-        const columnsToExport = table.getVisibleLeafColumns().filter(col => col.id !== 'details');
+        const columnsToExport = table.getVisibleLeafColumns();
         return columnsToExport.map((column) => {
             const header = column.columnDef.header;
             return {
@@ -1289,6 +1779,9 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
             };
         });
     }, [table, columnSizing, columnStyles]);
+
+    const isOperationNumberDescending = Boolean(sorting[0]?.desc)
+        && ['operation_number', 'date_time', 'transaction_date', 'time', 'day'].includes(sorting[0]?.id || '');
 
     const exportCurrentView = useCallback(() => {
         const rowsToUse = exportViewRows || table.getPrePaginationRowModel().rows.map(r => r.original);
@@ -1303,10 +1796,19 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
             cellStyles: cellStyles as any,
             fileName: `transactions_view_${new Date().toISOString().slice(0, 10)}.xlsx`,
             includeAlternating: true,
+            operationNumberDescending: isOperationNumberDescending,
+            operationNumberTotal: rowsToUse.length,
         });
-    }, [exportViewRows, table, columnStyles, cellStyles, buildExportColumns]);
+    }, [exportViewRows, table, columnStyles, cellStyles, buildExportColumns, isOperationNumberDescending]);
 
     const exportAll = useCallback(() => {
+        const visibleColumnIds = table.getVisibleLeafColumns().map((column) => column.id);
+        if (serverModeActive && onServerExportAll) {
+            setServerExportPending(true);
+            Promise.resolve(onServerExportAll(visibleColumnIds))
+                .finally(() => setServerExportPending(false));
+            return;
+        }
         const rowsToUse = exportAllRows || exportViewRows || table.getPrePaginationRowModel().rows.map(r => r.original);
         if (!rowsToUse.length) {
             alert('Нет данных для экспорта.');
@@ -1319,8 +1821,75 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
             cellStyles: cellStyles as any,
             fileName: `transactions_all_${new Date().toISOString().slice(0, 10)}.xlsx`,
             includeAlternating: true,
+            operationNumberDescending: isOperationNumberDescending,
+            operationNumberTotal: rowsToUse.length,
         });
-    }, [exportAllRows, exportViewRows, table, columnStyles, cellStyles, buildExportColumns]);
+    }, [serverModeActive, onServerExportAll, exportAllRows, exportViewRows, table, columnStyles, cellStyles, buildExportColumns, isOperationNumberDescending]);
+
+    const exportByPeriod = useCallback(() => {
+        if (!exportDateFrom || !exportDateTo) {
+            showToast('error', 'Укажите период (дата начала и дата конца).');
+            return;
+        }
+        const from = new Date(exportDateFrom);
+        const to = new Date(exportDateTo);
+        to.setHours(23, 59, 59, 999);
+
+        if (Number.isNaN(from.getTime()) || Number.isNaN(to.getTime()) || from > to) {
+            showToast('error', 'Период указан некорректно.');
+            return;
+        }
+
+        const visibleColumnIds = table.getVisibleLeafColumns().map((column) => column.id);
+        if (serverModeActive && onServerExportByPeriod) {
+            setServerExportPending(true);
+            Promise.resolve(onServerExportByPeriod(exportDateFrom, exportDateTo, visibleColumnIds))
+                .then(() => {
+                    setExportPeriodOpen(false);
+                    setExportMenuOpen(false);
+                })
+                .finally(() => setServerExportPending(false));
+            return;
+        }
+
+        const allRows = exportAllRows || exportViewRows || table.getPrePaginationRowModel().rows.map((r) => r.original);
+        const filtered = allRows.filter((tx) => {
+            const txDate = tx.transaction_date ? new Date(tx.transaction_date) : null;
+            if (!txDate || Number.isNaN(txDate.getTime())) return false;
+            return txDate >= from && txDate <= to;
+        });
+
+        if (!filtered.length) {
+            showToast('warning', 'Нет транзакций за выбранный период.');
+            return;
+        }
+
+        exportTransactionsToExcel({
+            rows: filtered,
+            columns: buildExportColumns(),
+            columnStyles: columnStyles as any,
+            cellStyles: cellStyles as any,
+            fileName: `transactions_${exportDateFrom}_${exportDateTo}.xlsx`,
+            includeAlternating: true,
+            operationNumberDescending: isOperationNumberDescending,
+            operationNumberTotal: filtered.length,
+        });
+        setExportPeriodOpen(false);
+        setExportMenuOpen(false);
+    }, [
+        exportDateFrom,
+        exportDateTo,
+        serverModeActive,
+        onServerExportByPeriod,
+        exportAllRows,
+        exportViewRows,
+        table,
+        showToast,
+        buildExportColumns,
+        columnStyles,
+        cellStyles,
+        isOperationNumberDescending,
+    ]);
 
     const selectedRowIds = useMemo(() => {
         const rows = new Set<number>();
@@ -1334,7 +1903,7 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
     // Applied filter chips intentionally removed per latest request
 
     return (
-        <div className="flex flex-col h-full space-y-4 p-4" onClick={() => {
+        <div className="flex flex-col h-full min-h-0 overflow-hidden gap-3 p-4" onClick={() => {
             // Optional: click background to clear selection?
         }}>
             {contextMenu && (
@@ -1352,18 +1921,18 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
             )}
 
             {/* Top controls */}
-            <div className="space-y-3 mb-3">
+            <div className="mb-1 space-y-1 shrink-0">
                 {/* Toolbar */}
-                <div className="flex flex-wrap gap-2 items-center">
-                    <div className="relative flex-1 min-w-[280px]" ref={searchHelpRef}>
+                <div className="flex flex-wrap gap-1.5 items-center">
+                    <div className="relative flex-1 min-w-[240px]" ref={searchHelpRef}>
                         <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
-                            <Search className="h-5 w-5 text-foreground-muted" />
+                            <Search className="h-4 w-4 text-foreground-muted" />
                         </div>
                         <input
                             type="text"
                             value={searchValue}
                             onChange={(e) => setSearchValue(e.target.value)}
-                            className="block w-full pl-10 pr-10 py-2 border border-border rounded-md leading-5 bg-surface placeholder-text-muted text-foreground focus:outline-none focus:ring-1 focus:ring-primary focus:border-primary sm:text-sm transition duration-150 ease-in-out shadow-sm"
+                            className="block w-full pl-9 pr-9 py-1.5 border border-border rounded-md leading-4 bg-surface placeholder-text-muted text-foreground focus:outline-none focus:ring-1 focus:ring-primary focus:border-primary text-xs transition duration-150 ease-in-out shadow-sm"
                             placeholder='Напр: 1250000, "Korzinka", 2026-01-28, status:ошибка, -status:дубликат'
                         />
                         <button
@@ -1388,58 +1957,128 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
                         )}
                     </div>
 
-                    <div className="flex items-center gap-2 ml-auto">
+                    <div className="flex items-center gap-1.5 ml-auto">
                         <button
                             onClick={onAddClick}
-                            className="flex items-center gap-2 px-3 py-2 text-sm font-medium text-foreground bg-primary text-white border border-primary rounded hover:bg-primary-dark focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-primary"
+                            className="flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium text-foreground bg-primary text-white border border-primary rounded hover:bg-primary-dark focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-primary"
                         >
                             Добавить
                         </button>
 
                         <div className="relative" ref={exportMenuRef}>
                             <button
-                                onClick={() => setExportMenuOpen(prev => !prev)}
-                                className="flex items-center gap-2 px-3 py-2 text-sm font-medium text-foreground bg-surface border border-border rounded hover:bg-surface-2 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-primary"
+                                onClick={() => {
+                                    setExportMenuOpen((prev) => {
+                                        const next = !prev;
+                                        if (!next) {
+                                            setExportPeriodOpen(false);
+                                        }
+                                        return next;
+                                    });
+                                }}
+                                className="flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium text-foreground bg-surface border border-border rounded hover:bg-surface-2 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-primary disabled:opacity-60"
+                                disabled={serverExportPending}
                             >
                                 <FileText className="w-4 h-4" />
                                 Экспорт
                             </button>
                             {exportMenuOpen && (
-                                <div className="absolute top-full right-0 mt-1 w-52 bg-surface border border-border rounded-md shadow-lg z-50">
+                                <div className="absolute top-full right-0 mt-1 w-56 bg-surface border border-border rounded-md shadow-lg z-50">
                                     <button
-                                        onClick={() => { exportCurrentView(); setExportMenuOpen(false); }}
-                                        className="w-full text-left px-3 py-2 text-sm hover:bg-surface-2"
+                                        onClick={() => {
+                                            exportCurrentView();
+                                            setExportPeriodOpen(false);
+                                            setExportMenuOpen(false);
+                                        }}
+                                        className="w-full text-left px-3 py-2 text-sm hover:bg-surface-2 disabled:opacity-60"
+                                        disabled={serverExportPending}
                                     >
                                         Экспорт текущего вида
                                     </button>
                                     <button
-                                        onClick={() => { exportAll(); setExportMenuOpen(false); }}
-                                        className="w-full text-left px-3 py-2 text-sm hover:bg-surface-2"
+                                        onClick={() => {
+                                            exportAll();
+                                            setExportPeriodOpen(false);
+                                            setExportMenuOpen(false);
+                                        }}
+                                        className="w-full text-left px-3 py-2 text-sm hover:bg-surface-2 disabled:opacity-60"
+                                        disabled={serverExportPending}
                                     >
                                         Экспорт всех транзакций
                                     </button>
+                                    <div className="border-t border-border my-1" />
+                                    <button
+                                        onClick={() => setExportPeriodOpen((prev) => !prev)}
+                                        className="w-full text-left px-3 py-2 text-sm hover:bg-surface-2 disabled:opacity-60"
+                                        disabled={serverExportPending}
+                                    >
+                                        Экспорт за период
+                                    </button>
+                                    {exportPeriodOpen && (
+                                        <div className="px-3 py-2 space-y-2">
+                                            <input
+                                                type="date"
+                                                value={exportDateFrom}
+                                                onChange={(e) => setExportDateFrom(e.target.value)}
+                                                className="w-full px-2 py-1 text-sm border border-border rounded bg-input-bg"
+                                            />
+                                            <input
+                                                type="date"
+                                                value={exportDateTo}
+                                                onChange={(e) => setExportDateTo(e.target.value)}
+                                                className="w-full px-2 py-1 text-sm border border-border rounded bg-input-bg"
+                                            />
+                                            <button
+                                                onClick={exportByPeriod}
+                                                disabled={!exportDateFrom || !exportDateTo || serverExportPending}
+                                                className="w-full px-2 py-1.5 text-sm rounded bg-primary text-white hover:bg-primary/90 disabled:opacity-50"
+                                            >
+                                                {serverExportPending ? 'Экспорт...' : 'Скачать'}
+                                            </button>
+                                        </div>
+                                    )}
                                 </div>
                             )}
                         </div>
 
                         <button
                             onClick={() => setFilterDrawerOpen(true)}
-                            className={`flex items-center gap-2 px-3 py-2 text-sm font-medium border rounded hover:bg-surface-2 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-primary ${activeFilterCount > 0 ? 'bg-primary-light text-primary border-primary/30' : 'text-foreground bg-surface border-border'}`}
+                            className={`flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium border rounded hover:bg-surface-2 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-primary ${activeFilterCount > 0 ? 'bg-primary-light text-primary border-primary/30' : 'text-foreground bg-surface border-border'}`}
                         >
                             <Filter className="w-4 h-4" />
                             Фильтры{activeFilterCount > 0 ? ` (${activeFilterCount})` : ''}
                         </button>
 
+                        <button
+                            onClick={handleJumpToLatest}
+                            className="flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium text-foreground bg-surface border border-border rounded hover:bg-surface-2 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-primary"
+                            title="Перейти к последней порции операций текущего вида"
+                        >
+                            Последние
+                        </button>
+
+                        <button
+                            onClick={handleNewestFirst}
+                            className={`flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium border rounded focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-primary ${
+                                sorting[0]?.id === 'transaction_date' && sorting[0]?.desc
+                                    ? 'bg-primary-light text-primary border-primary/30'
+                                    : 'text-foreground bg-surface border-border hover:bg-surface-2'
+                            }`}
+                            title="Показать операции от новых к старым"
+                        >
+                            Сначала новые
+                        </button>
+
                         <div className="relative" ref={viewMenuRef}>
                             <button
                                 onClick={() => setViewMenuOpen(!viewMenuOpen)}
-                                className="flex items-center gap-2 px-3 py-2 text-sm font-medium text-foreground bg-surface border border-border rounded hover:bg-surface-2 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-primary"
+                                className="flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium text-foreground bg-surface border border-border rounded hover:bg-surface-2 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-primary"
                             >
                                 <Eye className="w-4 h-4" />
                                 Вид
                             </button>
                             {viewMenuOpen && (
-                                <div className="absolute top-full right-0 mt-1 w-96 bg-surface border border-border rounded-md shadow-lg z-50">
+                                <div className="absolute top-full right-0 mt-1 w-[30rem] bg-surface border border-border rounded-md shadow-lg z-50">
                                     <div className="p-2 border-b border-border">
                                         <div className="text-xs font-semibold text-foreground-muted mb-2 px-2">Столбцы</div>
                                         <div className="flex items-center gap-2 px-2 mb-2">
@@ -1460,7 +2099,7 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
                                     {table.getAllLeafColumns().map((col) => {
                                         const label = typeof col.columnDef.header === 'string'
                                             ? col.columnDef.header
-                                            : (col.id === 'details' ? 'Детали' : col.id);
+                                            : col.id;
                                         const disabled = LOCKED_COLUMNS.has(col.id);
                                         return (
                                             <label key={col.id} className="flex items-center gap-2 text-sm text-foreground">
@@ -1469,6 +2108,7 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
                                                     checked={col.getIsVisible()}
                                                     disabled={disabled}
                                                     onChange={(e) => toggleColumnVisibility(col.id, e.target.checked)}
+                                                    aria-label={`Показать столбец ${label}`}
                                                 />
                                                 <span className={disabled ? 'text-foreground-muted' : ''}>{label}</span>
                                             </label>
@@ -1478,6 +2118,12 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
                             </div>
                                     <div className="p-2 border-b border-border">
                                         <div className="text-xs font-semibold text-foreground-muted mb-2 px-2">Плотность строк</div>
+                                        <button
+                                            onClick={() => { setDensity('ultra-compact'); setViewMenuOpen(false); }}
+                                            className={`w-full text-left px-2 py-1 text-sm rounded focus:outline-none focus:ring-2 focus:ring-primary ${density === 'ultra-compact' ? 'bg-primary-light text-primary' : 'hover:bg-surface-2'}`}
+                                        >
+                                            Ультра-компактный
+                                        </button>
                                         <button
                                             onClick={() => { setDensity('compact'); setViewMenuOpen(false); }}
                                             className={`w-full text-left px-2 py-1 text-sm rounded focus:outline-none focus:ring-2 focus:ring-primary ${density === 'compact' ? 'bg-primary-light text-primary' : 'hover:bg-surface-2'}`}
@@ -1496,6 +2142,20 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
                                         >
                                             Крупный
                                         </button>
+                                    </div>
+                                    <div className="p-2 border-b border-border">
+                                        <div className="text-xs font-semibold text-foreground-muted mb-2 px-2">Закреплено слева</div>
+                                        <div className="grid grid-cols-4 gap-1 px-2">
+                                            {[0, 1, 2, 3].map((count) => (
+                                                <button
+                                                    key={count}
+                                                    onClick={() => setPinnedCount(count as 0 | 1 | 2 | 3)}
+                                                    className={`px-2 py-1 text-xs rounded border ${pinnedCount === count ? 'bg-primary-light text-primary border-primary/40' : 'border-border hover:bg-surface-2'}`}
+                                                >
+                                                    {count}
+                                                </button>
+                                            ))}
+                                        </div>
                                     </div>
                                     <div className="p-2 border-b border-border">
                                         <div className="text-xs font-semibold text-foreground-muted mb-2 px-2">Сохраненные виды</div>
@@ -1568,7 +2228,7 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
                                                 setGlobalFilter('');
                                                 setSearchValue('');
                                                 setSorting([]);
-                                                setActiveFilters({});
+                                                setActiveFilters({ currency: 'ALL' });
                                                 setViewMenuOpen(false);
                                             }}
                                             className="w-full text-left px-2 py-1 text-sm text-danger rounded hover:bg-danger-light"
@@ -1579,17 +2239,33 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
                                 </div>
                             )}
                         </div>
+                        <button
+                            onClick={() => undo()}
+                            disabled={!canUndo}
+                            className="flex items-center gap-1 px-2 py-1.5 text-xs font-medium text-foreground bg-surface border border-border rounded hover:bg-surface-2 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-primary disabled:opacity-50 disabled:cursor-not-allowed"
+                            title="Отменить (Ctrl+Z)"
+                        >
+                            <Undo2 className="w-4 h-4" />
+                        </button>
+                        <button
+                            onClick={() => redo()}
+                            disabled={!canRedo}
+                            className="flex items-center gap-1 px-2 py-1.5 text-xs font-medium text-foreground bg-surface border border-border rounded hover:bg-surface-2 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-primary disabled:opacity-50 disabled:cursor-not-allowed"
+                            title="Повторить (Ctrl+Y)"
+                        >
+                            <Redo2 className="w-4 h-4" />
+                        </button>
                     </div>
 
                 </div>
 
                 {/* Status + pagination + currency */}
-                <div className="flex flex-wrap items-center gap-3 text-sm px-3 py-2 bg-surface-2 border border-border rounded-md">
+                <div className="flex flex-wrap items-center gap-2 text-xs px-2 py-1.5 bg-surface-2 border border-border rounded-md">
                     <div className="flex items-center gap-2 text-foreground">
                         {syncState?.isSyncing ? (
-                            <div className="h-2 w-2 rounded-full bg-primary animate-pulse" />
+                            <div className="h-1.5 w-1.5 rounded-full bg-primary animate-pulse" />
                         ) : (
-                            <div className="h-2 w-2 rounded-full bg-success" />
+                            <div className="h-1.5 w-1.5 rounded-full bg-success" />
                         )}
                         <span>
                             {syncState?.isSyncing
@@ -1605,7 +2281,28 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
                         Последнее обновление:{' '}
                         {syncState?.lastSyncAt ? new Date(syncState.lastSyncAt).toLocaleTimeString() : '—'}
                     </div>
-                    <div className="flex space-x-1 bg-surface p-1 rounded-lg border border-border">
+                    <div className="flex items-center gap-1.5 bg-surface px-1.5 py-0.5 rounded border border-border">
+                        <span className="text-foreground-secondary">Год</span>
+                        <select
+                            value={selectedYear === null ? '' : String(selectedYear)}
+                            onChange={(e) => {
+                                const value = e.target.value;
+                                onYearChange(value ? parseInt(value, 10) : null);
+                            }}
+                            className="px-1.5 py-0.5 rounded border border-border bg-input-bg text-input-text text-xs min-w-[86px]"
+                            aria-label="Выбор года папки"
+                        >
+                            {availableYears.map((year) => (
+                                <option key={year} value={year}>
+                                    {year}
+                                </option>
+                            ))}
+                        </select>
+                        {selectedYear !== null && (
+                            <span className="text-foreground-muted">Папка: {selectedYear}</span>
+                        )}
+                    </div>
+                    <div className="flex space-x-1 bg-surface px-1 py-0.5 rounded border border-border">
                         {[
                             { key: 'ALL', label: 'Все' },
                             { key: 'UZS', label: 'UZS' },
@@ -1614,7 +2311,7 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
                             <button
                                 key={item.key}
                                 onClick={() => setActiveFilters({ ...activeFilters, currency: item.key as any })}
-                                className={`px-3 py-1.5 text-sm font-medium rounded-md transition-all focus:outline-none focus:ring-2 focus:ring-primary ${activeFilters.currency === item.key
+                                className={`px-2 py-1 text-xs font-medium rounded transition-all focus:outline-none focus:ring-2 focus:ring-primary ${activeFilters.currency === item.key
                                     ? 'bg-surface-2 text-foreground shadow-sm border border-border'
                                     : 'text-foreground-secondary hover:text-foreground'
                                     }`}
@@ -1629,31 +2326,35 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
                     <button
                         onClick={syncState?.onSync}
                         disabled={syncState?.isSyncing}
-                        className="flex items-center gap-2 px-3 py-1.5 text-sm font-medium border rounded bg-surface hover:bg-surface-2 disabled:opacity-60"
+                        className="flex items-center gap-1 px-2 py-1 text-xs font-medium border rounded bg-surface hover:bg-surface-2 disabled:opacity-60"
                     >
-                        {syncState?.isSyncing && <div className="animate-spin h-4 w-4 border-2 border-primary border-t-transparent rounded-full" />}
+                        {syncState?.isSyncing && <div className="animate-spin h-3 w-3 border-2 border-primary border-t-transparent rounded-full" />}
                         {syncState?.isSyncing ? 'Синхронизация…' : 'Синхронизировать'}
                     </button>
                     {isSaving && (
-                        <div className="flex items-center gap-2 text-foreground-secondary">
-                            <div className="animate-spin h-4 w-4 border-2 border-primary border-t-transparent rounded-full"></div>
+                        <div className="flex items-center gap-1 text-foreground-secondary">
+                            <div className="animate-spin h-3 w-3 border-2 border-primary border-t-transparent rounded-full"></div>
                             <span>Сохранение…</span>
                         </div>
                     )}
-                </div>
-
-                {/* Applied filters */}
-                {/* Applied filters hidden per request */}
-
-                {/* Selection bar */}
-                {selectedRowIds.length > 0 && (
-                    <div className="flex flex-wrap items-center gap-2 px-3 py-2 bg-surface-2 border border-border rounded-md">
-                        <div className="text-sm font-medium">Выбрано: {selectedRowIds.length}</div>
+                    {selectedRowIds.length > 0 && (
+                        <div className="flex items-center gap-1 border-l border-border pl-2 ml-1">
+                            <div className="font-medium">Выбрано: {selectedRowIds.length}</div>
+                            <button
+                                onClick={() => setSelectedCells(new Set())}
+                                className="text-xs text-foreground-secondary hover:text-foreground"
+                            >
+                                Снять
+                            </button>
+                        </div>
+                    )}
+                    {selectedRowIds.length > 0 && (
+                        <>
                         <button
                             onClick={() => handleDeleteSelected()}
-                            className="flex items-center gap-1 px-3 py-1.5 text-sm font-medium text-danger bg-surface border border-border rounded hover:bg-danger/10 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-danger"
+                            className="flex items-center gap-1 px-2 py-1 text-xs font-medium text-danger bg-surface border border-border rounded hover:bg-danger/10 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-danger"
                         >
-                            <Trash2 className="w-4 h-4" />
+                            <Trash2 className="w-3.5 h-3.5" />
                             Удалить
                         </button>
                         <button
@@ -1667,40 +2368,17 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
                                     cellStyles: cellStyles as any,
                                     fileName: `transactions_selected_${new Date().toISOString().slice(0, 10)}.xlsx`,
                                     includeAlternating: true,
+                                    operationNumberDescending: isOperationNumberDescending,
+                                    operationNumberTotal: rowsToUse.length,
                                 });
                             }}
-                            className="flex items-center gap-1 px-3 py-1.5 text-sm font-medium text-foreground bg-surface border border-border rounded hover:bg-surface-2"
+                            className="flex items-center gap-1 px-2 py-1 text-xs font-medium text-foreground bg-surface border border-border rounded hover:bg-surface-2"
                         >
-                            <FileText className="w-4 h-4" />
+                            <FileText className="w-3.5 h-3.5" />
                             Экспорт
                         </button>
-                        <button
-                            onClick={() => setSelectedCells(new Set())}
-                            className="text-sm text-foreground-secondary hover:text-foreground"
-                        >
-                            Снять выделение
-                        </button>
-                    </div>
-                )}
-
-                {/* Undo/Redo (kept but tucked to right) */}
-                <div className="flex items-center gap-1">
-                    <button
-                        onClick={() => undo()}
-                        disabled={!canUndo}
-                        className="flex items-center gap-1 px-2 py-1.5 text-sm font-medium text-foreground bg-surface border border-border rounded hover:bg-surface-2 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-primary disabled:opacity-50 disabled:cursor-not-allowed"
-                        title="Отменить (Ctrl+Z)"
-                    >
-                        <Undo2 className="w-4 h-4" />
-                    </button>
-                    <button
-                        onClick={() => redo()}
-                        disabled={!canRedo}
-                        className="flex items-center gap-1 px-2 py-1.5 text-sm font-medium text-foreground bg-surface border border-border rounded hover:bg-surface-2 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-primary disabled:opacity-50 disabled:cursor-not-allowed"
-                        title="Повторить (Ctrl+Y)"
-                    >
-                        <Redo2 className="w-4 h-4" />
-                    </button>
+                        </>
+                    )}
                 </div>
             </div>
 
@@ -1711,21 +2389,46 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
                 initialFilters={activeFilters}
                 operatorOptions={operatorOptions}
                 appOptions={appOptions}
+                telegramSourceOptions={telegramSourceOptions}
             />
 
-            <DndContext
-                collisionDetection={closestCenter}
-                modifiers={[]}
-                onDragOver={handleDragOver}
-                onDragEnd={handleDragEnd}
-                sensors={sensors}
-            >
-                <div
-                    className="flex-1 overflow-auto border border-table-border bg-surface shadow-sm"
-                    ref={tableContainerRef}
-                >
-                    <table className="strict-table w-full relative" style={{ minWidth: table.getTotalSize() }}>
-                        <thead className="sticky top-0 z-10 bg-table-header shadow-sm">
+            {rowCount === 0 && !isLoading ? (
+                <EmptyState
+                    compact
+                    icon={<FileText className="w-6 h-6 text-foreground-muted" />}
+                    title="Транзакции не найдены"
+                    description="Измените фильтры или добавьте новую транзакцию."
+                />
+            ) : (
+                <div className="flex-1 min-h-0">
+                    <DndContext
+                        collisionDetection={closestCenter}
+                        modifiers={[]}
+                        onDragOver={handleDragOver}
+                        onDragEnd={handleDragEnd}
+                        sensors={sensors}
+                    >
+                        <div className="flex h-full min-h-0 flex-col">
+                            <div
+                                className="flex-1 min-h-0 overflow-x-scroll overflow-y-scroll overscroll-contain border border-table-border bg-surface shadow-sm"
+                                ref={tableContainerRef}
+                                tabIndex={0}
+                                role="region"
+                                aria-label="Таблица транзакций"
+                                onMouseLeave={restoreTemporaryExpandedColumn}
+                                style={{
+                                    scrollbarGutter: 'stable both-edges',
+                                    WebkitOverflowScrolling: 'touch',
+                                    touchAction: 'pan-x pan-y',
+                                }}
+                            >
+                                <table
+                                    className={`strict-table relative density-${density} w-max`}
+                                    role="grid"
+                                    aria-rowcount={total}
+                                    style={{ width: table.getTotalSize(), minWidth: '100%' }}
+                                >
+                        <thead className="sticky top-0 z-30 bg-table-header shadow-sm">
                             {table.getHeaderGroups().map((headerGroup) => (
                                 <tr key={headerGroup.id}>
                                     <SortableContext
@@ -1736,14 +2439,17 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
                                             <DraggableTableHeader
                                                 key={header.id}
                                                 header={header}
+                                                pinnedStyle={getPinnedStyles(header.column.id, true)}
                                                 onContextMenu={(e) => handleHeaderContextMenu(e, header.column.id)}
                                                 paddingClass={cellPadding}
                                             >
                                                 <div
-                                                    className={`flex items-center gap-1 ${header.column.getCanSort() ? 'cursor-pointer hover:text-foreground' : ''}`}
+                                                    className={`flex min-w-0 items-center gap-1 ${header.column.getCanSort() ? 'cursor-pointer hover:text-foreground' : ''} ${highlightedColumnId === header.column.id ? 'rounded bg-primary/10 px-1 text-primary' : ''}`}
                                                     onClick={header.column.getToggleSortingHandler()}
                                                 >
-                                                    {flexRender(header.column.columnDef.header, header.getContext())}
+                                                    <div className="min-w-0 flex-1 truncate">
+                                                        {flexRender(header.column.columnDef.header, header.getContext())}
+                                                    </div>
                                                     {header.column.getIsSorted() ? (
                                                         header.column.getIsSorted() === 'asc' ? (
                                                             <ChevronUp className="w-3 h-3" />
@@ -1759,24 +2465,17 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
                             ))}
                         </thead>
                         <tbody style={{ position: 'relative' }}>
-                            {paddingTop > 0 && (
-                                <tr style={{ height: `${paddingTop}px` }}>
-                                    <td colSpan={table.getVisibleLeafColumns().length} />
-                                </tr>
-                            )}
-                            {virtualRows.map((virtualRow) => {
-                                const row = rows[virtualRow.index];
-                                if (!row) return null;
+                            {rows.map((row, rowIndex) => {
                                 const rowData = row.original;
                                 const lowConf = (rowData.parsing_confidence ?? 1) < LOW_CONFIDENCE_THRESHOLD;
-                                const highlighted = highlightRowId && Number(row.id) === highlightRowId;
-                                const rowClass = `${lowConf ? 'bg-amber-50/60' : ''} ${highlighted ? 'ring-2 ring-primary/70' : ''}`;
+                                const highlighted = normalizedHighlightRowIds.includes(Number(row.id));
+                                const rowClass = `${lowConf ? 'row-low-conf' : ''} ${highlighted ? 'row-highlighted' : ''}`;
 
                                 return (
                                     <tr
                                         key={row.id}
-                                        data-index={virtualRow.index}
-                                        ref={rowVirtualizer.measureElement}
+                                        data-rowid={Number(row.id)}
+                                        data-index={rowIndex}
                                         style={{ height: `${rowHeight}px` }}
                                         className={rowClass}
                                     >
@@ -1785,41 +2484,44 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
                                             const isSelected = selectedCells.has(cellKey);
 
                                             // Use index from list of visible columns to ensure drag selection works with reorder
-                                            const colIndex = table.getVisibleLeafColumns().findIndex(c => c.id === cell.column.id);
+                                            const colIndex = visibleColumnIndexMap[cell.column.id] ?? -1;
 
                                             // Style Resolution: Cell Style > Column Style > Default
                                             const colStyle = columnStyles[cell.column.id] || {};
                                             const cStyle = cellStyles[cellKey] || {};
+                                            const pinnedStyle = getPinnedStyles(cell.column.id, false);
+                                            const isPinned = cell.column.getIsPinned() === 'left';
+                                            const isDetailTriggerCell = ['row_number', 'operation_number', 'date_time', 'transaction_date', 'day'].includes(cell.column.id);
+                                            const renderReadOnlyCell = ['row_number', 'operation_number', 'date_time', 'transaction_date', 'day'].includes(cell.column.id);
+                                            const highlightedColumn = highlightedColumnId === cell.column.id;
 
                                             const finalStyle: CSSProperties = {
-                                                width: cell.column.getSize(),
+                                                ...pinnedStyle,
                                                 textAlign: cStyle.textAlign || colStyle.textAlign || 'left',
-                                                backgroundColor: cStyle.backgroundColor || colStyle.backgroundColor || undefined,
+                                                backgroundColor:
+                                                    cStyle.backgroundColor ||
+                                                    colStyle.backgroundColor,
                                             };
-
-                                            const isDetailsCell = cell.column.id === 'details';
 
                                             return (
                                                 <td
                                                     key={cell.id}
                                                     style={finalStyle}
-                                                    className={`cursor-default select-none border border-table-border text-table-text ${cellPadding} ${isSelected ? 'ring-2 ring-inset ring-primary z-10 bg-table-row-selected' : ''}`}
-                                                    onClick={(e) => handleCellClick(e, cellKey)}
-                                                    onMouseDown={(e) => handleCellMouseDown(e, row.id, cell.column.id, virtualRow.index, colIndex)}
-                                                    onMouseEnter={() => handleCellMouseEnter(virtualRow.index, colIndex)}
+                                                    className={`${isDetailTriggerCell ? 'cursor-pointer' : 'cursor-default'} ${isPinned ? 'pinned-cell' : ''} ${highlightedColumn ? 'bg-primary/10 text-primary' : ''} select-none border border-table-border text-table-text ${cellPadding} ${isSelected ? 'ring-2 ring-inset ring-primary z-10 bg-table-row-selected' : ''}`}
+                                                    onClick={(e) => {
+                                                        if (isDetailTriggerCell) {
+                                                            e.stopPropagation();
+                                                            setDetailRow(row.original);
+                                                            return;
+                                                        }
+                                                        handleCellClick(e, cellKey);
+                                                        maybeExpandColumnForClippedCell(e, cell.column.id);
+                                                    }}
+                                                    onMouseDown={(e) => handleCellMouseDown(e, row.id, cell.column.id, rowIndex, colIndex)}
+                                                    onMouseEnter={() => handleCellMouseEnter(rowIndex, colIndex)}
                                                     onContextMenu={(e) => handleCellContextMenu(e, cellKey)}
                                                 >
-                                                    {isDetailsCell ? (
-                                                        <button
-                                                            className="px-2 py-1 text-xs bg-surface-2 border border-border rounded hover:bg-surface-3 focus:outline-none focus:ring-2 focus:ring-primary w-full"
-                                                            onClick={(e) => {
-                                                                e.stopPropagation();
-                                                                setDetailRow(row.original);
-                                                            }}
-                                                        >
-                                                            Детали
-                                                        </button>
-                                                    ) : cell.column.id === 'row_number' || cell.column.id === 'day' ? (
+                                                    {renderReadOnlyCell ? (
                                                         flexRender(cell.column.columnDef.cell, cell.getContext())
                                                     ) : (
                                                         <EditableCell
@@ -1838,7 +2540,10 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
                                                             onSave={saveEdit}
                                                             onCancel={cancelEdit}
                                                             isEditing={editingCell?.rowId === Number(row.id) && editingCell?.columnId === cell.column.id}
-                                                            onStartEdit={() => startEdit(Number(row.id), cell.column.id)}
+                                                            onStartEdit={() => {
+                                                                restoreTemporaryExpandedColumn();
+                                                                startEdit(Number(row.id), cell.column.id);
+                                                            }}
                                                         />
                                                     )}
                                                 </td>
@@ -1847,15 +2552,13 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
                                     </tr>
                                 );
                             })}
-                            {paddingBottom > 0 && (
-                                <tr style={{ height: `${paddingBottom}px` }}>
-                                    <td colSpan={table.getVisibleLeafColumns().length} />
-                                </tr>
-                            )}
                         </tbody>
-                    </table>
+                                </table>
+                            </div>
+                        </div>
+                    </DndContext>
                 </div>
-            </DndContext>
+            )}
 
             {/* Details Drawer */}
             {detailRow && (
@@ -1878,7 +2581,11 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
                             <div className="space-y-2">
                                 <div className="text-sm font-medium text-foreground">Исходный текст</div>
                                 <div className="border border-border rounded-md bg-surface-2 p-3 text-sm text-foreground max-h-[300px] overflow-auto whitespace-pre-wrap">
-                                    {detailRow.raw_message || '—'}
+                                    {detailRawLoading ? (
+                                        <span className="text-foreground-secondary animate-pulse">Загрузка...</span>
+                                    ) : (
+                                        detailRawMessage || '—'
+                                    )}
                                 </div>
                             </div>
                             <div className="space-y-2">
@@ -1886,14 +2593,14 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
                                 <div className="border border-border rounded-md bg-surface-2 p-3 text-sm text-foreground space-y-2">
                                     {[
                                         { label: 'Дата', value: formatDateTime(new Date(detailRow.transaction_date)) },
-                                        { label: 'Сумма', value: detailRow.amount },
+                                        { label: 'Сумма', value: formatAmount(detailRow.amount) },
                                         { label: 'Валюта', value: detailRow.currency },
                                         { label: 'Оператор', value: detailRow.operator_raw || '—' },
                                         { label: 'Приложение', value: detailRow.application_mapped || '—' },
                                         { label: 'Тип', value: resolveTransactionTypeDisplay(detailRow) },
                                         { label: 'Карта', value: detailRow.card_last_4 || '—' },
                                         { label: 'Источник', value: resolveSourceDisplay(detailRow) },
-                                        { label: 'Остаток', value: detailRow.balance_after || '—' },
+                                        { label: 'Остаток', value: detailRow.balance_after ? formatAmount(detailRow.balance_after) : '—' },
                                     ].map((item) => (
                                         <div key={item.label} className="flex justify-between gap-4">
                                             <span className="text-foreground-muted">{item.label}</span>
