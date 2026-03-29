@@ -4,14 +4,17 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+import os
+import time
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from database.models import MonitoredBotChat, Transaction
+from database.models import MonitoredBotChat, TgChatMessage, TgHistoryCursor, Transaction
 from database.connection import SessionLocal
 from services.receipt_processor import process_tdlib_message
+from services.auth_bot_service import get_redis
 from services.telegram_tdlib_manager import TelegramTDLibManager
 
 logger = logging.getLogger(__name__)
@@ -59,7 +62,34 @@ class TgAutoMonitorService:
         self.queue: asyncio.Queue[Tuple[int, int]] = asyncio.Queue()
         self._running = False
         self._tasks: List[asyncio.Task] = []
-        self._inflight: Set[Tuple[int, int]] = set()
+        self._inflight: Dict[Tuple[int, int], float] = {}
+        self._inflight_ttl_sec = max(60, int(os.getenv("TG_MONITOR_INFLIGHT_TTL_SEC", "300")))
+        self._dedupe_ttl_sec = max(60, int(os.getenv("TG_MONITOR_DEDUPE_TTL_SEC", "3600")))
+        self._catchup_max_batches = max(0, int(os.getenv("TG_MONITOR_CATCHUP_MAX_BATCHES", "0")))
+        raw_catchup_max_seconds = int(os.getenv("TG_MONITOR_CATCHUP_MAX_SECONDS", "0"))
+        self._catchup_max_seconds = 0 if raw_catchup_max_seconds <= 0 else max(5, raw_catchup_max_seconds)
+
+    def _prune_inflight(self) -> None:
+        now = time.monotonic()
+        stale = [key for key, expires_at in self._inflight.items() if expires_at <= now]
+        for key in stale:
+            self._inflight.pop(key, None)
+
+    async def _reserve_recent_message(self, chat_id: int, message_id: int) -> Optional[bool]:
+        """
+        Redis fast dedupe.
+        Returns:
+        - True  -> reserved (not seen recently)
+        - False -> already seen recently
+        - None  -> Redis unavailable, caller should fallback to DB check
+        """
+        key = f"tg:seen:{int(chat_id)}:{int(message_id)}"
+        try:
+            redis = await get_redis()
+            created = await redis.set(key, "1", ex=self._dedupe_ttl_sec, nx=True)
+            return bool(created)
+        except Exception:
+            return None
 
     def _should_process_message(
         self,
@@ -71,7 +101,11 @@ class TgAutoMonitorService:
         """
         # Formatted messages (from TDLib manager) already include "document"/"text"
         doc = message.get("document") or {}
-        if doc.get("mime_type") == "application/pdf":
+        doc_mime = str(doc.get("mime_type") or "").lower()
+        if doc_mime == "application/pdf" or doc_mime.startswith("image/"):
+            return True
+        photo = message.get("photo") or {}
+        if photo.get("file_id"):
             return True
 
         text = (message.get("text") or "").strip()
@@ -86,8 +120,11 @@ class TgAutoMonitorService:
                 caption = content.get("caption", {}).get("text", "") or ""
                 text = caption
                 doc_obj = content.get("document") or {}
-                if (doc_obj or {}).get("mime_type") == "application/pdf":
+                raw_doc_mime = str((doc_obj or {}).get("mime_type") or "").lower()
+                if raw_doc_mime == "application/pdf" or raw_doc_mime.startswith("image/"):
                     return True
+            elif content_type == "messagePhoto":
+                return True
 
         if not text:
             return False
@@ -154,11 +191,82 @@ class TgAutoMonitorService:
         self._tasks.clear()
         self._inflight.clear()
 
+    def _persist_to_history(self, chat_id: int, message: Dict) -> None:
+        """Save a new real-time message to tg_chat_messages if the chat has been synced."""
+        message_id = message.get("id")
+        if not message_id:
+            return
+        try:
+            with self.session_factory() as db:
+                # Only persist if chat was previously synced (cursor exists)
+                cursor = db.get(TgHistoryCursor, int(chat_id))
+                if cursor is None:
+                    return
+                # Check for duplicates
+                existing = (
+                    db.query(TgChatMessage.id)
+                    .filter(TgChatMessage.chat_id == int(chat_id), TgChatMessage.message_id == int(message_id))
+                    .first()
+                )
+                if existing:
+                    return
+
+                from datetime import datetime as _dt
+                msg_date = None
+                raw_ts = message.get("date")
+                if raw_ts is not None:
+                    try:
+                        msg_date = _dt.utcfromtimestamp(int(raw_ts))
+                    except Exception:
+                        pass
+
+                # Extract text from message
+                text = (message.get("text") or "").strip()
+                if not text:
+                    content = message.get("content") or {}
+                    ct = content.get("@type", "")
+                    if ct == "messageText":
+                        text = (content.get("text") or {}).get("text") or ""
+                    elif ct == "messageDocument":
+                        text = (content.get("caption") or {}).get("text") or ""
+                    elif ct == "messagePhoto":
+                        text = (content.get("caption") or {}).get("text") or ""
+
+                sender = message.get("sender_id") or {}
+                sender_id = None
+                if isinstance(sender, dict):
+                    for key in ("user_id", "chat_id"):
+                        val = sender.get(key)
+                        if val is not None:
+                            try:
+                                sender_id = int(val)
+                            except Exception:
+                                pass
+                            break
+
+                row = TgChatMessage(
+                    chat_id=int(chat_id),
+                    message_id=int(message_id),
+                    message_date=msg_date,
+                    is_outgoing=bool(message.get("is_outgoing", False)),
+                    sender_id=sender_id,
+                    text=text,
+                    raw_json=json.dumps(message, ensure_ascii=False),
+                )
+                db.add(row)
+                db.commit()
+        except Exception:
+            logger.debug("Failed to persist realtime message %s:%s to history", chat_id, message_id, exc_info=True)
+
     async def _handle_new_message(self, message: Dict) -> None:
         chat_id = message.get("chat_id")
         message_id = message.get("id")
         if not chat_id or not message_id:
             return
+
+        # Persist to chat history if this chat has been synced
+        self._persist_to_history(int(chat_id), message)
+
         try:
             with self.session_factory() as db:
                 monitored = db.get(MonitoredBotChat, chat_id)
@@ -172,29 +280,37 @@ class TgAutoMonitorService:
         except Exception:
             logger.exception("Monitor check failed for chat %s", chat_id)
             return
-        self._enqueue(chat_id, message_id)
+        await self._enqueue(chat_id, message_id)
 
-    def _enqueue(self, chat_id: int, message_id: int) -> None:
+    async def _enqueue(self, chat_id: int, message_id: int) -> None:
         """Add message to processing queue with duplicate check."""
         key = (chat_id, message_id)
+        self._prune_inflight()
         if key in self._inflight:
             return
 
-        # Check if already processed in database (strict duplicate check)
-        try:
-            with self.session_factory() as db:
-                existing = db.query(Transaction).filter(
-                    Transaction.source_chat_id == int(chat_id),
-                    Transaction.source_message_id == int(message_id)
-                ).first()
-                if existing:
-                    logger.debug("Message %s:%s already processed (transaction %s), skipping",
-                                chat_id, message_id, existing.id)
-                    return
-        except Exception:
-            logger.exception("Duplicate check failed for %s:%s, proceeding anyway", chat_id, message_id)
+        redis_reservation = await self._reserve_recent_message(chat_id, message_id)
+        if redis_reservation is False:
+            return
 
-        self._inflight.add(key)
+        if redis_reservation is None:
+            # Redis unavailable: fallback to strict DB duplicate check.
+            try:
+                with self.session_factory() as db:
+                    existing = db.query(Transaction).filter(
+                        Transaction.source_chat_id == int(chat_id),
+                        Transaction.source_message_id == int(message_id)
+                    ).first()
+                    if existing:
+                        logger.debug(
+                            "Message %s:%s already processed (transaction %s), skipping",
+                            chat_id, message_id, existing.id
+                        )
+                        return
+            except Exception:
+                logger.exception("Duplicate check failed for %s:%s, proceeding anyway", chat_id, message_id)
+
+        self._inflight[key] = time.monotonic() + self._inflight_ttl_sec
         self.queue.put_nowait(key)
 
     async def _worker(self, idx: int) -> None:
@@ -206,7 +322,7 @@ class TgAutoMonitorService:
             except Exception:  # noqa: BLE001
                 logger.exception("Worker %s failed on %s:%s", idx, chat_id, message_id)
             finally:
-                self._inflight.discard(key)
+                self._inflight.pop(key, None)
                 self.queue.task_done()
 
     async def _process_single(self, chat_id: int, message_id: int) -> None:
@@ -299,10 +415,32 @@ class TgAutoMonitorService:
         batch = 100
         from_message_id = 0
         collected: List[int] = []
-        max_batches = 50
+        batches = 0
+        started_at = time.monotonic()
+        limit_hit_reason: Optional[str] = None
 
-        for _ in range(max_batches):
+        while True:
+            if self._catchup_max_batches and batches >= self._catchup_max_batches:
+                logger.warning(
+                    "Catch-up batch limit hit for chat %s (batches=%s, last_processed_id=%s)",
+                    chat_id,
+                    batches,
+                    last_processed_id,
+                )
+                limit_hit_reason = "batch_limit"
+                break
+            if self._catchup_max_seconds and (time.monotonic() - started_at) >= self._catchup_max_seconds:
+                logger.warning(
+                    "Catch-up time budget exceeded for chat %s (seconds=%s, queued=%s)",
+                    chat_id,
+                    self._catchup_max_seconds,
+                    len(collected),
+                )
+                limit_hit_reason = "time_limit"
+                break
+
             resp = await self.manager.get_messages(chat_id=chat_id, limit=batch, from_message_id=from_message_id)
+            batches += 1
             items = resp.get("items") or []
             if not items:
                 break
@@ -324,7 +462,14 @@ class TgAutoMonitorService:
                     logger.debug("Catchup: Message %s:%s filtered out by %s", chat_id, mid, monitor.filter_mode)
 
             oldest_id = min(ids)
-            if oldest_id <= last_processed_id or len(items) < batch:
+            if oldest_id <= last_processed_id:
+                break
+            if int(oldest_id) == int(from_message_id):
+                logger.warning(
+                    "Catch-up pagination stalled for chat %s at message_id=%s; stopping to avoid loop",
+                    chat_id,
+                    oldest_id,
+                )
                 break
             from_message_id = oldest_id
 
@@ -333,7 +478,20 @@ class TgAutoMonitorService:
 
         for mid in sorted(set(collected)):
             if mid > last_processed_id:
-                self._enqueue(chat_id, mid)
+                await self._enqueue(chat_id, mid)
+
+        logger.info(
+            "Catch-up queued %s messages for chat %s (last_processed_id=%s)",
+            len(collected),
+            chat_id,
+            last_processed_id,
+        )
+        if limit_hit_reason:
+            logger.warning(
+                "Catch-up stopped early for chat %s due to %s; consider disabling limits to avoid backlog lag",
+                chat_id,
+                limit_hit_reason,
+            )
 
     def status(self) -> Dict[str, int | bool]:
         return {
@@ -349,7 +507,14 @@ _service: Optional[TgAutoMonitorService] = None
 def init_auto_monitor_service(manager: TelegramTDLibManager, session_factory: Callable[[], Session] = SessionLocal) -> TgAutoMonitorService:
     global _service
     if _service is None:
-        _service = TgAutoMonitorService(manager=manager, session_factory=session_factory)
+        workers = max(1, int(os.getenv("TG_MONITOR_WORKERS", "2")))
+        catchup_interval = max(15, int(os.getenv("TG_MONITOR_CATCHUP_INTERVAL_SEC", "45")))
+        _service = TgAutoMonitorService(
+            manager=manager,
+            session_factory=session_factory,
+            workers=workers,
+            catchup_interval_sec=catchup_interval,
+        )
     return _service
 
 

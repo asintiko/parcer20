@@ -18,37 +18,63 @@ class RegexParser:
         # Regex patterns for different formats
         self.patterns = {
             'humo_notification': {
-                'amount': r'[➖➕💸]\s*([\d\s\.,]+)\s*(UZS|USD)',
+                'amount': r'[➖➕💸]\s*([\d\s\.,]{1,30})\s*(UZS|USD|сум|сўм|sum)',
                 'transaction_type': r'(Оплата|Пополнение|Операция|Конверсия|Счет по карте изменен.*|Счёт по карте изменён.*|Снятие наличных)',
                 'card': r'(?:HUMO-?CARD|HUMOCARD|💳)\s*([\d\*]{6,})',
-                'operator': r'📍\s*(.+)',
-                'datetime': r'[🕓🕘]\s*(?:(\d{2}:\d{2})\s+(\d{2}\.\d{2}\.\d{2,4})|(\d{2}\.\d{2}\.\d{2,4})\s+(\d{2}:\d{2}))',
-                'balance': r'[💰💵]\s*([\d\s\.,]+)\s*(USD|UZS)',
-                'currency': r'(USD|UZS)',
+                'operator': r'[📍🏪]\s*(.+)',
+                'datetime': r'[🕓🕘📅]\s*(?:(\d{2}:\d{2})\s+(\d{2}\.\d{2}\.\d{2,4})|(\d{2}\.\d{2}\.\d{2,4})\s+(\d{2}:\d{2}))',
+                'datetime_fallback': r'(?<!\d)(\d{2}\.\d{2}\.\d{2,4})\s+(\d{2}:\d{2})(?!\d)',
+                'balance': r'[💰💵]\s*(?:(?:Баланс|Остаток|Balance|Balans|Dostupno)\s*:?\s*)?([\d\s\.,]{1,30})\s*(USD|UZS|сум|сўм|sum)?',
+                'currency': r'(USD|UZS|сум|сўм|sum)',
             },
             'sms_inline': {
-                'operator': r'(?:Pokupka|Spisanie c karty|Popolnenie scheta|E-Com oplata|Platezh):\s*(.+?)(?:,|\s+\d{2}\.\d{2})',
-                'datetime': r'(\d{2}\.\d{2}\.\d{2})\s+(\d{2}:\d{2})',
-                'amount': r'summa:([\d\s\.,]+)\s*UZS',
-                'card': r'karta\s*\*{3}(\d{4})',
-                'balance': r'balans:([\d\s\.,]+)\s*UZS',
-                'type_keyword': r'^(Pokupka|Spisanie|Popolnenie|E-Com|Platezh|OTMENA)',
+                'operator': r'(?:Pokupka|Spisanie c karty|Spisanie|Popolnenie scheta|Popolnenie|E-Com oplata|Platezh|OTMENA(?:\s+Pokupka)?)\s*:?\s*(.+?)(?:,\s*[\d\s\.,]|(?:\s+\d{2}\.\d{2}\.\d{2,4})|(?:\.\s*summa))',
+                'datetime': r'(\d{2}\.\d{2}\.\d{2,4})\s+(\d{2}:\d{2})',
+                'datetime_iso': r'(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2})',
+                'amount': r'(?:summa\s*:?\s*|,\s*)([\d\s\.,]{1,30})\s*(UZS|USD|сум|сўм|sum)',
+                'card': r'(?:karta\s*\*{0,3}|Karta\s*:?\s*)\*?(\d{4})',
+                'balance': r'(?:balans|Bal|Balance)\s*:?\s*([\d\s\.,]{1,30})\s*(UZS|USD|сум|сўм|sum)?',
+                'type_keyword': r'^(OTMENA|Pokupka|Spisanie|Popolnenie|E-Com|Platezh)',
             },
             'semicolon_format': {
                 'card_amount': r'HUMOCARD\s*\*(\d{4}):\s*(oplata|popolnenie|operacija)\s+([\d\.]+)\s*UZS',
                 'operator': r';\s*([^;]+?)\s*;',
-                'datetime': r';\s*(\d{2})-(\d{2})-(\d{2})\s+(\d{2}:\d{2})',
+                'datetime': r';\s*(\d{2,4})-(\d{2})-(\d{2})\s+(\d{2}:\d{2})',
                 'balance': r'Dostupno:\s*([\d\.]+)\s*UZS',
             },
             'cardxabar': {
-                'amount': r'[➖➕]\s*([\d\s\.,]+)\s*(USD|UZS)',
-                'card': r'💳\s*([\d\*]{6,})',
-                'operator': r'📍\s*(.+)',
-                'datetime': r'🕓\s*(?:(\d{2}:\d{2})\s+(\d{2}\.\d{2}\.\d{2,4})|(\d{2}\.\d{2}\.\d{2,4})\s+(\d{2}:\d{2}))',
-                'balance': r'[💰💵]\s*([\d\s\.,]+)\s*(USD|UZS)?',
-                'currency': r'(USD|UZS)',
+                'amount': r'(?:[➖➕]\s*|Summa\s*:?\s*)([\d\s\.,]{1,30})\s*(USD|UZS|сум|сўм|sum)',
+                'card': r'(?:💳|Karta)\s*:?\s*([0-9\*]{4,20})',
+                'operator': r'(?:📍|Magazin|Otpravitel)\s*:?\s*(.+)',
+                'datetime': r'[🕓🕘📅]\s*(?:(\d{2}:\d{2})\s+(\d{2}\.\d{2}\.\d{2,4})|(\d{2}\.\d{2}\.\d{2,4})\s+(\d{2}:\d{2}))',
+                'datetime_text': r'Data\s*:?\s*(\d{2}\.\d{2}\.\d{2,4})\s*\n?\s*Vremya\s*:?\s*(\d{2}:\d{2})',
+                'balance': r'(?:[💰💵]|Balans?|Balance|Dostupno)\s*:?\s*([\d\s\.,]{1,30})\s*(USD|UZS|сум|сўм|sum)?',
+                'currency': r'(USD|UZS|сум|сўм|sum)',
             }
         }
+
+    def _search_any(self, text: str, patterns: List[str], flags: int = re.IGNORECASE):
+        for pattern in patterns:
+            match = re.search(pattern, text, flags)
+            if match:
+                return match
+        return None
+
+    def _parse_datetime_with_optional_seconds(self, date_str: str, time_str: str) -> Optional[datetime]:
+        for fmt in ("%d.%m.%Y %H:%M:%S", "%d.%m.%Y %H:%M", "%d.%m.%y %H:%M"):
+            try:
+                return self.tz.localize(datetime.strptime(f"{date_str} {time_str}", fmt))
+            except Exception:
+                continue
+        return None
+
+    def _extract_name_from_party_line(self, value: Optional[str]) -> Optional[str]:
+        if not value:
+            return None
+        cleaned = re.sub(r"(?:HUMO-?CARD|HUMOCARD|HUMO|UZCARD)", " ", value, flags=re.IGNORECASE)
+        cleaned = re.sub(r"[0-9\*]{4,}", " ", cleaned)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip(" ,:-")
+        return cleaned or None
     
     def parse_sender_receiver_transfer(self, text: str) -> Optional[Dict[str, Any]]:
         """
@@ -61,39 +87,79 @@ class RegexParser:
         Receiver amount 1,450,000.00 UZS
         """
         lines_lower = text.lower()
-        if "sender" not in lines_lower or "receiver" not in lines_lower:
+        if "sender" not in lines_lower and "отправител" not in lines_lower:
             return None
 
         amount = None
         currency = "UZS"
-        amount_match = re.search(r'Receiver amount\s+([\d\s\.,]+)\s*(UZS|USD)?', text, re.IGNORECASE)
-        if not amount_match:
-            amount_match = re.search(r'Sender amount\s+([\d\s\.,]+)\s*(UZS|USD)?', text, re.IGNORECASE)
+        amount_match = self._search_any(
+            text,
+            [
+                r'Receiver amount\s*[:\-]?\s*([\d\s\.,]+)\s*(UZS|USD)?',
+                r'Sender amount\s*[:\-]?\s*([\d\s\.,]+)\s*(UZS|USD)?',
+                r'Amount\s*[:\-]?\s*([\d\s\.,]+)\s*(UZS|USD)?',
+                r'Сумма(?:\s+(?:отправителя|получателя))?\s*[:\-]?\s*([\d\s\.,]+)\s*(UZS|USD)?',
+            ],
+        )
         if amount_match:
             try:
                 amount = self.normalize_amount(amount_match.group(1))
             except Exception:
                 pass
             if amount_match.lastindex and amount_match.group(2):
-                currency = amount_match.group(2).upper()
+                currency = self.normalize_currency(amount_match.group(2))
 
-        date_match = re.search(r'Transaction date\s+(\d{2}\.\d{2}\.\d{4})\s+(\d{2}:\d{2}:\d{2})', text, re.IGNORECASE)
+        date_match = self._search_any(
+            text,
+            [
+                r'Trans(?:action|cation)\s+date\s*[:\-]?\s*(\d{2}\.\d{2}\.\d{2,4})\s+(\d{2}:\d{2}(?::\d{2})?)',
+                r'Date(?:\s+transaction)?\s*[:\-]?\s*(\d{2}\.\d{2}\.\d{2,4})\s+(\d{2}:\d{2}(?::\d{2})?)',
+                r'Дата(?:\s+транзакции)?\s*[:\-]?\s*(\d{2}\.\d{2}\.\d{2,4})\s+(\d{2}:\d{2}(?::\d{2})?)',
+            ],
+        )
         transaction_date = None
         if date_match:
-            try:
-                dt_str = f"{date_match.group(1)} {date_match.group(2)}"
-                transaction_date = self.tz.localize(datetime.strptime(dt_str, "%d.%m.%Y %H:%M:%S"))
-            except Exception:
-                pass
+            transaction_date = self._parse_datetime_with_optional_seconds(
+                date_match.group(1),
+                date_match.group(2),
+            )
 
-        sender_mask = re.search(r'Sender\s+([0-9\*]{6,})', text, re.IGNORECASE)
-        receiver_mask = re.search(r'Receiver\s+([0-9\*]{6,})', text, re.IGNORECASE)
-        card_last_4 = self.extract_card_last4(sender_mask.group(1)) if sender_mask else None
-        receiver_card = receiver_mask.group(1).strip() if receiver_mask else None
+        sender_mask = self._search_any(
+            text,
+            [
+                r'\bSender\b\s*[:\-]?\s*([^\n\r]+)',
+                r'Отправител[ья]?\s*[:\-]?\s*([^\n\r]+)',
+            ],
+        )
+        receiver_mask = self._search_any(
+            text,
+            [
+                r'\bReceiver\b\s*[:\-]?\s*([^\n\r]+)',
+                r'Получател[ья]?\s*[:\-]?\s*([^\n\r]+)',
+            ],
+        )
+        sender_line = sender_mask.group(1).strip() if sender_mask else None
+        receiver_line = receiver_mask.group(1).strip() if receiver_mask else None
+        card_last_4 = self.extract_card_last4(sender_line) if sender_line else self.extract_card_last4(text)
+        receiver_card = self.extract_card_last4(receiver_line) if receiver_line else None
 
-        sender_name_match = re.search(r'Sender name\s+([^\n\r]+)', text, re.IGNORECASE)
-        receiver_name_match = re.search(r'Receiver name\s+([^\n\r]+)', text, re.IGNORECASE)
+        sender_name_match = self._search_any(
+            text,
+            [
+                r'Sender name\s*[:\-]?\s*([^\n\r]+)',
+                r'Имя\s+отправителя\s*[:\-]?\s*([^\n\r]+)',
+            ],
+        )
+        receiver_name_match = self._search_any(
+            text,
+            [
+                r'Receiver name\s*[:\-]?\s*([^\n\r]+)',
+                r'Имя\s+получател[ья]?\s*[:\-]?\s*([^\n\r]+)',
+            ],
+        )
         receiver_name = receiver_name_match.group(1).strip() if receiver_name_match else None
+        if not receiver_name:
+            receiver_name = self._extract_name_from_party_line(receiver_line)
 
         if not amount or not transaction_date:
             return None
@@ -122,9 +188,13 @@ class RegexParser:
             return None
 
         sender_mask = re.search(r'Отправителя\s+([0-9\*]{6,})', text, re.IGNORECASE)
+        if not sender_mask:
+            sender_mask = re.search(r'Отправител[ья]?\s*[:\-]?\s*([^\n\r]+)', text, re.IGNORECASE)
         receiver_mask = re.search(r'Получател[ьяя]?\s+([0-9\*]{6,})', text, re.IGNORECASE)
+        if not receiver_mask:
+            receiver_mask = re.search(r'Получател[ьяя]?\s*[:\-]?\s*([^\n\r]+)', text, re.IGNORECASE)
 
-        amount_match = re.search(r'Сумма(?:\s+отправителя)?\s+([\d\s\.,]+)\s*(UZS|USD)?', text, re.IGNORECASE)
+        amount_match = re.search(r'Сумма(?:\s+отправителя)?\s*[:\-]?\s*([\d\s\.,]+)\s*(UZS|USD)?', text, re.IGNORECASE)
         amount = None
         currency = "UZS"
         if amount_match:
@@ -133,24 +203,27 @@ class RegexParser:
             except Exception:
                 amount = None
             if amount_match.lastindex and amount_match.group(2):
-                currency = amount_match.group(2).upper()
+                currency = self.normalize_currency(amount_match.group(2))
 
-        date_match = re.search(r'Дата(?:\s+транзакции)?\s+(\d{2}\.\d{2}\.\d{4})\s+(\d{2}:\d{2}:\d{2})', text, re.IGNORECASE)
+        date_match = re.search(r'Дата(?:\s+транзакции)?\s*[:\-]?\s*(\d{2}\.\d{2}\.\d{2,4})\s+(\d{2}:\d{2}(?::\d{2})?)', text, re.IGNORECASE)
         transaction_date = None
         if date_match:
-            try:
-                dt_str = f"{date_match.group(1)} {date_match.group(2)}"
-                transaction_date = self.tz.localize(datetime.strptime(dt_str, "%d.%m.%Y %H:%M:%S"))
-            except Exception:
-                transaction_date = None
+            transaction_date = self._parse_datetime_with_optional_seconds(
+                date_match.group(1),
+                date_match.group(2),
+            )
 
         operator_raw = "Uzum Bank"
 
         receiver_name_match = re.search(r'(?:Receiver name|Имя\s+получател[ьяя]?|Имя\s+отправителя|Имя)\s+([^\n\r]+)', text, re.IGNORECASE)
         receiver_name = receiver_name_match.group(1).strip() if receiver_name_match else None
 
-        card_last_4 = self.extract_card_last4(sender_mask.group(1)) if sender_mask else None
-        receiver_card = receiver_mask.group(1).strip() if receiver_mask else None
+        sender_line = sender_mask.group(1).strip() if sender_mask else None
+        receiver_line = receiver_mask.group(1).strip() if receiver_mask else None
+        card_last_4 = self.extract_card_last4(sender_line) if sender_line else self.extract_card_last4(text)
+        receiver_card = self.extract_card_last4(receiver_line) if receiver_line else None
+        if not receiver_name:
+            receiver_name = self._extract_name_from_party_line(receiver_line)
 
         if amount is None or transaction_date is None:
             return None
@@ -205,6 +278,14 @@ class RegexParser:
 
         return Decimal(cleaned)
 
+    def normalize_currency(self, currency: Optional[str]) -> str:
+        if not currency:
+            return "UZS"
+        code = str(currency).strip().upper()
+        if code in {"СУМ", "СЎМ", "SUM"}:
+            return "UZS"
+        return code
+
     def extract_card_last4(self, text: str) -> Optional[str]:
         """Extract last 4 digits of card number from various masked formats."""
         patterns = [
@@ -222,9 +303,12 @@ class RegexParser:
         """Parse date and time strings to datetime object"""
         try:
             if format_type == 'semicolon':
-                # Format: YY-MM-DD HH:MM
-                year, month, day = date_str.split('-')
-                full_year = f"20{year}"
+                # Format: YY-MM-DD HH:MM or YYYY-MM-DD HH:MM
+                parts = date_str.split('-')
+                year = parts[0]
+                month = parts[1]
+                day = parts[2]
+                full_year = f"20{year}" if len(year) == 2 else year
                 dt_str = f"{full_year}-{month}-{day} {time_str}"
                 dt = datetime.strptime(dt_str, "%Y-%m-%d %H:%M")
             else:
@@ -249,7 +333,11 @@ class RegexParser:
         if not amount_match:
             return None
         amount = self.normalize_amount(amount_match.group(1))
-        amount_currency = amount_match.group(2) if amount_match.lastindex and amount_match.lastindex >= 2 else None
+        amount_currency = (
+            self.normalize_currency(amount_match.group(2))
+            if amount_match.lastindex and amount_match.lastindex >= 2 and amount_match.group(2)
+            else None
+        )
         
         # Extract transaction type
         type_match = re.search(patterns['transaction_type'], text, re.IGNORECASE)
@@ -303,15 +391,23 @@ class RegexParser:
         
         # Extract datetime
         datetime_match = re.search(patterns['datetime'], text)
-        if not datetime_match:
-            return None
-        if datetime_match.group(1) and datetime_match.group(2):
-            time_str = datetime_match.group(1)
-            date_str = datetime_match.group(2)
+        if datetime_match:
+            if datetime_match.group(1) and datetime_match.group(2):
+                time_str = datetime_match.group(1)
+                date_str = datetime_match.group(2)
+            else:
+                date_str = datetime_match.group(3)
+                time_str = datetime_match.group(4)
         else:
-            date_str = datetime_match.group(3)
-            time_str = datetime_match.group(4)
-        transaction_date = self.parse_date(date_str, time_str)
+            datetime_fallback = re.search(patterns['datetime_fallback'], text)
+            if not datetime_fallback:
+                return None
+            date_str = datetime_fallback.group(1)
+            time_str = datetime_fallback.group(2)
+        try:
+            transaction_date = self.parse_date(date_str, time_str)
+        except ValueError:
+            return None
         
         # Extract balance
         balance_match = re.search(patterns['balance'], text)
@@ -321,7 +417,7 @@ class RegexParser:
         currency = amount_currency
         if not currency:
             currency_match = re.search(patterns['currency'], text)
-            currency = currency_match.group(1) if currency_match else 'UZS'
+            currency = self.normalize_currency(currency_match.group(1)) if currency_match else 'UZS'
         
         return {
             'amount': amount,
@@ -344,6 +440,11 @@ class RegexParser:
         if not amount_match:
             return None
         amount = self.normalize_amount(amount_match.group(1))
+        currency = (
+            self.normalize_currency(amount_match.group(2))
+            if amount_match.lastindex and amount_match.lastindex >= 2 and amount_match.group(2)
+            else 'UZS'
+        )
         
         # Extract operator
         operator_match = re.search(patterns['operator'], text)
@@ -351,11 +452,18 @@ class RegexParser:
         
         # Extract datetime
         datetime_match = re.search(patterns['datetime'], text)
+        format_type = 'standard'
+        if not datetime_match:
+            datetime_match = re.search(patterns['datetime_iso'], text)
+            format_type = 'semicolon'
         if not datetime_match:
             return None
         date_str = datetime_match.group(1)
         time_str = datetime_match.group(2)
-        transaction_date = self.parse_date(date_str, time_str)
+        try:
+            transaction_date = self.parse_date(date_str, time_str, format_type=format_type)
+        except ValueError:
+            return None
         
         # Extract card
         card_last_4 = self.extract_card_last4(text)
@@ -368,10 +476,12 @@ class RegexParser:
         type_match = re.search(patterns['type_keyword'], text)
         if type_match:
             keyword = type_match.group(1)
-            if keyword in ['Popolnenie']:
-                transaction_type = 'CREDIT'
-            elif keyword == 'OTMENA':
+            if keyword == 'OTMENA':
                 transaction_type = 'REVERSAL'
+            elif keyword in ['Popolnenie']:
+                transaction_type = 'CREDIT'
+            elif keyword in ['E-Com', 'Platezh', 'Pokupka', 'Spisanie']:
+                transaction_type = 'DEBIT'
             else:
                 transaction_type = 'DEBIT'
         else:
@@ -379,7 +489,7 @@ class RegexParser:
         
         return {
             'amount': amount,
-            'currency': 'UZS',
+            'currency': currency,
             'transaction_type': transaction_type,
             'card_last_4': card_last_4,
             'operator_raw': operator_raw,
@@ -404,7 +514,7 @@ class RegexParser:
         
         # Map operation type
         type_map = {'oplata': 'DEBIT', 'popolnenie': 'CREDIT', 'operacija': 'DEBIT'}
-        transaction_type = type_map.get(op_type, 'DEBIT')
+        transaction_type = type_map.get(op_type.lower(), 'DEBIT')
         
         # Extract operator
         operator_match = re.search(patterns['operator'], text)
@@ -421,7 +531,10 @@ class RegexParser:
         time_str = datetime_match.group(4)
         date_str = f"{year}-{month}-{day}"
         
-        transaction_date = self.parse_date(date_str, time_str, format_type='semicolon')
+        try:
+            transaction_date = self.parse_date(date_str, time_str, format_type='semicolon')
+        except ValueError:
+            return None
         
         # Extract balance
         balance_match = re.search(patterns['balance'], text)
@@ -440,14 +553,18 @@ class RegexParser:
         }
 
     def parse_cardxabar(self, text: str) -> Optional[Dict[str, Any]]:
-        """Parse CardXabar-style emoji notifications."""
+        """Parse CardXabar notifications (emoji and text-label variants)."""
         patterns = self.patterns['cardxabar']
 
         amount_match = re.search(patterns['amount'], text)
         if not amount_match:
             return None
         amount = self.normalize_amount(amount_match.group(1))
-        currency = amount_match.group(2) if amount_match.lastindex and amount_match.lastindex >= 2 else None
+        currency = (
+            self.normalize_currency(amount_match.group(2))
+            if amount_match.lastindex and amount_match.lastindex >= 2 and amount_match.group(2)
+            else None
+        )
 
         card_last_4 = self.extract_card_last4(text)
 
@@ -455,20 +572,28 @@ class RegexParser:
         operator_raw = operator_match.group(1).strip() if operator_match else None
 
         dt_match = re.search(patterns['datetime'], text)
-        if not dt_match:
-            return None
-        if dt_match.group(1) and dt_match.group(2):
-            time_str = dt_match.group(1)
-            date_str = dt_match.group(2)
+        if dt_match:
+            if dt_match.group(1) and dt_match.group(2):
+                time_str = dt_match.group(1)
+                date_str = dt_match.group(2)
+            else:
+                date_str = dt_match.group(3)
+                time_str = dt_match.group(4)
         else:
-            date_str = dt_match.group(3)
-            time_str = dt_match.group(4)
-        transaction_date = self.parse_date(date_str, time_str)
+            dt_text_match = re.search(patterns['datetime_text'], text, re.IGNORECASE)
+            if not dt_text_match:
+                return None
+            date_str = dt_text_match.group(1)
+            time_str = dt_text_match.group(2)
+        try:
+            transaction_date = self.parse_date(date_str, time_str)
+        except ValueError:
+            return None
 
         balance_match = re.search(patterns['balance'], text)
         balance_after = self.normalize_amount(balance_match.group(1)) if balance_match and balance_match.group(1) else None
         if not currency and balance_match and balance_match.lastindex and balance_match.lastindex >= 2 and balance_match.group(2):
-            currency = balance_match.group(2)
+            currency = self.normalize_currency(balance_match.group(2))
         if not currency:
             currency = 'UZS'
 
@@ -477,8 +602,10 @@ class RegexParser:
             transaction_type = 'REVERSAL'
         elif "КОНВЕРС" in upper_text or "CONVERS" in upper_text or "CONVERSION" in upper_text or "КОНВЕРСИЯ" in upper_text or "KONVERS" in upper_text:
             transaction_type = 'CONVERSION'
-        elif '🟢' in text or '➕' in text:
+        elif "ZACHISLENIE" in upper_text or '🟢' in text or '➕' in text:
             transaction_type = 'CREDIT'
+        elif "SPISANIE" in upper_text or '🔴' in text or '➖' in text:
+            transaction_type = 'DEBIT'
         else:
             transaction_type = 'DEBIT'
 
@@ -504,13 +631,21 @@ class RegexParser:
         Returns:
             Parsed transaction dict or None if parsing failed
         """
-        # CardXabar style (red/green bullets, 💵 balance)
-        if any(marker in text for marker in ['CardXabar', 'NBU Card', '🔴', '🟢']):
+        if not text or len(text) > 10000:
+            return None
+
+        lower_text = text.lower()
+        upper_text = text.upper()
+
+        # CardXabar style (red/green bullets, text labels)
+        if any(marker in text for marker in ['CardXabar', 'NBU Card', '🔴', '🟢']) or any(
+            marker in lower_text for marker in ['summa:', 'karta:', 'magazin:', 'otpravitel:', 'data:', 'vremya:']
+        ):
             result = self.parse_cardxabar(text)
             if result:
                 return result
 
-        # Try Humo notification format first (most common)
+        # Try focused transfer formats.
         result = self.parse_ru_transfer(text)
         if result:
             return result
@@ -519,22 +654,39 @@ class RegexParser:
         if result:
             return result
 
-        if any(emoji in text for emoji in ['💸', '💳', '📍', '🕓', '🕘']):
+        if any(emoji in text for emoji in ['💸', '💳', '📍', '🏪', '🕓', '🕘', '📅', '➖', '➕']):
             result = self.parse_humo_notification(text)
             if result:
                 return result
         
         # Try semicolon format
-        if 'HUMOCARD *' in text and ';' in text:
+        if ('HUMOCARD*' in upper_text or 'HUMOCARD *' in upper_text) and ';' in text:
             result = self.parse_semicolon_format(text)
             if result:
                 return result
         
         # Try SMS inline format
-        if 'summa:' in text and 'karta' in text:
+        sms_keywords = ['pokupka:', 'spisanie', 'popolnenie', 'e-com oplata', 'platezh:', 'otmena']
+        if any(kw in lower_text for kw in sms_keywords):
             result = self.parse_sms_inline(text)
             if result:
                 return result
-        
-        # All formats failed
+
+        # Full fallback cascade for mixed/dirty formats.
+        for parser_fn in (
+            self.parse_cardxabar,
+            self.parse_ru_transfer,
+            self.parse_sender_receiver_transfer,
+            self.parse_humo_notification,
+            self.parse_semicolon_format,
+            self.parse_sms_inline,
+        ):
+            try:
+                result = parser_fn(text)
+            except Exception:
+                result = None
+            if result:
+                return result
+
+        # All formats failed.
         return None

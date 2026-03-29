@@ -1,10 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { transactionsApi, Transaction } from '../services/api';
+import { Transaction } from '../services/api';
 import { db } from '../storage/db';
+import { syncManager } from '../services/syncManager';
 
 type SyncProgress = {
     downloaded: number;
     pages: number;
+    total?: number;
     status?: 'idle' | 'running' | 'done' | 'error';
 };
 
@@ -16,6 +18,7 @@ export const useOfflineTransactions = () => {
     const [syncProgress, setSyncProgress] = useState<SyncProgress>({ downloaded: 0, pages: 0, status: 'idle' });
     const [lastSyncAt, setLastSyncAt] = useState<string | null>(null);
     const retryDelayRef = useRef<number>(5 * 60 * 1000); // 5 minutes
+    const INITIAL_LOOP_DELAY_MS = 15 * 1000;
 
     const sortTransactions = useCallback((items: Transaction[]) => {
         return [...items].sort((a, b) => {
@@ -56,52 +59,29 @@ export const useOfflineTransactions = () => {
         setSyncProgress({ downloaded: 0, pages: 0, status: 'running' });
         if (!background) setIsLoading(true);
         try {
-            const pageSize = 1000;
-            let page = 1;
-            let fetched: Transaction[] = [];
+            await syncManager.runSyncCycle();
+            const all = await db.transactions.toArray();
+            const sortedFetched = sortTransactions(all);
 
-            while (true) {
-                const response = await transactionsApi.getTransactions({
-                    page,
-                    page_size: pageSize,
-                    sort_by: 'transaction_date',
-                    sort_dir: 'asc',
-                });
-                const items = response.items || [];
-                if (!items.length) break;
-
-                fetched = fetched.concat(items);
-                setSyncProgress({
-                    downloaded: fetched.length,
-                    pages: page,
-                    status: 'running',
-                });
-
-                if (items.length < pageSize) break;
-                page += 1;
-            }
-
-            const sortedFetched = sortTransactions(fetched);
-
-            await db.transaction('rw', db.transactions, db.meta, async () => {
-                await db.transactions.clear();
-                if (sortedFetched.length) {
-                    await db.transactions.bulkPut(sortedFetched);
-                }
-                const now = new Date().toISOString();
-                await db.meta.put({ key: 'lastSyncAt', value: now });
-                setLastSyncAt(now);
-                await db.meta.put({ key: 'version', value: META_VERSION });
+            const txStatus = syncManager.getStatuses().find((item) => item.table === 'transactions');
+            setSyncProgress({
+                downloaded: sortedFetched.length,
+                pages: txStatus ? Math.max(1, Math.ceil((txStatus.rows || 0) / 5000)) : 1,
+                total: txStatus?.rows,
+                status: 'running',
             });
+
+            const lastSync = await db.meta.get('lastSyncAt');
+            setLastSyncAt(lastSync?.value || new Date().toISOString());
 
             setData(sortedFetched);
             setIsOfflineReady(sortedFetched.length > 0);
             setSyncProgress((prev) => ({ ...prev, status: 'done' }));
-            retryDelayRef.current = 5 * 60 * 1000;
+            retryDelayRef.current = syncManager.getBackoffMs();
         } catch (error) {
             console.error('Failed to sync from server', error);
             setSyncProgress((prev) => ({ ...prev, status: 'error' }));
-            retryDelayRef.current = Math.min(retryDelayRef.current * 2, 30 * 60 * 1000);
+            retryDelayRef.current = syncManager.getBackoffMs();
         } finally {
             if (!background) setIsLoading(false);
         }
@@ -165,10 +145,19 @@ export const useOfflineTransactions = () => {
     }, [loadTransactions, syncFromServer]);
 
     useEffect(() => {
-        const interval = setInterval(() => {
-            syncFromServer(true);
-        }, retryDelayRef.current);
-        return () => clearInterval(interval);
+        let timeout: ReturnType<typeof setTimeout> | null = null;
+        let cancelled = false;
+        const loop = async () => {
+            if (cancelled) return;
+            await syncFromServer(true);
+            if (cancelled) return;
+            timeout = setTimeout(loop, retryDelayRef.current);
+        };
+        timeout = setTimeout(loop, Math.min(retryDelayRef.current, INITIAL_LOOP_DELAY_MS));
+        return () => {
+            cancelled = true;
+            if (timeout) clearTimeout(timeout);
+        };
     }, [syncFromServer]);
 
     return {
