@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { X, Calendar, Search, DollarSign, Smartphone, Hash } from 'lucide-react';
 import { DatePicker } from './DateTimePicker';
 
@@ -13,6 +13,7 @@ interface FilterState {
     operators: string[];
     apps: string[];
     sourceType: 'ALL' | 'TELEGRAM' | 'SMS' | 'MANUAL';
+    telegramSourceIds: number[];
     cardId: string;
 }
 
@@ -23,6 +24,7 @@ interface FilterDrawerProps {
     initialFilters?: Partial<FilterState>;
     operatorOptions?: string[];
     appOptions?: string[];
+    telegramSourceOptions?: Array<{ chat_id: number; title: string; chat_type?: 'bot' | 'group' | 'supergroup' | 'channel' | 'private' | null; count: number }>;
 }
 
 const DEFAULT_FILTERS: FilterState = {
@@ -36,8 +38,30 @@ const DEFAULT_FILTERS: FilterState = {
     operators: [],
     apps: [],
     sourceType: 'ALL',
+    telegramSourceIds: [],
     cardId: '',
 };
+
+function normalizeFilterState(input?: Partial<FilterState>): FilterState {
+    const nextSourceType = input?.sourceType;
+    const nextTelegramSourceIds = Array.isArray(input?.telegramSourceIds) ? [...input.telegramSourceIds] : [];
+    const normalizedSourceType =
+        nextSourceType === 'SMS' || nextSourceType === 'MANUAL'
+            ? nextSourceType
+            : nextTelegramSourceIds.length > 0
+                ? 'TELEGRAM'
+                : 'ALL';
+    return {
+        ...DEFAULT_FILTERS,
+        ...input,
+        daysOfWeek: Array.isArray(input?.daysOfWeek) ? [...input.daysOfWeek] : [],
+        transactionTypes: Array.isArray(input?.transactionTypes) ? [...input.transactionTypes] : [],
+        operators: Array.isArray(input?.operators) ? [...input.operators] : [],
+        apps: Array.isArray(input?.apps) ? [...input.apps] : [],
+        sourceType: normalizedSourceType,
+        telegramSourceIds: nextTelegramSourceIds,
+    };
+}
 
 const TRANS_TYPES = ['DEBIT', 'CREDIT', 'CONVERSION', 'REVERSAL']; // Mapped values might differ, using keys for now
 const DAYS_MAP = [
@@ -57,12 +81,20 @@ export const FilterDrawer: React.FC<FilterDrawerProps> = ({
     initialFilters,
     operatorOptions = [],
     appOptions = [],
+    telegramSourceOptions = [],
 }) => {
-    const [filters, setFilters] = useState<FilterState>({ ...DEFAULT_FILTERS, ...initialFilters });
+    const normalizedInitialFilters = useMemo(() => normalizeFilterState(initialFilters), [initialFilters]);
+    const normalizedInitialFiltersKey = useMemo(
+        () => JSON.stringify(normalizedInitialFilters),
+        [normalizedInitialFilters],
+    );
+    const lastHydratedFiltersKeyRef = useRef(normalizedInitialFiltersKey);
+    const [filters, setFilters] = useState<FilterState>(() => normalizedInitialFilters);
     const [isVisible, setIsVisible] = useState(false);
     const [isMounted, setIsMounted] = useState(false);
     const [operatorSearch, setOperatorSearch] = useState('');
     const [appSearch, setAppSearch] = useState('');
+    const [sourceSearch, setSourceSearch] = useState('');
 
     // Animation Logic
     useEffect(() => {
@@ -94,20 +126,60 @@ export const FilterDrawer: React.FC<FilterDrawerProps> = ({
         }));
     };
 
+    const toggleTelegramSource = (chatId: number) => {
+        setFilters((prev) => {
+            const nextTelegramSourceIds = prev.telegramSourceIds.includes(chatId)
+                ? prev.telegramSourceIds.filter((id) => id !== chatId)
+                : [...prev.telegramSourceIds, chatId];
+            return {
+                ...prev,
+                sourceType: nextTelegramSourceIds.length > 0 ? 'TELEGRAM' : 'ALL',
+                telegramSourceIds: nextTelegramSourceIds,
+            };
+        });
+    };
+
+    const applyDirectSource = (sourceType: 'SMS' | 'MANUAL') => {
+        setFilters((prev) => ({
+            ...prev,
+            sourceType: prev.sourceType === sourceType ? 'ALL' : sourceType,
+            telegramSourceIds: [],
+        }));
+    };
+
     const handleApply = () => {
         onApply(filters);
         onClose();
     };
 
     const handleReset = () => {
-        setFilters({ ...DEFAULT_FILTERS });
+        const resetFilters = normalizeFilterState();
+        setFilters(resetFilters);
         setOperatorSearch('');
         setAppSearch('');
+        setSourceSearch('');
+        onApply(resetFilters);
     };
 
     useEffect(() => {
-        setFilters(prev => ({ ...DEFAULT_FILTERS, ...prev, ...initialFilters }));
-    }, [initialFilters]);
+        if (lastHydratedFiltersKeyRef.current === normalizedInitialFiltersKey) {
+            return;
+        }
+        if (!isOpen || !isMounted) {
+            setFilters(normalizedInitialFilters);
+            lastHydratedFiltersKeyRef.current = normalizedInitialFiltersKey;
+        }
+    }, [isMounted, isOpen, normalizedInitialFilters, normalizedInitialFiltersKey]);
+
+    useEffect(() => {
+        if (!isOpen) {
+            return;
+        }
+        if (lastHydratedFiltersKeyRef.current !== normalizedInitialFiltersKey) {
+            setFilters(normalizedInitialFilters);
+            lastHydratedFiltersKeyRef.current = normalizedInitialFiltersKey;
+        }
+    }, [isOpen, normalizedInitialFilters, normalizedInitialFiltersKey]);
 
     const filteredOperators = operatorOptions
         .filter((op) => op.toLowerCase().includes(operatorSearch.toLowerCase()))
@@ -117,20 +189,24 @@ export const FilterDrawer: React.FC<FilterDrawerProps> = ({
         .filter((app) => app.toLowerCase().includes(appSearch.toLowerCase()))
         .sort((a, b) => a.localeCompare(b));
 
+    const filteredTelegramSources = telegramSourceOptions
+        .filter((item) => item.title.toLowerCase().includes(sourceSearch.toLowerCase()))
+        .sort((a, b) => a.title.localeCompare(b.title));
+
     if (!isMounted) return null;
 
     return (
-        <div className="fixed inset-0 z-[60] flex justify-end">
+        <div className={`fixed inset-0 z-[var(--z-modal)] flex justify-end ${isVisible ? 'pointer-events-auto' : 'pointer-events-none'}`}>
             {/* Backdrop */}
             <div
-                className={`fixed inset-0 bg-black/20 backdrop-blur-sm transition-opacity duration-300 ease-in-out ${isVisible ? 'opacity-100' : 'opacity-0'
+                className={`fixed inset-0 bg-black/20 backdrop-blur-sm transition-opacity duration-300 ease-in-out ${isVisible ? 'opacity-100 pointer-events-auto' : 'opacity-0 pointer-events-none'
                     }`}
                 onClick={onClose}
             />
 
             {/* Drawer */}
             <div
-                className={`relative w-full max-w-md bg-surface h-full shadow-2xl flex flex-col transform transition-transform duration-300 ease-in-out border-l border-border ${isVisible ? 'translate-x-0' : 'translate-x-full'
+                className={`relative w-full max-w-md bg-surface h-full shadow-2xl flex flex-col transform transition-transform duration-300 ease-in-out border-l border-border ${isVisible ? 'translate-x-0 pointer-events-auto' : 'translate-x-full pointer-events-none'
                     }`}
             >
                 {/* Header */}
@@ -313,20 +389,94 @@ export const FilterDrawer: React.FC<FilterDrawerProps> = ({
                             </div>
                         </div>
                         <div className="mt-4">
-                            <label className="text-xs text-foreground-muted mb-2 block">Источник</label>
-                            <div className="flex gap-4">
-                                {['ALL', 'TELEGRAM', 'SMS', 'MANUAL'].map(src => (
-                                    <label key={src} className="flex items-center gap-2 text-sm text-foreground">
-                                        <input
-                                            type="radio"
-                                            name="sourceType"
-                                            checked={filters.sourceType === src}
-                                            onChange={() => setFilters({ ...filters, sourceType: src as any })}
-                                            className="text-primary focus:ring-primary"
-                                        />
-                                        {getSourceLabel(src)}
-                                    </label>
-                                ))}
+                            <div className="flex items-center justify-between">
+                                <label className="text-xs text-foreground-muted">Источник</label>
+                                <button
+                                    onClick={() => setFilters({ ...filters, sourceType: 'ALL', telegramSourceIds: [] })}
+                                    className="text-[11px] text-primary"
+                                >
+                                    Сбросить источник
+                                </button>
+                            </div>
+                            <div className="mt-3 flex flex-wrap gap-2">
+                                <button
+                                    type="button"
+                                    onClick={() => applyDirectSource('SMS')}
+                                    className={`rounded-md border px-3 py-1.5 text-sm transition-colors ${
+                                        filters.sourceType === 'SMS'
+                                            ? 'border-primary bg-primary text-foreground-inverse'
+                                            : 'border-border bg-surface text-foreground hover:bg-surface-2'
+                                    }`}
+                                >
+                                    СМС
+                                </button>
+                                <button
+                                    type="button"
+                                    onClick={() => applyDirectSource('MANUAL')}
+                                    className={`rounded-md border px-3 py-1.5 text-sm transition-colors ${
+                                        filters.sourceType === 'MANUAL'
+                                            ? 'border-primary bg-primary text-foreground-inverse'
+                                            : 'border-border bg-surface text-foreground hover:bg-surface-2'
+                                    }`}
+                                >
+                                    Ручной
+                                </button>
+                            </div>
+                            <div className="mt-4 space-y-2">
+                                <div className="flex items-center justify-between">
+                                    <label className="text-xs text-foreground-muted">Актуальные Telegram-источники</label>
+                                    <div className="flex gap-2 text-[11px] text-primary">
+                                        <button
+                                            onClick={() =>
+                                                setFilters({
+                                                    ...filters,
+                                                    sourceType: filteredTelegramSources.length > 0 ? 'TELEGRAM' : 'ALL',
+                                                    telegramSourceIds: filteredTelegramSources.map((item) => item.chat_id),
+                                                })
+                                            }
+                                        >
+                                            Выбрать все
+                                        </button>
+                                        <button
+                                            onClick={() =>
+                                                setFilters({
+                                                    ...filters,
+                                                    sourceType: 'ALL',
+                                                    telegramSourceIds: [],
+                                                })
+                                            }
+                                        >
+                                            Снять все
+                                        </button>
+                                    </div>
+                                </div>
+                                <input
+                                    value={sourceSearch}
+                                    onChange={(e) => setSourceSearch(e.target.value)}
+                                    placeholder="Поиск бота, группы или канала"
+                                    className="input-base text-sm"
+                                />
+                                <div className="grid grid-cols-1 gap-2 max-h-48 overflow-auto border border-border rounded-md p-2">
+                                    {filteredTelegramSources.map((item) => (
+                                        <label key={item.chat_id} className="flex items-start gap-2 text-sm text-foreground">
+                                            <input
+                                                type="checkbox"
+                                                checked={filters.telegramSourceIds.includes(item.chat_id)}
+                                                onChange={() => toggleTelegramSource(item.chat_id)}
+                                                className="rounded text-primary focus:ring-primary border-border mt-0.5"
+                                            />
+                                            <div className="min-w-0">
+                                                <div className="truncate">{item.title}</div>
+                                                <div className="text-[11px] text-foreground-secondary">
+                                                    {getChatTypeLabel(item.chat_type)} · {item.count}
+                                                </div>
+                                            </div>
+                                        </label>
+                                    ))}
+                                    {filteredTelegramSources.length === 0 && (
+                                        <div className="text-xs text-foreground-secondary">Нет актуальных источников</div>
+                                    )}
+                                </div>
                             </div>
                         </div>
                     </section>
@@ -379,14 +529,16 @@ const getTypeLabel = (type: string) => {
     return map[type] || type;
 };
 
-const getSourceLabel = (src: string) => {
+const getChatTypeLabel = (type?: string | null) => {
     const map: Record<string, string> = {
-        ALL: 'Все',
-        TELEGRAM: 'Телеграм',
-        SMS: 'СМС',
-        MANUAL: 'Ручной',
+        bot: 'Бот',
+        group: 'Группа',
+        supergroup: 'Супергруппа',
+        channel: 'Канал',
+        private: 'Личка',
     };
-    return map[src] || src;
+    if (!type) return 'Telegram';
+    return map[type] || type;
 };
 
 // CSS Utilities (injected for simplicity, ideally in index.css)

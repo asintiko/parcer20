@@ -9,28 +9,39 @@ import { TelegramChatMessage, TelegramProcessResult, API_BASE_URL } from '../ser
 
 interface MessageItemProps {
     message: TelegramChatMessage;
-    isSelected: boolean;
+    selectionMode?: boolean;
+    isSelected?: boolean;
     status?: TelegramProcessResult;
-    processingId: number | null;
-    currentChatId: number | null;
-    onToggleSelect: (id: number) => void;
-    onProcess: (chatId: number, messageId: number) => void;
-    onReprocess: (chatId: number, messageId: number) => void;
-    onPreview: (url: string) => void;
-    formatDateTime: (date?: string | null) => string;
+    processingId?: number | null;
+    currentChatId?: number | null;
+    showProcessingControls?: boolean;
+    onToggleSelect?: (id: number) => void;
+    onProcess?: (chatId: number, messageId: number) => void | ((messageId: number) => void);
+    onReprocess?: (chatId: number, messageId: number) => void;
+    onPreview?: (url: string) => void;
+    formatDateTime?: (date?: string | null) => string;
 }
+
+const defaultFormatDateTime = (date?: string | null) => {
+    if (!date) return '';
+    try {
+        return new Date(date).toLocaleString('ru-RU', { day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit' });
+    } catch { return date; }
+};
 
 export const MessageItem = memo<MessageItemProps>(({
     message,
-    isSelected,
+    selectionMode = false,
+    isSelected = false,
     status,
-    processingId,
-    currentChatId,
+    processingId = null,
+    currentChatId = null,
+    showProcessingControls = false,
     onToggleSelect,
     onProcess,
     onReprocess,
     onPreview,
-    formatDateTime,
+    formatDateTime = defaultFormatDateTime,
 }) => {
     const msgId = message.id as number;
     const doc = message.document;
@@ -52,24 +63,30 @@ export const MessageItem = memo<MessageItemProps>(({
         if (target.closest('button') || target.closest('a') || target.closest('input')) {
             return;
         }
-        onToggleSelect(msgId);
+        if (!selectionMode) {
+            return;
+        }
+        onToggleSelect?.(msgId);
     };
 
     const statusText = status?.status || 'not_processed';
     const err = status?.error;
+    const showStatusBadge = showProcessingControls || statusText !== 'not_processed';
 
     return (
         <div
-            className={`flex items-start gap-3 p-2 rounded-lg transition-colors cursor-pointer ${isSelected ? 'bg-primary/10 ring-2 ring-primary/30' : 'hover:bg-surface-2/50'
+            className={`flex items-start gap-3 p-2 rounded-lg transition-colors ${selectionMode ? 'cursor-pointer' : 'cursor-default'} ${isSelected ? 'bg-primary/10 ring-2 ring-primary/30' : selectionMode ? 'hover:bg-surface-2/50' : ''
                 }`}
             onClick={handleMessageClick}
         >
-            <input
-                type="checkbox"
-                className="mt-2 w-6 h-6 text-primary border-border rounded focus:ring-primary cursor-pointer flex-shrink-0"
-                checked={isSelected}
-                onChange={() => onToggleSelect(msgId)}
-            />
+            {selectionMode && (
+                <input
+                    type="checkbox"
+                    className="mt-2 w-6 h-6 text-primary border-border rounded focus:ring-primary cursor-pointer flex-shrink-0"
+                    checked={isSelected}
+                    onChange={() => onToggleSelect?.(msgId)}
+                />
+            )}
             <div className={`flex-1 flex ${message.is_outgoing ? 'justify-end' : 'justify-start'}`}>
                 <div
                     className={`max-w-[75%] rounded-lg px-4 py-3 border shadow-sm ${message.is_outgoing
@@ -77,6 +94,12 @@ export const MessageItem = memo<MessageItemProps>(({
                             : 'bg-surface-2 text-foreground border-border'
                         }`}
                 >
+                    {message._receipt_transaction_id && (
+                        <div className="inline-flex items-center gap-1 mb-1 px-1.5 py-0.5 rounded text-[10px] font-medium bg-success/15 text-success">
+                            <CheckCircle2 className="w-3 h-3" />
+                            Чек #{message._receipt_transaction_id}
+                        </div>
+                    )}
                     <div className="text-sm whitespace-pre-wrap">
                         {message.text || 'Сообщение без текста'}
                     </div>
@@ -99,7 +122,7 @@ export const MessageItem = memo<MessageItemProps>(({
                                     <button
                                         type="button"
                                         className="underline text-primary hover:text-primary-hover"
-                                        onClick={() => onPreview(downloadUrl)}
+                                        onClick={() => onPreview?.(downloadUrl)}
                                     >
                                         Просмотр
                                     </button>
@@ -107,101 +130,105 @@ export const MessageItem = memo<MessageItemProps>(({
                             </div>
                         </div>
                     )}
-                    <div className="flex items-center gap-2 text-xs mt-2">
-                        {(() => {
-                            if (statusText === 'done') {
+                    {showStatusBadge && (
+                        <div className="flex items-center gap-2 text-xs mt-2">
+                            {(() => {
+                                if (statusText === 'done') {
+                                    return (
+                                        <span className="flex items-center gap-1 text-success">
+                                            <CheckCircle2 className="w-4 h-4" /> Обработан
+                                            {status?.check_id ? ` #${status.check_id}` : ''}
+                                        </span>
+                                    );
+                                }
+                                if (statusText === 'queued') {
+                                    return (
+                                        <span className="flex items-center gap-1 text-warning">
+                                            <Loader2 className="w-4 h-4 animate-spin" /> В очереди
+                                        </span>
+                                    );
+                                }
+                                if (statusText === 'processing') {
+                                    return (
+                                        <span className="flex items-center gap-1 text-info">
+                                            <Loader2 className="w-4 h-4 animate-spin" /> Обработка
+                                        </span>
+                                    );
+                                }
+                                if (statusText === 'failed') {
+                                    return (
+                                        <span className="flex items-center gap-1 text-danger" title={err || 'Ошибка'}>
+                                            <XCircle className="w-4 h-4" /> Ошибка {err ? `: ${err}` : ''}
+                                        </span>
+                                    );
+                                }
                                 return (
-                                    <span className="flex items-center gap-1 text-success">
-                                        <CheckCircle2 className="w-4 h-4" /> Обработан
-                                        {status?.check_id ? ` #${status.check_id}` : ''}
+                                    <span className="flex items-center gap-1 text-foreground-secondary">
+                                        <AlertCircle className="w-4 h-4" /> Не обработан
                                     </span>
                                 );
-                            }
-                            if (statusText === 'queued') {
-                                return (
-                                    <span className="flex items-center gap-1 text-warning">
-                                        <Loader2 className="w-4 h-4 animate-spin" /> В очереди
-                                    </span>
-                                );
-                            }
-                            if (statusText === 'processing') {
-                                return (
-                                    <span className="flex items-center gap-1 text-info">
-                                        <Loader2 className="w-4 h-4 animate-spin" /> Обработка
-                                    </span>
-                                );
-                            }
-                            if (statusText === 'failed') {
-                                return (
-                                    <span className="flex items-center gap-1 text-danger" title={err || 'Ошибка'}>
-                                        <XCircle className="w-4 h-4" /> Ошибка {err ? `: ${err}` : ''}
-                                    </span>
-                                );
-                            }
-                            return (
-                                <span className="flex items-center gap-1 text-foreground-secondary">
-                                    <AlertCircle className="w-4 h-4" /> Не обработан
-                                </span>
-                            );
-                        })()}
-                    </div>
+                            })()}
+                        </div>
+                    )}
                     <div className="text-[11px] mt-1 text-right opacity-80">
                         {formatDateTime(message.date)}
                     </div>
-                    <div className="flex justify-end mt-3 gap-2">
-                        {status?.status === 'done' ? (
-                            <>
-                                <button
-                                    type="button"
-                                    className="text-sm px-4 py-2 min-h-[40px] rounded-md border border-success text-success bg-success/10 cursor-default font-medium"
-                                    disabled
-                                >
-                                    ✓ Обработано
-                                </button>
+                    {showProcessingControls && (
+                        <div className="flex justify-end mt-3 gap-2">
+                            {status?.status === 'done' ? (
+                                <>
+                                    <button
+                                        type="button"
+                                        className="text-sm px-4 py-2 min-h-[40px] rounded-md border border-success text-success bg-success/10 cursor-default font-medium"
+                                        disabled
+                                    >
+                                        ✓ Обработано
+                                    </button>
+                                    <button
+                                        type="button"
+                                        onClick={(e) => {
+                                            e.stopPropagation();
+                                            if (!currentChatId) return;
+                                            onReprocess?.(currentChatId, msgId);
+                                        }}
+                                        className="text-sm px-4 py-2 min-h-[40px] rounded-md border border-border text-foreground-secondary hover:bg-surface-2 disabled:opacity-50 font-medium transition-colors"
+                                        disabled={processingId === msgId}
+                                    >
+                                        {processingId === msgId ? (
+                                            <Loader2 className="w-4 h-4 animate-spin" />
+                                        ) : (
+                                            '↻ Повторить'
+                                        )}
+                                    </button>
+                                </>
+                            ) : (
                                 <button
                                     type="button"
                                     onClick={(e) => {
                                         e.stopPropagation();
                                         if (!currentChatId) return;
-                                        onReprocess(currentChatId, msgId);
+                                        onProcess?.(currentChatId, msgId);
                                     }}
-                                    className="text-sm px-4 py-2 min-h-[40px] rounded-md border border-border text-foreground-secondary hover:bg-surface-2 disabled:opacity-50 font-medium transition-colors"
-                                    disabled={processingId === msgId}
+                                    className={`text-sm px-4 py-2 min-h-[40px] rounded-md border font-medium ${message.is_outgoing
+                                            ? 'border-primary/60 text-foreground-inverse/90 hover:bg-primary/90'
+                                            : 'border-primary text-primary hover:bg-primary/10'
+                                        } transition-colors`}
+                                    disabled={
+                                        processingId === msgId ||
+                                        ['queued', 'processing'].includes(status?.status || '')
+                                    }
                                 >
                                     {processingId === msgId ? (
-                                        <Loader2 className="w-4 h-4 animate-spin" />
+                                        <span className="flex items-center gap-2">
+                                            <Loader2 className="w-4 h-4 animate-spin" /> Обработка...
+                                        </span>
                                     ) : (
-                                        '↻ Повторить'
+                                        '▶ Обработать'
                                     )}
                                 </button>
-                            </>
-                        ) : (
-                            <button
-                                type="button"
-                                onClick={(e) => {
-                                    e.stopPropagation();
-                                    if (!currentChatId) return;
-                                    onProcess(currentChatId, msgId);
-                                }}
-                                className={`text-sm px-4 py-2 min-h-[40px] rounded-md border font-medium ${message.is_outgoing
-                                        ? 'border-primary/60 text-foreground-inverse/90 hover:bg-primary/90'
-                                        : 'border-primary text-primary hover:bg-primary/10'
-                                    } transition-colors`}
-                                disabled={
-                                    processingId === msgId ||
-                                    ['queued', 'processing'].includes(status?.status || '')
-                                }
-                            >
-                                {processingId === msgId ? (
-                                    <span className="flex items-center gap-2">
-                                        <Loader2 className="w-4 h-4 animate-spin" /> Обработка...
-                                    </span>
-                                ) : (
-                                    '▶ Обработать'
-                                )}
-                            </button>
-                        )}
-                    </div>
+                            )}
+                        </div>
+                    )}
                 </div>
             </div>
         </div>

@@ -168,3 +168,131 @@ def test_cardxabar_conversion_usd(parser):
     assert res
     assert res["transaction_type"] == "CONVERSION"
     assert res["currency"] == "USD"
+
+
+def test_sender_receiver_transfer_uzum_style(parser):
+    text = """Sender 561468******4483
+Sender name RAK VALENTINA PETROVNA
+Receiver 491699******1116
+Receiver name SVYATOSLAV LI
+Transaction ID 79c9ee9b-ff97-40a9-a339-1592d6ea06b4
+Transaction date 31.01.2026 11:12:51
+Received date 31.01.2026 11:12:56
+Receiver fee 0.00 UZS
+Receiver amount 10,000,000.00 UZS
+Sender fee 0.00 UZS
+Sender amount 10,000,000.00 UZS"""
+    res = parser.parse(text)
+    assert res
+    assert res["parsing_method"] == "REGEX_TRANSFER"
+    assert res["operator_raw"] == "Uzum Bank"
+    assert res["transaction_type"] == "DEBIT"
+    assert res["currency"] == "UZS"
+    assert res["amount"] == Decimal("10000000.00")
+    assert res["card_last_4"] == "4483"
+    assert res["receiver_card"] == "1116"
+    assert res["receiver_name"] == "SVYATOSLAV LI"
+    assert res["transaction_date"].year == 2026
+    assert res["transaction_date"].minute == 12
+
+
+def test_sender_receiver_transfer_ocr_typo_and_colons(parser):
+    text = """Sender: 561468******4483
+Sender name: RAK VALENTINA PETROVNA
+Receiver: 491699******1116
+Receiver name: SVYATOSLAV LI
+Transcation date: 31.01.2026 11:12:51
+Receiver amount: 10,000,000.00 UZS"""
+    res = parser.parse(text)
+    assert res
+    assert res["parsing_method"] == "REGEX_TRANSFER"
+    assert res["amount"] == Decimal("10000000.00")
+    assert res["transaction_date"].second == 51
+
+
+def test_humo_shop_and_calendar_emoji_with_balance_label(parser):
+    text = """💸 Оплата
+➖ 150 000 UZS
+🏪 TEST SHOP
+💳 HUMOCARD *4862
+📅 02.04.2025 08:37
+💰 Баланс: 2 340 500,00 UZS"""
+    res = parser.parse(text)
+    assert res
+    assert res["operator_raw"] == "TEST SHOP"
+    assert res["card_last_4"] == "4862"
+    assert res["balance_after"] == Decimal("2340500.00")
+    assert res["transaction_date"].year == 2025
+
+
+def test_humo_notification_datetime_without_datetime_emoji(parser):
+    text = """💸 Оплата
+➖ 500,000 UZS
+HUMOCARD *6714
+TEST SHOP
+12.02.2026 14:30
+Баланс: 1,200,000 UZS"""
+    res = parser.parse(text)
+    assert res
+    assert res["parsing_method"] == "REGEX_HUMO"
+    assert res["transaction_date"].year == 2026
+    assert res["transaction_date"].day == 12
+    assert res["transaction_date"].hour == 14
+
+
+def test_sms_inline_new_real_format(parser):
+    text = "Pokupka: XK FAMILY SHOP, 250000.00 UZS, 02.04.25 08:37 *6714 Bal:1500000.00 UZS"
+    res = parser.parse(text)
+    assert res
+    assert res["parsing_method"] == "REGEX_SMS"
+    assert res["amount"] == Decimal("250000.00")
+    assert res["card_last_4"] == "6714"
+    assert res["balance_after"] == Decimal("1500000.00")
+
+
+def test_sms_inline_with_iso_datetime(parser):
+    text = "Pokupka: TEST SHOP, 250000.00 UZS, 2026-02-18 14:30 karta ***0907. balans:1500000.00 UZS"
+    res = parser.parse(text)
+    assert res
+    assert res["parsing_method"] == "REGEX_SMS"
+    assert res["transaction_date"].year == 2026
+    assert res["transaction_date"].month == 2
+    assert res["transaction_date"].day == 18
+    assert res["transaction_date"].hour == 14
+
+
+def test_semicolon_format_with_full_year(parser):
+    text = "HUMOCARD*4862: oplata 250000.00 UZS; TEST SHOP; 2025-04-02 08:37; Dostupno: 1500000.00 UZS"
+    res = parser.parse(text)
+    assert res
+    assert res["parsing_method"] == "REGEX_SEMICOLON"
+    assert res["transaction_date"].year == 2025
+    assert res["transaction_date"].month == 4
+    assert res["transaction_date"].day == 2
+
+
+def test_sender_receiver_transfer_supports_summa_poluchatelya(parser):
+    text = """Sender: 561468******4483
+Receiver: 491699******1116
+Transaction date: 31.01.2026 11:12:51
+Сумма получателя: 1,500,000.00 UZS"""
+    res = parser.parse(text)
+    assert res
+    assert res["parsing_method"] == "REGEX_TRANSFER"
+    assert res["amount"] == Decimal("1500000.00")
+
+
+def test_cardxabar_text_labels(parser):
+    text = """🔴 Spisanie
+Summa: 250000.00 UZS
+Karta: *6714
+Magazin: XK FAMILY SHOP
+Data: 02.04.2025
+Vremya: 08:37
+Bal: 1500000.00 UZS"""
+    res = parser.parse(text)
+    assert res
+    assert res["parsing_method"] == "REGEX_CARDXABAR"
+    assert res["transaction_type"] == "DEBIT"
+    assert res["amount"] == Decimal("250000.00")
+    assert res["card_last_4"] == "6714"

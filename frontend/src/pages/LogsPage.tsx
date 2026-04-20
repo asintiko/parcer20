@@ -4,6 +4,9 @@
  */
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { AlertCircle, CheckCircle2, Clock, Copy, RefreshCw, Search, Filter, ChevronLeft, ChevronRight, X, Play, Pause, Eye } from 'lucide-react';
+import { API_BASE_URL, getAuthToken } from '../services/api';
+import { useToast } from '../components/Toast';
+import { EmptyState } from '../components/ui';
 
 interface LogEntry {
     id: number;
@@ -38,10 +41,10 @@ interface LogsResponse {
     items: LogEntry[];
 }
 
-const API_BASE = (import.meta as any).env?.VITE_API_URL || 'http://localhost:8000';
 const AUTO_REFRESH_INTERVAL = 10000; // 10 seconds
 
 export const LogsPage = () => {
+    const { showToast } = useToast();
     const [logs, setLogs] = useState<LogEntry[]>([]);
     const [stats, setStats] = useState<LogStats | null>(null);
     const [loading, setLoading] = useState(true);
@@ -53,10 +56,11 @@ export const LogsPage = () => {
     const [duplicatesOnly, setDuplicatesOnly] = useState(false);
     const [autoRefresh, setAutoRefresh] = useState(false);
     const [selectedLog, setSelectedLog] = useState<LogEntry | null>(null);
+    const [uiError, setUiError] = useState<string | null>(null);
     const autoRefreshRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
     const getAuthHeaders = () => {
-        const token = localStorage.getItem('token');
+        const token = getAuthToken();
         return {
             'Content-Type': 'application/json',
             ...(token ? { Authorization: `Bearer ${token}` } : {}),
@@ -65,17 +69,20 @@ export const LogsPage = () => {
 
     const fetchStats = useCallback(async () => {
         try {
-            const res = await fetch(`${API_BASE}/api/logs/stats`, {
+            const res = await fetch(`${API_BASE_URL}/api/logs/stats`, {
                 headers: getAuthHeaders(),
             });
             if (res.ok) {
                 const data = await res.json();
                 setStats(data);
+                setUiError(null);
             }
-        } catch (err) {
-            console.error('Failed to fetch stats:', err);
+        } catch (err: any) {
+            const detail = err?.message || 'Не удалось получить статистику логов';
+            setUiError(detail);
+            showToast('error', 'Ошибка загрузки статистики', { details: detail });
         }
-    }, []);
+    }, [showToast]);
 
     const fetchLogs = useCallback(async () => {
         setLoading(true);
@@ -88,20 +95,23 @@ export const LogsPage = () => {
             if (searchQuery) params.append('search', searchQuery);
             if (duplicatesOnly) params.append('duplicates_only', 'true');
 
-            const res = await fetch(`${API_BASE}/api/logs?${params}`, {
+            const res = await fetch(`${API_BASE_URL}/api/logs?${params}`, {
                 headers: getAuthHeaders(),
             });
             if (res.ok) {
                 const data: LogsResponse = await res.json();
                 setLogs(data.items);
                 setTotal(data.total);
+                setUiError(null);
             }
-        } catch (err) {
-            console.error('Failed to fetch logs:', err);
+        } catch (err: any) {
+            const detail = err?.message || 'Не удалось получить список логов';
+            setUiError(detail);
+            showToast('error', 'Ошибка загрузки логов', { details: detail });
         } finally {
             setLoading(false);
         }
-    }, [page, pageSize, statusFilter, searchQuery, duplicatesOnly]);
+    }, [page, pageSize, statusFilter, searchQuery, duplicatesOnly, showToast]);
 
     // Auto-refresh effect
     useEffect(() => {
@@ -228,6 +238,7 @@ export const LogsPage = () => {
                         placeholder="Поиск по ошибке..."
                         value={searchQuery}
                         onChange={(e) => setSearchQuery(e.target.value)}
+                        aria-label="Поиск по логам"
                         className="w-full pl-10 pr-4 py-2 bg-surface border border-border rounded-lg text-foreground placeholder:text-foreground-secondary focus:outline-none focus:ring-2 focus:ring-primary/50"
                     />
                 </div>
@@ -237,6 +248,7 @@ export const LogsPage = () => {
                     <select
                         value={statusFilter}
                         onChange={(e) => setStatusFilter(e.target.value)}
+                        aria-label="Фильтр по статусу логов"
                         className="bg-surface border border-border rounded-lg px-3 py-2 text-foreground focus:outline-none focus:ring-2 focus:ring-primary/50"
                     >
                         <option value="">Все статусы</option>
@@ -252,6 +264,7 @@ export const LogsPage = () => {
                         type="checkbox"
                         checked={duplicatesOnly}
                         onChange={(e) => setDuplicatesOnly(e.target.checked)}
+                        aria-label="Показывать только дубликаты"
                         className="w-4 h-4 rounded border-border text-primary focus:ring-primary/50"
                     />
                     <span className="text-sm text-foreground">Только дубликаты</span>
@@ -266,6 +279,7 @@ export const LogsPage = () => {
                             : 'bg-surface border border-border text-foreground hover:bg-surface-2'
                     }`}
                     title={autoRefresh ? 'Остановить автообновление' : 'Включить автообновление (10 сек)'}
+                    aria-label={autoRefresh ? 'Остановить автообновление' : 'Включить автообновление'}
                 >
                     {autoRefresh ? (
                         <>
@@ -284,44 +298,52 @@ export const LogsPage = () => {
                 <button
                     onClick={() => { fetchLogs(); fetchStats(); }}
                     className="flex items-center gap-2 px-4 py-2 bg-primary text-white rounded-lg hover:bg-primary/90 transition-colors"
+                    aria-label="Обновить логи"
                 >
                     <RefreshCw className="w-4 h-4" />
                     Обновить
                 </button>
             </div>
 
+            {uiError && (
+                <div className="mx-4 mt-3 rounded-md border border-danger/40 bg-danger/10 text-danger text-sm px-3 py-2">
+                    {uiError}
+                </div>
+            )}
+
             {/* Table */}
             <div className="flex-1 overflow-auto">
-                <table className="w-full">
-                    <thead className="bg-surface-2 sticky top-0">
-                        <tr>
-                            <th className="px-4 py-3 text-left text-xs font-medium text-foreground-secondary uppercase tracking-wider">Дата</th>
-                            <th className="px-4 py-3 text-left text-xs font-medium text-foreground-secondary uppercase tracking-wider">Чат / Сообщение</th>
-                            <th className="px-4 py-3 text-left text-xs font-medium text-foreground-secondary uppercase tracking-wider">Статус</th>
-                            <th className="px-4 py-3 text-left text-xs font-medium text-foreground-secondary uppercase tracking-wider">Оператор</th>
-                            <th className="px-4 py-3 text-left text-xs font-medium text-foreground-secondary uppercase tracking-wider">Сумма</th>
-                            <th className="px-4 py-3 text-left text-xs font-medium text-foreground-secondary uppercase tracking-wider">Ошибка</th>
-                            <th className="px-4 py-3 text-center text-xs font-medium text-foreground-secondary uppercase tracking-wider w-16">
-                                <span className="sr-only">Действия</span>
-                            </th>
-                        </tr>
-                    </thead>
-                    <tbody className="divide-y divide-border">
-                        {loading ? (
+                {loading ? (
+                    <div className="px-4 py-8 text-center text-foreground-secondary">
+                        <RefreshCw className="w-6 h-6 animate-spin mx-auto mb-2" />
+                        Загрузка...
+                    </div>
+                ) : logs.length === 0 ? (
+                    <div className="p-4">
+                        <EmptyState
+                            compact
+                            icon={<Filter className="w-6 h-6 text-foreground-muted" />}
+                            title="Нет данных"
+                            description="Попробуйте изменить фильтры или обновить список."
+                        />
+                    </div>
+                ) : (
+                    <table className="w-full">
+                        <thead className="bg-surface-2 sticky top-0">
                             <tr>
-                                <td colSpan={7} className="px-4 py-8 text-center text-foreground-secondary">
-                                    <RefreshCw className="w-6 h-6 animate-spin mx-auto mb-2" />
-                                    Загрузка...
-                                </td>
+                                <th className="px-4 py-3 text-left text-xs font-medium text-foreground-secondary uppercase tracking-wider">Дата</th>
+                                <th className="px-4 py-3 text-left text-xs font-medium text-foreground-secondary uppercase tracking-wider">Чат / Сообщение</th>
+                                <th className="px-4 py-3 text-left text-xs font-medium text-foreground-secondary uppercase tracking-wider">Статус</th>
+                                <th className="px-4 py-3 text-left text-xs font-medium text-foreground-secondary uppercase tracking-wider">Оператор</th>
+                                <th className="px-4 py-3 text-left text-xs font-medium text-foreground-secondary uppercase tracking-wider">Сумма</th>
+                                <th className="px-4 py-3 text-left text-xs font-medium text-foreground-secondary uppercase tracking-wider">Ошибка</th>
+                                <th className="px-4 py-3 text-center text-xs font-medium text-foreground-secondary uppercase tracking-wider w-16">
+                                    Действия
+                                </th>
                             </tr>
-                        ) : logs.length === 0 ? (
-                            <tr>
-                                <td colSpan={7} className="px-4 py-8 text-center text-foreground-secondary">
-                                    Нет данных для отображения
-                                </td>
-                            </tr>
-                        ) : (
-                            logs.map((log) => (
+                        </thead>
+                        <tbody className="divide-y divide-border">
+                            {logs.map((log) => (
                                 <tr
                                     key={log.id}
                                     className="hover:bg-surface-2/50 transition-colors cursor-pointer"
@@ -342,7 +364,7 @@ export const LogsPage = () => {
                                         {log.operator_raw || '—'}
                                     </td>
                                     <td className="px-4 py-3 text-sm text-foreground whitespace-nowrap">
-                                        {log.amount ? `${Number(log.amount).toLocaleString()} ${log.currency || 'UZS'}` : '—'}
+                                        {log.amount ? `${Number(log.amount).toLocaleString('ru-RU')} ${log.currency || 'UZS'}` : '—'}
                                     </td>
                                     <td className="px-4 py-3 text-sm text-error max-w-[300px] truncate" title={log.error || ''}>
                                         {log.error || '—'}
@@ -356,15 +378,16 @@ export const LogsPage = () => {
                                             }}
                                             className="p-1.5 rounded-lg hover:bg-surface-2 text-foreground-secondary hover:text-foreground transition-colors"
                                             title="Подробнее"
+                                            aria-label={`Показать детали записи ${log.id}`}
                                         >
                                             <Eye className="w-4 h-4" />
                                         </button>
                                     </td>
                                 </tr>
-                            ))
-                        )}
-                    </tbody>
-                </table>
+                            ))}
+                        </tbody>
+                    </table>
+                )}
             </div>
 
             {/* Pagination */}
@@ -377,6 +400,7 @@ export const LogsPage = () => {
                         <button
                             onClick={() => setPage((p) => Math.max(1, p - 1))}
                             disabled={page === 1}
+                            aria-label="Предыдущая страница логов"
                             className="p-2 rounded-lg border border-border hover:bg-surface-2 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
                         >
                             <ChevronLeft className="w-4 h-4" />
@@ -387,6 +411,7 @@ export const LogsPage = () => {
                         <button
                             onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
                             disabled={page === totalPages}
+                            aria-label="Следующая страница логов"
                             className="p-2 rounded-lg border border-border hover:bg-surface-2 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
                         >
                             <ChevronRight className="w-4 h-4" />
@@ -431,6 +456,7 @@ const LogDetailModal: React.FC<{ log: LogEntry; onClose: () => void }> = ({ log,
                         onClick={onClose}
                         className="p-2 rounded-lg hover:bg-surface-2 text-foreground-secondary hover:text-foreground transition-colors"
                         title="Закрыть"
+                        aria-label="Закрыть детали лога"
                     >
                         <X className="w-5 h-5" />
                     </button>
@@ -499,7 +525,7 @@ const LogDetailModal: React.FC<{ log: LogEntry; onClose: () => void }> = ({ log,
                         <div>
                             <label className="text-xs text-foreground-secondary uppercase tracking-wider">Сумма</label>
                             <div className="text-sm text-foreground mt-1">
-                                {log.amount ? `${Number(log.amount).toLocaleString()} ${log.currency || 'UZS'}` : '—'}
+                                {log.amount ? `${Number(log.amount).toLocaleString('ru-RU')} ${log.currency || 'UZS'}` : '—'}
                             </div>
                         </div>
                     </div>

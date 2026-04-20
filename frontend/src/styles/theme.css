@@ -120,6 +120,14 @@
   /* Drawer/Menu */
   --drawer-bg: var(--surface);
 
+  /* Z-index scale */
+  --z-base: 10;
+  --z-dropdown: 30;
+  --z-modal: 40;
+  --z-overlay: 50;
+  --z-toast: 60;
+  --z-popper: 35;
+
   /* MUI Component Variables */
   --color-surface: var(--surface);
   --color-surface-2: var(--surface-2);
@@ -247,7 +255,18 @@ html {
   transition: var(--transition-theme);
 }
 
-[data-theme="dark"] html {
+html[data-theme="light"] {
+  color-scheme: light;
+}
+
+html[data-theme="dark"] {
+  color-scheme: dark;
+}
+
+/* Propagate dark color-scheme to all form elements */
+[data-theme="dark"] input,
+[data-theme="dark"] select,
+[data-theme="dark"] textarea {
   color-scheme: dark;
 }
 

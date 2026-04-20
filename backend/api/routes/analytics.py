@@ -12,7 +12,7 @@ import os
 
 from database.connection import get_db_session
 from database.models import Transaction
-from api.dependencies import get_current_user
+from api.dependencies import require_tab_access
 
 router = APIRouter()
 
@@ -31,7 +31,7 @@ class TopAgentResponse(BaseModel):
 @router.get("/top-agent", response_model=TopAgentResponse)
 async def get_top_agent(
     db: Session = Depends(get_db_session),
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(require_tab_access("dashboard")),
 ):
     """
     Get 'Top Agent' statistics for the last hour
@@ -101,7 +101,7 @@ async def get_top_agent(
 @router.get("/summary")
 async def get_summary(
     db: Session = Depends(get_db_session),
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(require_tab_access("dashboard")),
 ):
     """
     Get overall system statistics
