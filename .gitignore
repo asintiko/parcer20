@@ -76,3 +76,33 @@ htmlcov/
 
 # Alembic
 backend/alembic/versions/*.pyc
+
+# Vendored Telegram Web (tweb) static bundle
+**/public/tweb/
+
+# MCP / tooling artifacts
+.playwright-mcp/
+.serena/
+
+# Backups
+*.bak
+
+# Media
+*.mp4
+*.mov
+
+# Root debug screenshots
+/*.png
+
+# Real access credentials (keep only .example templates)
+security/*.json
+!security/*.example.json
+
+# Junk / agent scratch
+/,
+agentcontinue.md
+
+# Build artifacts / installers (too large for git)
+*.exe
+*.msi
+*.dmg

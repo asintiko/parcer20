@@ -1,0 +1,160 @@
+/**
+ * Editorial AI agent FAB.
+ * Pill-shaped, monochrome, mono eyebrow + label, subtle motion.
+ * Uses theme tokens — works in light and dark.
+ */
+
+.ai-fab {
+    position: fixed;
+    right: 22px;
+    bottom: 22px;
+    z-index: 70;
+    display: inline-flex;
+    align-items: center;
+    gap: 10px;
+    padding: 0 16px 0 12px;
+    height: 40px;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    background: var(--surface);
+    color: var(--text);
+    font-family: inherit;
+    font-size: 13px;
+    cursor: pointer;
+    box-shadow: 0 8px 22px -10px color-mix(in srgb, var(--text) 30%, transparent);
+    transition:
+        background var(--dur-base, 220ms) var(--ease-standard, ease-out),
+        color var(--dur-base, 220ms) var(--ease-standard, ease-out),
+        border-color var(--dur-base, 220ms) var(--ease-standard, ease-out),
+        box-shadow var(--dur-base, 220ms) var(--ease-standard, ease-out);
+    will-change: transform;
+}
+
+[data-theme="dark"] .ai-fab {
+    box-shadow: 0 10px 28px -10px color-mix(in srgb, #000 70%, transparent);
+}
+
+.ai-fab:hover {
+    background: var(--text);
+    color: var(--text-inverse, #fff);
+    border-color: var(--text);
+    box-shadow: 0 10px 26px -10px color-mix(in srgb, var(--text) 40%, transparent);
+}
+
+[data-theme="dark"] .ai-fab:hover {
+    box-shadow: 0 12px 32px -10px color-mix(in srgb, #000 80%, transparent);
+}
+
+.ai-fab:focus-visible {
+    outline: 2px solid var(--text);
+    outline-offset: 2px;
+}
+
+.ai-fab.is-busy {
+    border-color: color-mix(in srgb, var(--text) 32%, transparent);
+}
+
+.ai-fab.is-error {
+    color: var(--danger);
+    border-color: color-mix(in srgb, var(--danger) 38%, transparent);
+}
+
+.ai-fab.is-error:hover {
+    background: var(--danger);
+    color: var(--text-inverse, #fff);
+    border-color: var(--danger);
+}
+
+.ai-fab.is-alert {
+    border-color: color-mix(in srgb, var(--warning) 45%, var(--border));
+}
+
+.ai-fab-eyebrow {
+    font-family: var(--font-mono, monospace);
+    font-size: 9.5px;
+    text-transform: uppercase;
+    letter-spacing: 0.18em;
+    color: var(--text-muted);
+    line-height: 1;
+    padding-top: 1px;
+}
+
+.ai-fab:hover .ai-fab-eyebrow {
+    color: color-mix(in srgb, var(--text-inverse, #fff) 75%, transparent);
+}
+
+.ai-fab-divider {
+    width: 1px;
+    height: 14px;
+    background: var(--border);
+}
+
+.ai-fab:hover .ai-fab-divider {
+    background: color-mix(in srgb, var(--text-inverse, #fff) 35%, transparent);
+}
+
+.ai-fab-icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.ai-fab-label {
+    font-weight: 500;
+    letter-spacing: 0.005em;
+    font-size: 13px;
+}
+
+.ai-fab-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+    margin-left: 2px;
+    padding: 0 7px;
+    height: 20px;
+    border-radius: 999px;
+    background: var(--text);
+    color: var(--text-inverse, #fff);
+    font-family: var(--font-mono, monospace);
+    font-size: 11px;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    line-height: 1;
+}
+
+.ai-fab:hover .ai-fab-badge {
+    background: var(--text-inverse, #fff);
+    color: var(--text);
+}
+
+@keyframes ai-fab-spin {
+    to {
+        transform: rotate(360deg);
+    }
+}
+
+.ai-fab-spin {
+    animation: ai-fab-spin 900ms linear infinite;
+}
+
+@keyframes ai-fab-alert-pulse {
+    0%, 100% { box-shadow: 0 8px 22px -10px color-mix(in srgb, var(--text) 30%, transparent); }
+    50%      { box-shadow: 0 8px 22px -10px color-mix(in srgb, var(--warning) 50%, transparent); }
+}
+
+.ai-fab.is-alert {
+    animation: ai-fab-alert-pulse 2.4s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .ai-fab {
+        transition: none;
+        animation: none;
+    }
+    .ai-fab.is-alert {
+        animation: none;
+    }
+    .ai-fab-spin {
+        animation: none;
+    }
+}

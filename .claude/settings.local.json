@@ -47,7 +47,9 @@
       "Bash(docker ps:*)",
       "Bash(bash /tmp/create_transactions.sh:*)",
       "Bash(ssh root@144.31.17.123 \"docker compose version && free -h && df -h /\")",
-      "Bash(rsync:*)"
+      "Bash(rsync:*)",
+      "Bash(git -C /Users/kulacidmyt/Documents/parcer2.0 log --oneline -20)",
+      "Bash(ls:*)"
     ],
     "additionalDirectories": [
       "/Users/kulacidmyt/Documents/parcer2.0/backend/scripts"

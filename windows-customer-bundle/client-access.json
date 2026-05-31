@@ -1,0 +1,5 @@
+{
+  "version": 1,
+  "system_access_token": "change_me_system_token",
+  "api_base_url": "http://64.188.106.221:8000"
+}

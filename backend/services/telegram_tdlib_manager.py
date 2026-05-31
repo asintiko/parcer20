@@ -11,7 +11,8 @@ import os
 import threading
 import time
 import uuid
-from typing import Any, Dict, List, Optional, Callable, Awaitable
+from collections import OrderedDict
+from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Optional
 
 from sqlalchemy.orm import Session
 
@@ -68,6 +69,32 @@ class TDJsonClient:
             self.client = None
 
 
+class _TTLRUCache:
+    """Small TTL+LRU cache to protect long-lived TDLib manager from unbounded growth."""
+
+    def __init__(self, maxsize: int, ttl_seconds: int) -> None:
+        self.maxsize = max(1, int(maxsize))
+        self.ttl_seconds = max(1, int(ttl_seconds))
+        self._items: "OrderedDict[int, tuple[float, Dict[str, Any]]]" = OrderedDict()
+
+    def get(self, key: int) -> Optional[Dict[str, Any]]:
+        item = self._items.get(key)
+        if item is None:
+            return None
+        expires_at, value = item
+        if expires_at <= time.time():
+            self._items.pop(key, None)
+            return None
+        self._items.move_to_end(key)
+        return value
+
+    def set(self, key: int, value: Dict[str, Any]) -> None:
+        self._items[key] = (time.time() + self.ttl_seconds, value)
+        self._items.move_to_end(key)
+        while len(self._items) > self.maxsize:
+            self._items.popitem(last=False)
+
+
 class TelegramTDLibManager:
     """Singleton-style manager for TDLib interactions."""
 
@@ -95,13 +122,31 @@ class TelegramTDLibManager:
         self._auth_state_raw: str = "authorizationStateWaitPhoneNumber"
         self._phone_number: Optional[str] = None
         self._me: Optional[Dict[str, Any]] = None
-        self._chat_cache: Dict[int, Dict[str, Any]] = {}
-        self._user_cache: Dict[int, Dict[str, Any]] = {}
+        cache_max = int(os.getenv("TDLIB_CACHE_MAXSIZE", "500"))
+        cache_ttl = int(os.getenv("TDLIB_CACHE_TTL_SECONDS", "600"))
+        self._chat_cache = _TTLRUCache(maxsize=cache_max, ttl_seconds=cache_ttl)
+        self._user_cache = _TTLRUCache(maxsize=cache_max, ttl_seconds=cache_ttl)
         self._load_error: Optional[Exception] = None
         self._params_applied = False
         self._encryption_checked = False
         self._new_message_handlers: List[Callable[[Dict[str, Any]], Awaitable[None]]] = []
         self._last_code_info: Optional[Dict[str, Any]] = None
+        self._history_fetch_semaphore = asyncio.Semaphore(
+            max(1, int(os.getenv("TDLIB_FETCH_ALL_CONCURRENCY", "2")))
+        )
+        self._chat_info_concurrency = max(1, int(os.getenv("TDLIB_CHAT_INFO_CONCURRENCY", "8")))
+
+    def _cache_chat_get(self, chat_id: int) -> Optional[Dict[str, Any]]:
+        return self._chat_cache.get(int(chat_id))
+
+    def _cache_chat_set(self, chat_id: int, value: Dict[str, Any]) -> None:
+        self._chat_cache.set(int(chat_id), value)
+
+    def _cache_user_get(self, user_id: int) -> Optional[Dict[str, Any]]:
+        return self._user_cache.get(int(user_id))
+
+    def _cache_user_set(self, user_id: int, value: Dict[str, Any]) -> None:
+        self._user_cache.set(int(user_id), value)
 
     @staticmethod
     def _env_bool(key: str, default: bool = False) -> bool:
@@ -196,7 +241,9 @@ class TelegramTDLibManager:
         elif update_type == "updateUser":
             user = update.get("user")
             if user:
-                self._user_cache[user.get("id")] = user
+                user_id = user.get("id")
+                if user_id is not None:
+                    self._cache_user_set(int(user_id), user)
                 if self._me and self._me.get("id") == user.get("id"):
                     self._me = user
         elif update_type == "updateOption":
@@ -209,8 +256,11 @@ class TelegramTDLibManager:
             message = update.get("message")
             if message:
                 chat_id = message.get("chat_id")
-                if chat_id and chat_id in self._chat_cache:
-                    self._chat_cache[chat_id]["last_message"] = self._format_message(message)
+                if chat_id:
+                    cached_chat = self._cache_chat_get(int(chat_id))
+                    if cached_chat:
+                        cached_chat["last_message"] = self._format_message(message)
+                        self._cache_chat_set(int(chat_id), cached_chat)
                 formatted = self._format_message(message)
                 for handler in list(self._new_message_handlers):
                     try:
@@ -220,8 +270,11 @@ class TelegramTDLibManager:
         elif update_type == "updateChatLastMessage":
             chat_id = update.get("chat_id")
             last_message = update.get("last_message")
-            if chat_id and last_message and chat_id in self._chat_cache:
-                self._chat_cache[chat_id]["last_message"] = self._format_message(last_message)
+            if chat_id and last_message:
+                cached_chat = self._cache_chat_get(int(chat_id))
+                if cached_chat:
+                    cached_chat["last_message"] = self._format_message(last_message)
+                    self._cache_chat_set(int(chat_id), cached_chat)
 
     async def _send_request(self, payload: Dict[str, Any], timeout: float = 30.0) -> Dict[str, Any]:
         if not self._client:
@@ -382,7 +435,9 @@ class TelegramTDLibManager:
             me_response = await self._send_request({"@type": "getMe"})
             if me_response.get("@type") == "user":
                 self._me = me_response
-                self._user_cache[me_response.get("id")] = me_response
+                me_id = me_response.get("id")
+                if me_id is not None:
+                    self._cache_user_set(int(me_id), me_response)
                 return self._format_user(me_response)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Failed to fetch self info: %s", exc)
@@ -475,6 +530,32 @@ class TelegramTDLibManager:
             allowed_types=allowed_types or ["private", "group", "supergroup", "channel"]
         )
 
+    async def warm_up_chat(self, chat_id: int) -> bool:
+        """Force TDLib to refresh a chat's last_message from the network.
+
+        Background monitored-chat sync reads history via getChatHistory(from=0),
+        which only returns up to TDLib's locally-cached last_message. TDLib keeps
+        that pointer fresh only for chats it considers "open" or that receive
+        realtime updates (chats currently loaded in the chat list). Monitored bot
+        chats that the desktop client never opens go stale: no updateNewMessage,
+        so getChatHistory returns nothing new and the chat appears frozen.
+
+        Calling openChat subscribes the client to that chat (TDLib pulls the
+        newest messages and starts delivering updates); getChat then forces a
+        network refresh of the chat object. Best-effort: returns False on error
+        without raising so a single bad chat never blocks the sync tick.
+        """
+        try:
+            await self._send_request({"@type": "openChat", "chat_id": chat_id}, timeout=10)
+        except Exception:
+            logger.debug("openChat failed for chat %s", chat_id, exc_info=True)
+        try:
+            await self._send_request({"@type": "getChat", "chat_id": chat_id}, timeout=10)
+            return True
+        except Exception:
+            logger.debug("getChat refresh failed for chat %s", chat_id, exc_info=True)
+            return False
+
     async def _fetch_bot_chats(
         self,
         search: Optional[str],
@@ -505,9 +586,41 @@ class TelegramTDLibManager:
             return []
 
         chat_ids: List[int] = response.get("chat_ids") or []
+        if not chat_ids:
+            return []
+
+        # Warm up user cache in batches for private chats to reduce per-chat getUser calls.
+        semaphore = asyncio.Semaphore(self._chat_info_concurrency)
+
+        async def _fetch_raw_chat(chat_id: int) -> Optional[Dict[str, Any]]:
+            try:
+                async with semaphore:
+                    return await self._send_request({"@type": "getChat", "chat_id": chat_id})
+            except Exception:
+                return None
+
+        raw_chats = await asyncio.gather(*[_fetch_raw_chat(chat_id) for chat_id in chat_ids], return_exceptions=False)
+        private_user_ids: List[int] = []
+        for chat in raw_chats:
+            if not isinstance(chat, dict):
+                continue
+            chat_type = chat.get("type") or {}
+            if chat_type.get("@type") == "chatTypePrivate":
+                user_id = chat_type.get("user_id")
+                if user_id:
+                    private_user_ids.append(int(user_id))
+        await self._ensure_users_bulk(private_user_ids)
+
+        async def _fetch_info(chat_id: int) -> Optional[Dict[str, Any]]:
+            async with semaphore:
+                return await self._get_chat_info(chat_id, allowed_types=allowed_types)
+
+        infos = await asyncio.gather(*[_fetch_info(chat_id) for chat_id in chat_ids], return_exceptions=True)
         chats: List[Dict[str, Any]] = []
-        for chat_id in chat_ids:
-            info = await self._get_chat_info(chat_id, allowed_types=allowed_types)
+        for info in infos:
+            if isinstance(info, Exception):
+                logger.warning("Failed to resolve chat info in batch fetch: %s", info)
+                continue
             if info:
                 chats.append(info)
         return chats
@@ -528,8 +641,8 @@ class TelegramTDLibManager:
         Returns:
             Chat info dict with chat_type field, or None if filtered out
         """
-        if chat_id in self._chat_cache:
-            cached = self._chat_cache.get(chat_id)
+        cached = self._cache_chat_get(chat_id)
+        if cached:
             # Check if cached chat matches allowed types
             if allowed_types is not None:
                 cached_type = cached.get("chat_type", "")
@@ -645,25 +758,61 @@ class TelegramTDLibManager:
             }
 
         if formatted:
-            self._chat_cache[chat_id] = formatted
+            self._cache_chat_set(chat_id, formatted)
             return formatted
 
         return None
 
     async def _ensure_user(self, user_id: int) -> Optional[Dict[str, Any]]:
-        if user_id in self._user_cache:
-            return self._user_cache[user_id]
+        cached_user = self._cache_user_get(user_id)
+        if cached_user:
+            return cached_user
         user = await self._send_request({"@type": "getUser", "user_id": user_id})
         if user.get("@type") == "user":
-            self._user_cache[user_id] = user
+            self._cache_user_set(user_id, user)
             return user
         return None
+
+    async def _ensure_users_bulk(self, user_ids: List[int]) -> Dict[int, Dict[str, Any]]:
+        unique_ids = sorted({int(uid) for uid in user_ids if uid})
+        result: Dict[int, Dict[str, Any]] = {}
+        missing: List[int] = []
+        for user_id in unique_ids:
+            cached = self._cache_user_get(user_id)
+            if cached:
+                result[user_id] = cached
+            else:
+                missing.append(user_id)
+        if not missing:
+            return result
+
+        semaphore = asyncio.Semaphore(self._chat_info_concurrency)
+
+        async def _fetch(uid: int) -> Optional[Dict[str, Any]]:
+            try:
+                async with semaphore:
+                    payload = await self._send_request({"@type": "getUser", "user_id": uid})
+                if payload.get("@type") == "user":
+                    self._cache_user_set(uid, payload)
+                    return payload
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Bulk user fetch failed for %s: %s", uid, exc)
+            return None
+
+        fetched = await asyncio.gather(*[_fetch(uid) for uid in missing], return_exceptions=True)
+        for uid, payload in zip(missing, fetched):
+            if isinstance(payload, Exception):
+                continue
+            if payload:
+                result[uid] = payload
+        return result
 
     def _format_message(self, message: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         if not message or not isinstance(message, dict):
             return None
         text = ""
         document_info = None
+        photo_info = None
         content = message.get("content") or {}
         if content.get("@type") == "messageText":
             text = content.get("text", {}).get("text", "")
@@ -685,7 +834,44 @@ class TelegramTDLibManager:
                 "local_path": local_path,
                 "download_url": f"/api/tg/files/{file_id}" if file_id is not None else None,
             }
-            text = caption or f"[PDF] {file_name}"
+            if caption:
+                text = caption
+            elif str(mime_type or "").lower() == "application/pdf":
+                text = f"[PDF] {file_name}"
+            elif str(mime_type or "").lower().startswith("image/"):
+                text = f"[IMAGE] {file_name}"
+            else:
+                text = f"[FILE] {file_name}"
+        elif content.get("@type") == "messagePhoto":
+            caption = content.get("caption", {}).get("text", "")
+            photo = content.get("photo", {}) or {}
+            sizes = photo.get("sizes") or []
+            # Prefer largest available photo size for OCR quality.
+            best = None
+            best_area = -1
+            for size in sizes:
+                width = int(size.get("width") or 0)
+                height = int(size.get("height") or 0)
+                area = width * height
+                if area > best_area:
+                    best_area = area
+                    best = size
+            file_obj = (best or {}).get("photo", {}) or {}
+            file_id = file_obj.get("id")
+            remote_id = (file_obj.get("remote") or {}).get("id")
+            local_path = (file_obj.get("local") or {}).get("path")
+            photo_info = {
+                "file_id": file_id,
+                "file_name": "photo.jpg",
+                "mime_type": "image/jpeg",
+                "size": file_obj.get("expected_size") or file_obj.get("size"),
+                "remote_id": remote_id,
+                "local_path": local_path,
+                "download_url": f"/api/tg/files/{file_id}" if file_id is not None else None,
+                "width": (best or {}).get("width"),
+                "height": (best or {}).get("height"),
+            }
+            text = caption or "[Photo]"
         return {
             "chat_id": message.get("chat_id"),
             "id": message.get("id"),
@@ -694,6 +880,7 @@ class TelegramTDLibManager:
             "sender_id": message.get("sender_id"),
             "text": text,
             "document": document_info,
+            "photo": photo_info,
         }
 
     def add_new_message_handler(self, handler: Callable[[Dict[str, Any]], Awaitable[None]]) -> None:
@@ -720,14 +907,16 @@ class TelegramTDLibManager:
         limit: int = 50,
         from_message_id: int = 0,
         fetch_all: bool = False,
+        max_messages: Optional[int] = None,
     ) -> Dict[str, Any]:
         limit = min(max(limit, 1), 200)
         if not fetch_all:
+            history_offset = 0 if int(from_message_id or 0) <= 0 else -1
             payload = {
                 "@type": "getChatHistory",
                 "chat_id": chat_id,
                 "from_message_id": from_message_id,
-                "offset": 0,
+                "offset": history_offset,
                 "limit": limit,
                 "only_local": False,
             }
@@ -736,33 +925,107 @@ class TelegramTDLibManager:
             formatted = [self._format_message(msg) for msg in messages if msg]
             return {"items": formatted, "total": response.get("total_count", len(formatted))}
 
-        # fetch full history
-        batch_size = 100
+        # Legacy compatibility path: still returns the full payload, but streaming retrieval
+        # removes hard 40k cap and supports resume cursor/max_messages.
+        # `0` means unlimited (default). This prevents silent truncation for large chats.
+        response_cap = int(os.getenv("TDLIB_FETCH_ALL_RESPONSE_MAX_MESSAGES", "0"))
+        effective_max_messages = max_messages
+        if effective_max_messages is None and response_cap > 0:
+            # `/api/tg/chats/{chat_id}/messages?all=true` returns JSON array and therefore
+            # still keeps the response in memory. Keep it bounded by default; full history
+            # must use background loader endpoints (`/history/load` + `/history/messages`).
+            effective_max_messages = response_cap
+            logger.warning(
+                "Applying TDLIB fetch_all response cap (%s) for chat %s. "
+                "Use history loader endpoints for full streaming sync.",
+                response_cap,
+                chat_id,
+            )
+
         collected: List[Dict[str, Any]] = []
-        current_from = 0
-        safety_batches = 400
-        for _ in range(safety_batches):
-            payload = {
-                "@type": "getChatHistory",
-                "chat_id": chat_id,
-                "from_message_id": current_from,
-                "offset": 0,
-                "limit": batch_size,
-                "only_local": False,
-            }
-            response = await self._send_request(payload)
-            messages = response.get("messages", [])
-            if not messages:
-                break
-            collected.extend(messages)
-            oldest = messages[-1]
-            oldest_id = oldest.get("id")
-            if not oldest_id or len(messages) < batch_size:
-                break
-            current_from = oldest_id
+        async for chunk in self.iter_chat_history(
+            chat_id=chat_id,
+            from_message_id=from_message_id,
+            batch_size=500,
+            max_messages=effective_max_messages,
+        ):
+            collected.extend(chunk)
         formatted = [self._format_message(msg) for msg in collected if msg]
         formatted.sort(key=lambda x: x.get("date") or 0)
         return {"items": formatted, "total": len(formatted)}
+
+    async def iter_chat_history(
+        self,
+        *,
+        chat_id: int,
+        from_message_id: int = 0,
+        batch_size: int = 500,
+        max_messages: Optional[int] = None,
+        progress_callback: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None,
+    ) -> AsyncIterator[List[Dict[str, Any]]]:
+        """
+        Stream chat history in batches.
+        Stops only on history end or explicit max_messages.
+        """
+        # TDLib getChatHistory has an effective hard cap of ~100 messages per request.
+        # If we request 500 and then stop on `len(messages) < requested_limit`,
+        # pagination ends after the first batch. Keep request size aligned with TDLib.
+        per_request_limit = min(max(1, int(batch_size)), 100)
+        loaded_total = 0
+        current_from = int(from_message_id or 0)
+
+        async with self._history_fetch_semaphore:
+            while True:
+                payload = {
+                    "@type": "getChatHistory",
+                    "chat_id": chat_id,
+                    "from_message_id": current_from,
+                    "offset": 0 if current_from <= 0 else -1,
+                    "limit": per_request_limit,
+                    "only_local": False,
+                }
+                response = await self._send_request(payload)
+                messages: List[Dict[str, Any]] = response.get("messages", []) or []
+                if not messages:
+                    break
+
+                if max_messages is not None:
+                    remaining = max(0, int(max_messages) - loaded_total)
+                    if remaining <= 0:
+                        break
+                    if len(messages) > remaining:
+                        messages = messages[:remaining]
+
+                loaded_total += len(messages)
+                if progress_callback:
+                    try:
+                        await progress_callback(
+                            {
+                                "chat_id": chat_id,
+                                "loaded": loaded_total,
+                                "cursor_message_id": messages[-1].get("id") if messages else current_from,
+                            }
+                        )
+                    except Exception:
+                        logger.debug("History progress callback failed", exc_info=True)
+
+                yield messages
+
+                if max_messages is not None and loaded_total >= int(max_messages):
+                    break
+
+                oldest = messages[-1]
+                oldest_id = oldest.get("id")
+                if not oldest_id:
+                    break
+                if int(oldest_id) == current_from:
+                    logger.warning(
+                        "History pagination stalled for chat %s at message_id=%s; stopping to avoid loop",
+                        chat_id,
+                        oldest_id,
+                    )
+                    break
+                current_from = int(oldest_id)
 
     async def get_message_by_date(self, chat_id: int, date: int) -> Optional[Dict[str, Any]]:
         """
@@ -816,9 +1079,8 @@ class TelegramTDLibManager:
         batch_size = 100
         collected: List[Dict[str, Any]] = []
         current_from = start_message_id
-        safety_batches = limit // batch_size + 10
-        
-        for _ in range(safety_batches):
+
+        while True:
             if len(collected) >= limit:
                 break
                 
@@ -826,7 +1088,7 @@ class TelegramTDLibManager:
                 "@type": "getChatHistory",
                 "chat_id": chat_id,
                 "from_message_id": current_from,
-                "offset": 0,
+                "offset": 0 if int(current_from or 0) <= 0 else -1,
                 "limit": batch_size,
                 "only_local": False,
             }
@@ -851,9 +1113,16 @@ class TelegramTDLibManager:
                 break
                 
             oldest_id = oldest.get("id")
-            if not oldest_id or len(messages) < batch_size:
+            if not oldest_id:
                 break
-            current_from = oldest_id
+            if int(oldest_id) == current_from:
+                logger.warning(
+                    "Date-range pagination stalled for chat %s at message_id=%s; stopping to avoid loop",
+                    chat_id,
+                    oldest_id,
+                )
+                break
+            current_from = int(oldest_id)
         
         formatted = [self._format_message(msg) for msg in collected if msg]
         formatted.sort(key=lambda x: x.get("date") or 0)

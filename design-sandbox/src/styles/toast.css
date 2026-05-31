@@ -1,0 +1,199 @@
+/**
+ * Editorial toast notifications.
+ * Monochrome surface, semantic accent stripe, mono eyebrow, square radii.
+ * Variants: success / warning / error / info — same shape, different accent.
+ */
+
+.ed-toast-stack {
+    position: fixed;
+    bottom: 20px;
+    right: 20px;
+    z-index: var(--z-toast, 100);
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    width: min(420px, calc(100vw - 32px));
+    pointer-events: none;
+}
+
+.ed-toast {
+    position: relative;
+    pointer-events: auto;
+    display: grid;
+    grid-template-columns: auto 1fr auto;
+    align-items: flex-start;
+    gap: 12px;
+    padding: 12px 14px 14px 18px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: var(--text);
+    box-shadow: 0 14px 40px -16px color-mix(in srgb, var(--text) 35%, transparent);
+    overflow: hidden;
+    will-change: transform;
+}
+
+[data-theme="dark"] .ed-toast {
+    box-shadow: 0 18px 48px -14px color-mix(in srgb, #000 70%, transparent);
+}
+
+/* Left accent strip — semantic colour */
+.ed-toast-accent {
+    position: absolute;
+    left: 0;
+    top: 0;
+    bottom: 0;
+    width: 3px;
+    background: var(--text);
+}
+
+.ed-toast.is-success .ed-toast-accent { background: var(--success); }
+.ed-toast.is-error   .ed-toast-accent { background: var(--danger); }
+.ed-toast.is-warning .ed-toast-accent { background: var(--warning); }
+.ed-toast.is-info    .ed-toast-accent { background: var(--text); }
+
+/* Icon column */
+.ed-toast-icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 22px;
+    height: 22px;
+    color: var(--text-secondary);
+    margin-top: 2px;
+}
+
+.ed-toast.is-success .ed-toast-icon { color: var(--success); }
+.ed-toast.is-error   .ed-toast-icon { color: var(--danger); }
+.ed-toast.is-warning .ed-toast-icon { color: var(--warning); }
+
+/* Body */
+.ed-toast-body {
+    min-width: 0;
+}
+
+.ed-toast-eyebrow {
+    font-family: var(--font-mono, monospace);
+    font-size: 9.5px;
+    text-transform: uppercase;
+    letter-spacing: 0.18em;
+    color: var(--text-muted);
+    line-height: 1;
+    margin-bottom: 4px;
+}
+
+.ed-toast.is-success .ed-toast-eyebrow { color: var(--success); }
+.ed-toast.is-error   .ed-toast-eyebrow { color: var(--danger); }
+.ed-toast.is-warning .ed-toast-eyebrow { color: var(--warning); }
+
+.ed-toast-message {
+    font-size: 13.5px;
+    line-height: 1.45;
+    color: var(--text);
+    word-break: break-word;
+    white-space: pre-wrap;
+}
+
+.ed-toast-meta {
+    display: inline-flex;
+    align-items: center;
+    gap: 12px;
+    margin-top: 6px;
+}
+
+.ed-toast-countdown {
+    font-family: var(--font-mono, monospace);
+    font-size: 10.5px;
+    color: var(--text-muted);
+    letter-spacing: 0.04em;
+}
+
+.ed-toast-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    color: var(--text-secondary);
+    font-family: var(--font-mono, monospace);
+    font-size: 10.5px;
+    text-transform: uppercase;
+    letter-spacing: 0.14em;
+    cursor: pointer;
+    transition: color var(--dur-fast, 140ms) var(--ease-standard, ease);
+}
+
+.ed-toast-toggle:hover { color: var(--text); }
+.ed-toast-toggle:focus-visible {
+    outline: 2px solid var(--text);
+    outline-offset: 2px;
+    border-radius: 2px;
+}
+
+.ed-toast-details {
+    margin: 8px 0 0;
+    padding: 8px 10px;
+    border: 1px solid var(--border);
+    background: var(--surface-2);
+    color: var(--text-secondary);
+    font-family: var(--font-mono, monospace);
+    font-size: 11.5px;
+    line-height: 1.5;
+    white-space: pre-wrap;
+    word-break: break-word;
+    max-height: 240px;
+    overflow: auto;
+    border-radius: 2px;
+}
+
+/* Close */
+.ed-toast-close {
+    flex-shrink: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 22px;
+    height: 22px;
+    border: 0;
+    background: transparent;
+    color: var(--text-muted);
+    cursor: pointer;
+    transition: color var(--dur-fast, 140ms) var(--ease-standard, ease),
+                background var(--dur-fast, 140ms) var(--ease-standard, ease);
+    border-radius: 2px;
+}
+
+.ed-toast-close:hover {
+    color: var(--text);
+    background: var(--surface-2);
+}
+
+.ed-toast-close:focus-visible {
+    outline: 2px solid var(--text);
+    outline-offset: 2px;
+}
+
+/* Bottom progress bar */
+.ed-toast-progress {
+    position: absolute;
+    left: 0;
+    bottom: 0;
+    height: 1px;
+    background: color-mix(in srgb, var(--text) 26%, transparent);
+    transition: width 200ms linear;
+    pointer-events: none;
+}
+
+.ed-toast.is-success .ed-toast-progress { background: color-mix(in srgb, var(--success) 50%, transparent); }
+.ed-toast.is-error   .ed-toast-progress { background: color-mix(in srgb, var(--danger) 50%, transparent); }
+.ed-toast.is-warning .ed-toast-progress { background: color-mix(in srgb, var(--warning) 50%, transparent); }
+
+@media (prefers-reduced-motion: reduce) {
+    .ed-toast {
+        transition: none;
+    }
+    .ed-toast-progress {
+        transition: none;
+    }
+}

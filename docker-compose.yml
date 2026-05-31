@@ -8,8 +8,6 @@ services:
       POSTGRES_DB: ${POSTGRES_DB}
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./receipt_parser_dump.sql:/docker-entrypoint-initdb.d/00_receipt_parser_dump.sql
-      - ./backend/database/schema.sql:/docker-entrypoint-initdb.d/schema.sql
     # Security: ports only accessible on localhost, not exposed externally
     ports:
       - "127.0.0.1:9990:5432"
@@ -47,19 +45,21 @@ services:
     container_name: uzbek_parser_backend
     env_file:
       - .env
+    environment:
+      ROOT_ACCESS_SERVER_CONFIG_PATH: /app/config/root-access.server.json
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
     volumes:
-      - ./backend:/app
+      - ./security/root-access.server.json:/app/config/root-access.server.json:ro
       - backend_sessions:/app/sessions
       - tdlib_data:/app/sessions/tdlib
       - tdlib_files:/app/sessions/tdlib/files
     ports:
       - "8000:8000"
-    command: uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
+    command: uvicorn api.main:app --host 0.0.0.0 --port 8000 --workers 1 --proxy-headers --forwarded-allow-ips=*
     restart: unless-stopped
 
   userbot:
@@ -75,7 +75,6 @@ services:
       redis:
         condition: service_healthy
     volumes:
-      - ./backend:/app
       - backend_sessions:/app/sessions
       - tdlib_data:/app/sessions/tdlib
       - tdlib_files:/app/sessions/tdlib/files
@@ -94,10 +93,26 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-    volumes:
-      - ./backend:/app
     command: python -m ingestion.telegram_bot
     restart: unless-stopped
+
+  auth_bot:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: uzbek_parser_auth_bot
+    env_file:
+      - .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./security/root-access.server.json:/app/config/root-access.server.json:ro
+    command: python -m services.auth_bot_handler
+    restart: unless-stopped
+    mem_limit: 128m
 
   celery_worker:
     build:
@@ -111,10 +126,13 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-    volumes:
-      - ./backend:/app
     command: celery -A workers.celery_worker worker --loglevel=info
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A workers.celery_worker inspect ping --timeout 5"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
 
   frontend:
     build:
@@ -122,11 +140,28 @@ services:
       dockerfile: Dockerfile
     container_name: uzbek_parser_frontend
     ports:
-      - "5173:80"
+      - "${FRONTEND_BIND_IP:-127.0.0.1}:5173:80"
     depends_on:
       - backend
     environment:
       - VITE_API_URL=http://localhost:8000
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: uzbek_parser_caddy
+    depends_on:
+      - frontend
+      - backend
+    environment:
+      SYSTEM_ACCESS_TOKEN: ${SYSTEM_ACCESS_TOKEN}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
     restart: unless-stopped
 
 volumes:
@@ -134,3 +169,5 @@ volumes:
   backend_sessions:
   tdlib_data:
   tdlib_files:
+  caddy_data:
+  caddy_config:

@@ -1,133 +1,313 @@
 /**
  * Main Application Component with Routing
  */
-import { useState, useEffect, ComponentType, ReactNode } from 'react';
-import { BrowserRouter, HashRouter, Routes, Route, useLocation, useNavigate } from 'react-router-dom';
-import { Menu, Loader2, CheckCircle2 } from 'lucide-react';
-import { BurgerMenu } from './components/BurgerMenu';
+import { useState, useEffect, ComponentType, ReactNode, useMemo, useRef } from 'react';
+import { useQuery } from '@tanstack/react-query';
+import { BrowserRouter, HashRouter, Routes, Route, Navigate, useNavigate } from 'react-router-dom';
+import { AppShell } from './components/shell/AppShell';
+import { AiAgentDrawer } from './components/AiAgentDrawer';
+import { AiAgentLauncher } from './components/AiAgentLauncher';
+import { ScopeGuard } from './components/ScopeGuard';
+import { SyncStatus } from './components/SyncStatus';
+import { useToast } from './components/Toast';
 import { TransactionsPage } from './pages/TransactionsPage';
 import { ReferencePage } from './pages/ReferencePage';
-import { AutomationPage } from './pages/AutomationPage';
 import { UserbotPage } from './pages/UserbotPage';
 import { LogsPage } from './pages/LogsPage';
+import { AutomationPage } from './pages/AutomationPage';
+import { RoutinesPage } from './pages/RoutinesPage';
 import { SettingsPage } from './pages/SettingsPage';
-import { useAutomationStatus } from './hooks/useAutomationStatus';
-
-const LAST_PAGE_KEY = 'last_visited_page';
+import { AuditPage } from './pages/AuditPage';
+import { LoginPage } from './pages/LoginPage';
+import { useAiAgent } from './contexts/AiAgentContext';
+import { useAiAgentNotifications } from './hooks/useAiAgentNotifications';
+import { useSettingsSubscription } from './hooks/useSettingsSubscription';
+import { useScopeGuard } from './hooks/useScopeGuard';
+import { ru } from './i18n/ru';
+import { agentApi, API_BASE_URL, loadElectronSystemAccessStatus } from './services/api';
+import { syncManager, type SyncSnapshot } from './services/syncManager';
+import { useAuth } from './contexts/AuthContext';
 
 function AppContent() {
-    const [isMenuOpen, setIsMenuOpen] = useState(false);
-    const location = useLocation();
-    const navigate = useNavigate();
-    const { isRunning, isCompleted, taskStatus } = useAutomationStatus();
+    const [syncSnapshot, setSyncSnapshot] = useState<SyncSnapshot>({
+        state: syncManager.getState(),
+        statuses: syncManager.getStatuses(),
+        backoffMs: syncManager.getBackoffMs(),
+    });
+    const { openAgent, isOpen: isAgentOpen } = useAiAgent();
+    const { hasTab, firstAllowedRoute } = useAuth();
+    const { showToast } = useToast();
+    const { unreadCount } = useAiAgentNotifications();
+    const [isBackendOnline, setIsBackendOnline] = useState(true);
+    const launcherThreadsQuery = useQuery({
+        queryKey: ['agent-launcher-state'],
+        queryFn: () => agentApi.listThreads({ view: 'active' }),
+        staleTime: 5000,
+        refetchInterval: 5000,
+    });
+    useSettingsSubscription();
+    useScopeGuard();
 
-    // Restore last page on mount
+    useEffect(() => syncManager.subscribe(setSyncSnapshot), []);
+
     useEffect(() => {
-        const lastPage = localStorage.getItem(LAST_PAGE_KEY);
-        if (lastPage && lastPage !== '/' && location.pathname === '/') {
-            navigate(lastPage, { replace: true });
-        }
-    }, []); // eslint-disable-line react-hooks/exhaustive-deps
+        let mounted = true;
+        let timer: ReturnType<typeof setInterval> | null = null;
 
-    // Save current page to localStorage
+        const pingBackend = async () => {
+            try {
+                const response = await fetch(`${API_BASE_URL}/health`, {
+                    method: 'GET',
+                    cache: 'no-store',
+                });
+                if (!mounted) return;
+                setIsBackendOnline(response.ok);
+            } catch {
+                if (!mounted) return;
+                setIsBackendOnline(false);
+            }
+        };
+
+        const handleOffline = () => setIsBackendOnline(false);
+        const handleOnline = () => {
+            void pingBackend();
+        };
+
+        window.addEventListener('offline', handleOffline);
+        window.addEventListener('online', handleOnline);
+        void pingBackend();
+        timer = setInterval(() => {
+            void pingBackend();
+        }, 30000);
+
+        return () => {
+            mounted = false;
+            if (timer) clearInterval(timer);
+            window.removeEventListener('offline', handleOffline);
+            window.removeEventListener('online', handleOnline);
+        };
+    }, []);
+
     useEffect(() => {
-        localStorage.setItem(LAST_PAGE_KEY, location.pathname);
-    }, [location.pathname]);
+        const handler = (event: Event) => {
+            const custom = event as CustomEvent<{ expected?: string; server?: string }>;
+            const expected = custom.detail?.expected || 'unknown';
+            const server = custom.detail?.server || 'unknown';
+            showToast('warning', 'Версия сервера обновилась. Перезапустите клиент.', {
+                details: `Сервер API: ${server}\nКлиент ожидает: ${expected}`,
+                duration: 9000,
+            });
+        };
+        window.addEventListener('api-version-mismatch', handler);
+        return () => window.removeEventListener('api-version-mismatch', handler);
+    }, [showToast]);
 
-    const getPageTitle = () => {
-        switch (location.pathname) {
-            case '/':
-                return 'Транзакции';
-            case '/reference':
-                return 'Справочник операторов';
-            case '/automation':
-                return 'Автоматизация';
-            case '/userbot':
-                return 'Telegram Bots';
-            case '/logs':
-                return 'Логи';
-            default:
-                return 'Транзакции';
+    const lastSyncAt = useMemo(() => {
+        const candidates = syncSnapshot.statuses
+            .map((item) => item.lastSyncAt)
+            .filter((item): item is string => Boolean(item))
+            .sort((a, b) => new Date(b).getTime() - new Date(a).getTime());
+        return candidates[0] || null;
+    }, [syncSnapshot.statuses]);
+
+    const lagRows = useMemo(() => {
+        const txStatus = syncSnapshot.statuses.find((item) => item.table === 'transactions');
+        if (!txStatus) return 0;
+        const lag = Number(txStatus.lagRows || 0);
+        return lag > 0 ? lag : 0;
+    }, [syncSnapshot.statuses]);
+
+    const syncIndicatorState: 'idle' | 'syncing' | 'lagging' | 'error' = useMemo(() => {
+        if (syncSnapshot.state === 'syncing') return 'syncing';
+        if (syncSnapshot.state === 'error') return 'error';
+        if (lagRows > 0) return 'lagging';
+        return 'idle';
+    }, [syncSnapshot.state, lagRows]);
+
+    const launcherState = useMemo<'idle' | 'has_notifications' | 'thinking' | 'running' | 'error'>(() => {
+        if (!isBackendOnline) return 'error';
+        const threads = launcherThreadsQuery.data || [];
+        if (threads.some((thread) => thread.latest_run_status === 'processing')) {
+            return 'running';
         }
+        if (
+            threads.some((thread) =>
+                thread.latest_run_status === 'queued' ||
+                thread.latest_run_status === 'awaiting_confirmation',
+            )
+        ) {
+            return 'thinking';
+        }
+        if (unreadCount > 0) return 'has_notifications';
+        return 'idle';
+    }, [isBackendOnline, launcherThreadsQuery.data, unreadCount]);
+
+    const guardRoute = (tab: string, element: ReactNode) => {
+        if (hasTab(tab)) return element;
+        return <Navigate to={firstAllowedRoute()} replace />;
     };
 
     return (
-        <div className="h-screen w-full bg-bg flex flex-col">
-            <BurgerMenu isOpen={isMenuOpen} onClose={() => setIsMenuOpen(false)} />
-
-            {/* Top Header */}
-            <header className="flex items-center h-14 px-4 bg-surface border-b border-border shadow-sm z-10 flex-shrink-0">
-                <button
-                    onClick={() => setIsMenuOpen(true)}
-                    className="p-2 mr-4 rounded-lg hover:bg-surface-2 text-foreground-secondary transition-colors focus:outline-none focus:ring-2 focus:ring-primary"
-                >
-                    <Menu className="w-5 h-5" />
-                </button>
-                <h1 className="text-lg font-semibold text-foreground">{getPageTitle()}</h1>
-
-                {/* Background Automation Status Indicator */}
-                {isRunning && location.pathname !== '/automation' && (
-                    <button
-                        type="button"
-                        onClick={() => navigate('/automation')}
-                        className="ml-4 flex items-center gap-2 px-3 py-1.5 bg-primary/10 hover:bg-primary/20 border border-primary/30 rounded-lg transition-colors"
-                        title="Перейти к автоматизации"
+        <AppShell
+            rightSlot={(
+                <>
+                    <span
+                        className={`rl-status-pill${isBackendOnline ? ' is-online' : ' is-offline'}`}
+                        title={isBackendOnline ? 'Backend доступен' : 'Backend недоступен'}
                     >
-                        <Loader2 className="w-4 h-4 text-primary animate-spin" />
-                        <span className="text-sm text-primary font-medium">AI работает</span>
-                        {taskStatus?.progress && (
-                            <span className="text-xs text-primary/70">
-                                {taskStatus.progress.processed}/{taskStatus.progress.total}
-                            </span>
-                        )}
-                    </button>
-                )}
-
-                {isCompleted && location.pathname !== '/automation' && (
-                    <button
-                        type="button"
-                        onClick={() => navigate('/automation')}
-                        className="ml-4 flex items-center gap-2 px-3 py-1.5 bg-success/10 hover:bg-success/20 border border-success/30 rounded-lg transition-colors"
-                        title="Перейти к автоматизации"
-                    >
-                        <CheckCircle2 className="w-4 h-4 text-success" />
-                        <span className="text-sm text-success font-medium">AI завершен</span>
-                        {taskStatus?.results?.suggestions_count !== undefined && (
-                            <span className="text-xs text-success/70">
-                                {taskStatus.results.suggestions_count} предложений
-                            </span>
-                        )}
-                    </button>
-                )}
-            </header>
-
-            {/* Main Content */}
-            <div className="flex-1 overflow-hidden">
-                <Routes>
-                    <Route path="/" element={<TransactionsPage />} />
-                    <Route path="/reference" element={<ReferencePage />} />
-                    <Route path="/automation" element={<AutomationPage />} />
-                    <Route path="/userbot" element={<UserbotPage />} />
-                    <Route path="/logs" element={<LogsPage />} />
-                    <Route path="/settings" element={<SettingsPage />} />
-                </Routes>
-            </div>
-        </div>
+                        <span className="rl-status-dot" />
+                        {isBackendOnline ? 'онлайн' : 'офлайн'}
+                    </span>
+                    <SyncStatus
+                        state={syncIndicatorState}
+                        lagRows={lagRows}
+                        lastSyncAt={lastSyncAt}
+                        tableStatuses={syncSnapshot.statuses}
+                        onSync={() => {
+                            void syncManager.runSyncCycle();
+                        }}
+                    />
+                </>
+            )}
+        >
+            <Routes>
+                <Route path="/" element={guardRoute('dashboard', <TransactionsPage />)} />
+                <Route path="/reference" element={guardRoute('reference', <ReferencePage />)} />
+                <Route
+                    path="/automation"
+                    element={guardRoute('admin', <AutomationPage />)}
+                />
+                <Route
+                    path="/userbot"
+                    element={
+                        guardRoute(
+                            'userbot',
+                            <ScopeGuard action="sources">
+                                <UserbotPage />
+                            </ScopeGuard>
+                        )
+                    }
+                />
+                <Route path="/logs" element={guardRoute('logs', <LogsPage />)} />
+                <Route path="/routines" element={guardRoute('admin', <RoutinesPage />)} />
+                <Route path="/settings" element={guardRoute('admin', <SettingsPage />)} />
+                <Route path="/audit" element={guardRoute('admin', <AuditPage />)} />
+                <Route path="*" element={<Navigate to={firstAllowedRoute()} replace />} />
+            </Routes>
+            {!isAgentOpen ? (
+                <AiAgentLauncher
+                    unreadCount={unreadCount}
+                    state={launcherState}
+                    onClick={() => openAgent()}
+                />
+            ) : null}
+            <AiAgentDrawer />
+            <AgentUiActionRouter />
+        </AppShell>
     );
 }
 
+function AgentUiActionRouter() {
+    const navigate = useNavigate();
+    const { pendingUiAction, consumeUiAction } = useAiAgent();
+    const lastTokenRef = useRef<number | null>(null);
+
+    useEffect(() => {
+        if (!pendingUiAction) return;
+        if (lastTokenRef.current === pendingUiAction.token) return;
+
+        if (pendingUiAction.kind === 'navigate_view') {
+            const routeMap: Record<string, string> = {
+                transactions: '/',
+                dashboard: '/',
+                monitored_chats: '/userbot',
+                userbot: '/userbot',
+                operators: '/reference',
+                reference: '/reference',
+                audit: '/audit',
+                reports: '/audit',
+                automation: '/automation',
+                settings: '/settings',
+                logs: '/logs',
+            };
+            const targetRoute =
+                pendingUiAction.target?.route ||
+                (pendingUiAction.target?.view ? routeMap[String(pendingUiAction.target.view).toLowerCase()] : null);
+            if (targetRoute) {
+                lastTokenRef.current = pendingUiAction.token;
+                navigate(targetRoute);
+                consumeUiAction();
+            }
+        }
+    }, [pendingUiAction, navigate, consumeUiAction]);
+
+    return null;
+}
+
 function App() {
-    // Detect Electron to avoid file:// routing issues in packaged app
+    const { isAuthenticated, loading } = useAuth();
+
     const isElectron =
         typeof window !== 'undefined' &&
         (Boolean((window as any).electronAPI?.isElectron) ||
             navigator.userAgent.toLowerCase().includes('electron'));
+    const [clientAccessLoading, setClientAccessLoading] = useState(isElectron);
+    const [clientAccessStatus, setClientAccessStatus] = useState<any>(null);
+
+    useEffect(() => {
+        let mounted = true;
+        if (!isElectron) {
+            setClientAccessLoading(false);
+            return () => {
+                mounted = false;
+            };
+        }
+        loadElectronSystemAccessStatus(true)
+            .then((status) => {
+                if (!mounted) return;
+                setClientAccessStatus(status);
+            })
+            .finally(() => {
+                if (mounted) {
+                    setClientAccessLoading(false);
+                }
+            });
+        return () => {
+            mounted = false;
+        };
+    }, [isElectron]);
 
     const Router: ComponentType<{ children: ReactNode }> = isElectron ? HashRouter : BrowserRouter;
 
+    if (isElectron && clientAccessLoading) {
+        return (
+            <div className="h-screen w-full bg-bg flex items-center justify-center text-foreground">
+                {ru.common.checkingClientAccess}
+            </div>
+        );
+    }
+
+    if (isElectron && (!clientAccessStatus || !clientAccessStatus.ok)) {
+        return (
+            <div className="h-screen w-full bg-danger/10 flex items-center justify-center p-6">
+                <div className="max-w-xl w-full bg-surface border border-danger/40 rounded-lg p-8">
+                    <h2 className="text-2xl font-semibold text-danger text-center">{ru.common.accessBlocked}</h2>
+                </div>
+            </div>
+        );
+    }
+
     return (
         <Router>
-            <AppContent />
+            {loading ? (
+                <div className="h-screen w-full flex items-center justify-center bg-bg text-foreground-secondary">
+                    {ru.common.loading}
+                </div>
+            ) : isAuthenticated ? (
+                <AppContent />
+            ) : (
+                <LoginPage />
+            )}
         </Router>
     );
 }

@@ -12,9 +12,22 @@ import os
 
 from database.connection import get_db_session
 from database.models import Transaction
-from api.dependencies import get_current_user
+from api.dependencies import require_tab_access, get_allowed_sources_for_user
 
 router = APIRouter()
+
+
+def _scope_tx_query(query, current_user: dict):
+    """Restrict an analytics Transaction query to the operator's allowed sources.
+
+    Mirrors transactions._apply_allowed_sources_to_query: None (admin) or empty
+    set (no restriction configured) applies no filter; a non-empty set limits to
+    those chats. Without this, a scoped operator sees global aggregates.
+    """
+    allowed = get_allowed_sources_for_user(current_user)
+    if not allowed:
+        return query
+    return query.filter(Transaction.source_chat_id.in_(allowed))
 
 
 class TopAgentResponse(BaseModel):
@@ -31,7 +44,7 @@ class TopAgentResponse(BaseModel):
 @router.get("/top-agent", response_model=TopAgentResponse)
 async def get_top_agent(
     db: Session = Depends(get_db_session),
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(require_tab_access("dashboard")),
 ):
     """
     Get 'Top Agent' statistics for the last hour
@@ -42,8 +55,9 @@ async def get_top_agent(
     hour_ago = now - timedelta(hours=1)
     
     # Get transactions in last hour
-    recent_transactions = db.query(Transaction).filter(
-        Transaction.parsed_at >= hour_ago
+    recent_transactions = _scope_tx_query(
+        db.query(Transaction).filter(Transaction.parsed_at >= hour_ago),
+        current_user,
     ).all()
     
     transaction_count = len(recent_transactions)
@@ -101,35 +115,40 @@ async def get_top_agent(
 @router.get("/summary")
 async def get_summary(
     db: Session = Depends(get_db_session),
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(require_tab_access("dashboard")),
 ):
     """
     Get overall system statistics
     """
-    total_transactions = db.query(func.count(Transaction.id)).scalar()
-    
+    total_transactions = _scope_tx_query(db.query(func.count(Transaction.id)), current_user).scalar()
+
     # Count by type
-    debit_count = db.query(func.count(Transaction.id)).filter(
-        Transaction.transaction_type == 'DEBIT'
+    debit_count = _scope_tx_query(
+        db.query(func.count(Transaction.id)).filter(Transaction.transaction_type == 'DEBIT'),
+        current_user,
     ).scalar()
-    
-    credit_count = db.query(func.count(Transaction.id)).filter(
-        Transaction.transaction_type == 'CREDIT'
+
+    credit_count = _scope_tx_query(
+        db.query(func.count(Transaction.id)).filter(Transaction.transaction_type == 'CREDIT'),
+        current_user,
     ).scalar()
-    
+
     # GPT usage
-    gpt_parsed = db.query(func.count(Transaction.id)).filter(
-        Transaction.is_gpt_parsed == True
+    gpt_parsed = _scope_tx_query(
+        db.query(func.count(Transaction.id)).filter(Transaction.is_gpt_parsed == True),
+        current_user,
     ).scalar()
-    
+
     # Total volume (UZS only)
-    total_volume = db.query(func.sum(func.abs(Transaction.amount))).filter(
-        Transaction.currency == 'UZS'
+    total_volume = _scope_tx_query(
+        db.query(func.sum(func.abs(Transaction.amount))).filter(Transaction.currency == 'UZS'),
+        current_user,
     ).scalar() or 0
-    
+
     # Average confidence
-    avg_confidence = db.query(func.avg(Transaction.parsing_confidence)).filter(
-        Transaction.parsing_confidence.isnot(None)
+    avg_confidence = _scope_tx_query(
+        db.query(func.avg(Transaction.parsing_confidence)).filter(Transaction.parsing_confidence.isnot(None)),
+        current_user,
     ).scalar() or 0
     
     return {
