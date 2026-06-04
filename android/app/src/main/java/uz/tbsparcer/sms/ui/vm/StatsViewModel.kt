@@ -10,6 +10,7 @@ import uz.tbsparcer.sms.data.remote.SmsStatsResponse
 import uz.tbsparcer.sms.data.remote.SourceItem
 import uz.tbsparcer.sms.data.repo.SmsRepository
 import uz.tbsparcer.sms.data.repo.StatsRepository
+import uz.tbsparcer.sms.domain.SyncStatus
 import javax.inject.Inject
 
 data class StatsUi(
@@ -36,8 +37,8 @@ class StatsViewModel @Inject constructor(
     init {
         viewModelScope.launch {
             smsRepo.statusCounts().collect { list ->
-                val failed = list.filter { it.syncStatus == "error" || it.syncStatus == "skipped" || it.syncStatus == "parse_error" }
-                    .sumOf { it.n }
+                val problematic = setOf(SyncStatus.ERROR, SyncStatus.FAILED, SyncStatus.AUTH_ERROR, SyncStatus.SKIPPED)
+                val failed = list.filter { it.syncStatus in problematic }.sumOf { it.n }
                 _ui.value = _ui.value.copy(localFailed = failed)
             }
         }

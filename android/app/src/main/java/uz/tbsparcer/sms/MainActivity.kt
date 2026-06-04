@@ -12,14 +12,20 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.List
 import androidx.compose.material.icons.filled.BarChart
-import androidx.compose.material.icons.filled.Bolt
+import androidx.compose.material.icons.filled.Dashboard
 import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.Sync
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
+import androidx.lifecycle.lifecycleScope
 import androidx.navigation.NavGraph.Companion.findStartDestination
 import androidx.navigation.compose.*
 import dagger.hilt.android.AndroidEntryPoint
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import uz.tbsparcer.sms.data.local.SettingsStore
 import uz.tbsparcer.sms.ui.screens.*
 import uz.tbsparcer.sms.ui.theme.TbsTheme
@@ -31,11 +37,19 @@ import javax.inject.Inject
 class MainActivity : ComponentActivity() {
     @Inject lateinit var settings: SettingsStore
 
+    // EncryptedSharedPreferences decryption is blocking; read it off the main thread and let
+    // the UI react. Null until loaded → fall back to the system theme without blocking.
+    private val themeMode = MutableStateFlow<String?>(null)
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         WorkScheduler.schedulePeriodic(applicationContext)
+        lifecycleScope.launch {
+            themeMode.value = withContext(Dispatchers.IO) { settings.themeMode }
+        }
         setContent {
-            val dark = when (settings.themeMode) {
+            val mode by themeMode.collectAsState()
+            val dark = when (mode) {
                 "dark" -> true; "light" -> false
                 else -> isSystemInDarkTheme()
             }
@@ -67,11 +81,13 @@ private fun AppRoot(settings: SettingsStore) {
             val entry by nav.currentBackStackEntryAsState()
             val route = entry?.destination?.route
             NavigationBarItem(route == "home", { navigateTab("home") },
+                icon = { Icon(Icons.Filled.Dashboard, null) }, label = { Text("Сводка") })
+            NavigationBarItem(route == "feed", { navigateTab("feed") },
                 icon = { Icon(Icons.AutoMirrored.Filled.List, null) }, label = { Text("Лента") })
+            NavigationBarItem(route == "reconcile", { navigateTab("reconcile") },
+                icon = { Icon(Icons.Filled.Sync, null) }, label = { Text("Сверка") })
             NavigationBarItem(route == "stats", { navigateTab("stats") },
                 icon = { Icon(Icons.Filled.BarChart, null) }, label = { Text("Статистика") })
-            NavigationBarItem(route == "diag", { navigateTab("diag") },
-                icon = { Icon(Icons.Filled.Bolt, null) }, label = { Text("Статус") })
             NavigationBarItem(route == "settings", { navigateTab("settings") },
                 icon = { Icon(Icons.Filled.Settings, null) }, label = { Text("Настройки") })
         }
@@ -81,9 +97,10 @@ private fun AppRoot(settings: SettingsStore) {
                 val vm: SettingsViewModel = androidx.hilt.navigation.compose.hiltViewModel()
                 OnboardingScreen(vm) { nav.navigate("home") { popUpTo("onboarding") { inclusive = true } } }
             }
-            composable("home") { HomeScreen(onOpenDetail = { nav.navigate("detail/$it") }) }
+            composable("home") { DashboardScreen() }
+            composable("feed") { FeedScreen(onOpenDetail = { nav.navigate("detail/$it") }) }
+            composable("reconcile") { ReconcileScreen(onOpenDetail = { nav.navigate("detail/$it") }) }
             composable("stats") { StatsScreen() }
-            composable("diag") { DiagnosticsScreen() }
             composable("settings") { SettingsScreen() }
             composable("detail/{id}") { SmsDetailScreen(it.arguments?.getString("id") ?: "") }
         }

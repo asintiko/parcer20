@@ -61,7 +61,7 @@ def compute_fingerprint_v2(
     operator_raw: Optional[str] = None,
     *,
     include_operator: bool = True,
-    use_seconds: bool = True,
+    use_seconds: bool = False,
     transaction_type: Optional[str] = None,
 ) -> str:
     """Extended hash: amount + datetime(+seconds) + card_last4 + operator(optional) + tx_type(optional)."""
@@ -98,7 +98,11 @@ def compute_fingerprint_candidates(
     """
     effective_mode = (mode or _dedup_mode()).lower()
     include_operator = _bool_env("FINGERPRINT_V2_INCLUDE_OPERATOR", True)
-    use_seconds = _bool_env("FINGERPRINT_V2_USE_SECONDS", True)
+    # Minute precision by default: regex parsers only expose HH:MM while GPT
+    # emits seconds, so a seconds-based hash split the same receipt arriving via
+    # different channels into two transactions. Minute granularity keeps dedup
+    # consistent end-to-end.
+    use_seconds = _bool_env("FINGERPRINT_V2_USE_SECONDS", False)
     include_type = _bool_env("FINGERPRINT_V2_INCLUDE_TYPE", True)
 
     fp_v1 = compute_fingerprint_v1(amount, transaction_date, card_last4)

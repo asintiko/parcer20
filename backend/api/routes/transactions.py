@@ -706,10 +706,17 @@ def _assert_tx_in_scope(scope: Optional[Dict[str, Any]], tx: Transaction) -> Non
         raise HTTPException(status_code=403, detail="Transaction is outside of current scope")
 
 
-def _assert_not_in_locked_period(db: Session, tx_date: Optional[datetime]) -> None:
+def _assert_not_in_locked_period(
+    db: Session,
+    tx_date: Optional[datetime],
+    current_user: Optional[Dict[str, Any]] = None,
+) -> None:
     if not tx_date:
         return
-    if period_lock_service.is_date_locked(tx_date.date(), db):
+    if str((current_user or {}).get("role") or "").lower() == "admin":
+        return
+    user_id = (current_user or {}).get("id")
+    if period_lock_service.is_date_locked(tx_date.date(), db, user_id=user_id):
         raise HTTPException(status_code=403, detail="Transaction is in a locked period")
 
 
@@ -2204,7 +2211,7 @@ async def delete_transaction(
         _ensure_source_allowed(transaction, current_user)
         _assert_tx_in_scope(effective_scope, transaction)
         _assert_user_date_allowed(current_user, transaction.transaction_date)
-        _assert_not_in_locked_period(db, transaction.transaction_date)
+        _assert_not_in_locked_period(db, transaction.transaction_date, current_user)
 
         # Delete related tracking records to keep sync with Telegram client
         db.query(ReceiptProcessingTask).filter(
@@ -2261,6 +2268,9 @@ async def bulk_delete_transactions(
         failed_ids = [i for i in ids if i not in existing_map]
         errors: List[str] = [f"ID {fid} not found" for fid in failed_ids]
 
+        user_id = current_user.get("id")
+        is_admin = str(current_user.get("role") or "").lower() == "admin"
+
         allowed_ids: List[int] = []
         for tx_id, tx in existing_map.items():
             if not is_datetime_allowed(effective_scope, tx.transaction_date):
@@ -2271,7 +2281,11 @@ async def bulk_delete_transactions(
                 failed_ids.append(tx_id)
                 errors.append(f"ID {tx_id} date is forbidden for current user")
                 continue
-            if period_lock_service.is_date_locked(tx.transaction_date.date(), db):
+            if (
+                not is_admin
+                and tx.transaction_date
+                and period_lock_service.is_date_locked(tx.transaction_date.date(), db, user_id=user_id)
+            ):
                 failed_ids.append(tx_id)
                 errors.append(f"ID {tx_id} is in locked period")
                 continue
@@ -2279,7 +2293,14 @@ async def bulk_delete_transactions(
 
         deleted_count = 0
         if allowed_ids:
-            deleted_count = db.query(Transaction).filter(Transaction.id.in_(allowed_ids)).delete(synchronize_session=False)
+            allowed_set = set(allowed_ids)
+            db.query(ReceiptProcessingTask).filter(
+                ReceiptProcessingTask.transaction_id.in_(allowed_ids)
+            ).delete(synchronize_session=False)
+            for tx_id, tx in existing_map.items():
+                if tx_id in allowed_set:
+                    db.delete(tx)
+                    deleted_count += 1
         db.commit()
         _audit_transaction_action(
             db,

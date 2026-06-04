@@ -1,7 +1,10 @@
 """TOTP 2FA management endpoints."""
 from __future__ import annotations
 
+import logging
 import os
+import threading
+import time
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -26,6 +29,8 @@ from services.totp_service import (
 
 TWO_FA_MAX_ATTEMPTS = max(1, int(os.getenv("TWO_FA_MAX_ATTEMPTS", "5")))
 TWO_FA_LOCKOUT_MINUTES = max(1, int(os.getenv("TWO_FA_LOCKOUT_MINUTES", "15")))
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/2fa", tags=["two-factor"])
 
@@ -124,35 +129,47 @@ def _resolve_user_from_context(
 
 
 async def _check_2fa_lock(user_id: int) -> Optional[int]:
-    redis = await get_redis()
-    key = f"2fa:fail:{int(user_id)}"
-    failures_raw = await redis.get(key)
     try:
-        failures = int(failures_raw or 0)
+        redis = await get_redis()
+        key = f"2fa:fail:{int(user_id)}"
+        failures_raw = await redis.get(key)
+        try:
+            failures = int(failures_raw or 0)
+        except Exception:
+            failures = 0
+        if failures < TWO_FA_MAX_ATTEMPTS:
+            return None
+        ttl = await redis.ttl(key)
+        if ttl and int(ttl) > 0:
+            return int(ttl)
+        return max(1, TWO_FA_LOCKOUT_MINUTES * 60)
     except Exception:
-        failures = 0
-    if failures < TWO_FA_MAX_ATTEMPTS:
-        return None
-    ttl = await redis.ttl(key)
-    if ttl and int(ttl) > 0:
-        return int(ttl)
-    return max(1, TWO_FA_LOCKOUT_MINUTES * 60)
+        # Redis unavailable: fail closed — treat as locked to prevent brute force.
+        logger.warning("Redis unavailable in _check_2fa_lock for user_id=%s; denying", user_id)
+        return max(1, TWO_FA_LOCKOUT_MINUTES * 60)
 
 
 async def _mark_2fa_failed(user_id: int) -> Dict[str, int]:
-    redis = await get_redis()
-    key = f"2fa:fail:{int(user_id)}"
-    count = int(await redis.incr(key))
-    if count == 1:
-        await redis.expire(key, TWO_FA_LOCKOUT_MINUTES * 60)
-    ttl = await redis.ttl(key)
-    attempts_left = max(0, TWO_FA_MAX_ATTEMPTS - count)
-    return {"attempts_left": attempts_left, "locked_seconds": max(0, int(ttl or 0))}
+    try:
+        redis = await get_redis()
+        key = f"2fa:fail:{int(user_id)}"
+        count = int(await redis.incr(key))
+        if count == 1:
+            await redis.expire(key, TWO_FA_LOCKOUT_MINUTES * 60)
+        ttl = await redis.ttl(key)
+        attempts_left = max(0, TWO_FA_MAX_ATTEMPTS - count)
+        return {"attempts_left": attempts_left, "locked_seconds": max(0, int(ttl or 0))}
+    except Exception:
+        logger.warning("Redis unavailable in _mark_2fa_failed for user_id=%s", user_id)
+        return {"attempts_left": 0, "locked_seconds": TWO_FA_LOCKOUT_MINUTES * 60}
 
 
 async def _clear_2fa_failures(user_id: int) -> None:
-    redis = await get_redis()
-    await redis.delete(f"2fa:fail:{int(user_id)}")
+    try:
+        redis = await get_redis()
+        await redis.delete(f"2fa:fail:{int(user_id)}")
+    except Exception:
+        logger.debug("Redis unavailable in _clear_2fa_failures for user_id=%s", user_id)
 
 
 @router.get("/status", response_model=TwoFactorStatusResponse)

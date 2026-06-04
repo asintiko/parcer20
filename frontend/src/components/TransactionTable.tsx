@@ -58,6 +58,16 @@ import { CSS } from '@dnd-kit/utilities';
 
 type TableDensity = 'ultra-compact' | 'compact' | 'standard' | 'comfortable';
 
+const describeDeleteError = (errors?: string[]): string => {
+    const first = errors?.find(Boolean) ?? '';
+    const text = first.toLowerCase();
+    if (text.includes('locked period')) return 'период заблокирован';
+    if (text.includes('outside current scope')) return 'вне доступного периода';
+    if (text.includes('forbidden for current user')) return 'дата запрещена для пользователя';
+    if (text.includes('not found')) return 'запись не найдена';
+    return first;
+};
+
 interface TransactionTableProps {
     data: Transaction[];
     total: number;
@@ -1749,16 +1759,33 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
             return;
         }
         try {
-            await transactionsApi.bulkDeleteTransactions(idsArray);
-            const deletedRows = idsArray.map(id => {
-                const row = data.find(r => r.id === id);
-                return { rowId: id, rowData: row };
-            });
-            addAction({ type: 'BULK_DELETE', rows: deletedRows });
-            onTransactionsDeleted?.(idsArray);
+            const res = await transactionsApi.bulkDeleteTransactions(idsArray);
+            const failed = new Set(res?.failed_ids ?? []);
+            const deletedIds = idsArray.filter(id => !failed.has(id));
+
+            if (deletedIds.length) {
+                const deletedRows = deletedIds.map(id => {
+                    const row = data.find(r => r.id === id);
+                    return { rowId: id, rowData: row };
+                });
+                addAction({ type: 'BULK_DELETE', rows: deletedRows });
+                onTransactionsDeleted?.(deletedIds);
+            }
             setSelectedCells(new Set());
-            showToast('success', `Удалено ${idsArray.length} записей`);
+
+            if (failed.size > 0) {
+                console.warn('bulk-delete: часть записей не удалена', res?.failed_ids, res?.errors);
+                const reason = describeDeleteError(res?.errors);
+                if (deletedIds.length) {
+                    showToast('warning', `Удалено ${deletedIds.length}, не удалось ${failed.size}${reason ? `: ${reason}` : ''}`);
+                } else {
+                    showToast('error', `Не удалось удалить${reason ? `: ${reason}` : ''}`);
+                }
+            } else {
+                showToast('success', `Удалено ${deletedIds.length} записей`);
+            }
         } catch (error) {
+            console.error('bulk-delete: запрос завершился ошибкой', error);
             showToast('error', 'Ошибка при удалении');
         } finally {
             setConfirmDeleteRows(null);

@@ -9,6 +9,8 @@ import hmac
 import logging
 import os
 import secrets
+import time
+import threading
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 from urllib.parse import parse_qs
@@ -61,7 +63,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("AUTH_BOT_TOKEN", "").strip()
 AUTH_LOGIN_RATE_LIMIT_PER_MIN = max(1, int(os.getenv("AUTH_LOGIN_RATE_LIMIT_PER_MIN", "10")))
 AUTH_LOGIN_2FA_RATE_LIMIT_PER_MIN = max(1, int(os.getenv("AUTH_LOGIN_2FA_RATE_LIMIT_PER_MIN", "5")))
 PRIMARY_QR_ADMIN_TELEGRAM_ID = int(os.getenv("PRIMARY_QR_ADMIN_TELEGRAM_ID", "1957390574") or 1957390574)
-AUTH_DISABLE_LOGIN_2FA = str(os.getenv("AUTH_DISABLE_LOGIN_2FA", "true")).strip().lower() in {
+AUTH_DISABLE_LOGIN_2FA = str(os.getenv("AUTH_DISABLE_LOGIN_2FA", "false")).strip().lower() in {
     "1",
     "true",
     "yes",
@@ -202,12 +204,34 @@ def _safe_audit_log(
         logger.warning("Failed to write audit log: action=%s", action, exc_info=True)
 
 
+# In-process fallback rate-limit state when Redis is unavailable. Keyed by
+# "key:minute_slot". Protected by a lock so concurrent requests are safe.
+_AUTH_FALLBACK_RATE: Dict[str, int] = {}
+_AUTH_FALLBACK_LOCK = threading.Lock()
+
+
+def _auth_fallback_rate_check(key: str, limit: int) -> bool:
+    """Return True if allowed under the in-process limiter, False if over limit."""
+    current_slot = int(time.time() // 60)
+    with _AUTH_FALLBACK_LOCK:
+        for k in list(_AUTH_FALLBACK_RATE.keys()):
+            try:
+                if int(k.rsplit(":", 1)[1]) < current_slot:
+                    _AUTH_FALLBACK_RATE.pop(k, None)
+            except (ValueError, IndexError):
+                _AUTH_FALLBACK_RATE.pop(k, None)
+        count = _AUTH_FALLBACK_RATE.get(key, 0) + 1
+        _AUTH_FALLBACK_RATE[key] = count
+        return count <= limit
+
+
 async def _check_endpoint_rate_limit(ip: str, key_suffix: str, limit_per_minute: int) -> Optional[int]:
-    """Returns retry_after seconds when limited, otherwise None."""
+    """Returns retry_after seconds when limited, otherwise None. Fails closed via in-process fallback when Redis is down."""
+    minute_slot = int(time.time() // 60)
+    fallback_key = f"rate:auth:{key_suffix}:{ip}:{minute_slot}"
     try:
         redis_client = await get_redis()
-        minute_slot = int(datetime.utcnow().timestamp() // 60)
-        key = f"rate:auth:{key_suffix}:{ip}:{minute_slot}"
+        key = fallback_key
         count = await redis_client.incr(key)
         if count == 1:
             await redis_client.expire(key, 65)
@@ -216,8 +240,9 @@ async def _check_endpoint_rate_limit(ip: str, key_suffix: str, limit_per_minute:
             return max(1, int(ttl or 1))
         return None
     except Exception:
-        # Fail-open for auth when Redis is transiently unavailable.
-        logger.debug("Rate-limit Redis check failed for %s", key_suffix, exc_info=True)
+        logger.warning("Rate-limit Redis unavailable for %s, using in-process fallback", key_suffix)
+        if not _auth_fallback_rate_check(fallback_key, limit_per_minute):
+            return 60
         return None
 
 
@@ -300,35 +325,47 @@ def _requires_2fa(user: User, db: Session) -> bool:
 
 
 async def _check_2fa_lock(user_id: int) -> Optional[int]:
-    redis = await get_redis()
-    key = f"2fa:fail:{int(user_id)}"
-    failures_raw = await redis.get(key)
     try:
-        failures = int(failures_raw or 0)
+        redis = await get_redis()
+        key = f"2fa:fail:{int(user_id)}"
+        failures_raw = await redis.get(key)
+        try:
+            failures = int(failures_raw or 0)
+        except Exception:
+            failures = 0
+        if failures < TWO_FA_MAX_ATTEMPTS:
+            return None
+        ttl = await redis.ttl(key)
+        if ttl and int(ttl) > 0:
+            return int(ttl)
+        return max(1, TWO_FA_LOCKOUT_MINUTES * 60)
     except Exception:
-        failures = 0
-    if failures < TWO_FA_MAX_ATTEMPTS:
-        return None
-    ttl = await redis.ttl(key)
-    if ttl and int(ttl) > 0:
-        return int(ttl)
-    return max(1, TWO_FA_LOCKOUT_MINUTES * 60)
+        # Redis unavailable: fail closed — treat as locked to prevent brute force.
+        logger.warning("Redis unavailable in _check_2fa_lock for user_id=%s; denying", user_id)
+        return max(1, TWO_FA_LOCKOUT_MINUTES * 60)
 
 
 async def _mark_2fa_failed(user_id: int) -> Dict[str, int]:
-    redis = await get_redis()
-    key = f"2fa:fail:{int(user_id)}"
-    count = int(await redis.incr(key))
-    if count == 1:
-        await redis.expire(key, TWO_FA_LOCKOUT_MINUTES * 60)
-    ttl = await redis.ttl(key)
-    attempts_left = max(0, TWO_FA_MAX_ATTEMPTS - count)
-    return {"attempts_left": attempts_left, "locked_seconds": max(0, int(ttl or 0))}
+    try:
+        redis = await get_redis()
+        key = f"2fa:fail:{int(user_id)}"
+        count = int(await redis.incr(key))
+        if count == 1:
+            await redis.expire(key, TWO_FA_LOCKOUT_MINUTES * 60)
+        ttl = await redis.ttl(key)
+        attempts_left = max(0, TWO_FA_MAX_ATTEMPTS - count)
+        return {"attempts_left": attempts_left, "locked_seconds": max(0, int(ttl or 0))}
+    except Exception:
+        logger.warning("Redis unavailable in _mark_2fa_failed for user_id=%s", user_id)
+        return {"attempts_left": 0, "locked_seconds": TWO_FA_LOCKOUT_MINUTES * 60}
 
 
 async def _clear_2fa_failed(user_id: int) -> None:
-    redis = await get_redis()
-    await redis.delete(f"2fa:fail:{int(user_id)}")
+    try:
+        redis = await get_redis()
+        await redis.delete(f"2fa:fail:{int(user_id)}")
+    except Exception:
+        logger.debug("Redis unavailable in _clear_2fa_failed for user_id=%s", user_id)
 
 
 async def _store_access_token_compat(user_id: int, token: str) -> None:

@@ -51,4 +51,23 @@ class SmsFilterTest {
         assertFalse(SmsFilter.isBankSms("Promo",
             "Skidka 50.00 segodnya tolko"))
     }
+    @Test fun rejectsEmptyBody() {
+        assertFalse(SmsFilter.isBankSms("UZCARD", ""))
+    }
+    @Test fun rejectsEmptySender() {
+        // empty sender is not in the ignore list, so acceptance must hinge on the body alone
+        assertFalse(SmsFilter.isBankSms("", "just a normal text without money"))
+    }
+    @Test fun rejectsBlankBoth() {
+        assertFalse(SmsFilter.isBankSms("", ""))
+    }
+    @Test fun rejectsDeliveryNotification() {
+        // known false-positive shape: courier SMS with an order number, no amount/currency/card
+        assertFalse(SmsFilter.isBankSms("BTS",
+            "Vash zakaz #1234567 dostavlen v punkt vydachi. Spasibo za pokupku!"))
+    }
+    @Test fun rejectsTwoFactorWithDigits() {
+        // 6-digit OTP must not be read as an amount/currency match
+        assertFalse(SmsFilter.isBankSms("MyGov", "Kod podtverzhdeniya: 845102"))
+    }
 }

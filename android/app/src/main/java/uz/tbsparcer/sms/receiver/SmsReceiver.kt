@@ -13,6 +13,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import uz.tbsparcer.sms.data.repo.SmsRepository
+import uz.tbsparcer.sms.domain.SmsLocalId
 import uz.tbsparcer.sms.work.WorkScheduler
 
 class SmsReceiver : BroadcastReceiver() {
@@ -27,7 +28,7 @@ class SmsReceiver : BroadcastReceiver() {
         val sender = msgs.firstOrNull()?.originatingAddress ?: return
         val body = msgs.joinToString("") { it.messageBody ?: "" }
         val ts = msgs.firstOrNull()?.timestampMillis ?: System.currentTimeMillis()
-        val deviceSmsId = "${ts}_${sender.hashCode()}"
+        val deviceSmsId = SmsLocalId.of(sender, ts, body)
 
         val repo = EntryPointAccessors
             .fromApplication(context.applicationContext, ReceiverEntryPoint::class.java)

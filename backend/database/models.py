@@ -27,7 +27,11 @@ class Transaction(Base):
     source_type = Column(String(20), nullable=False)
     source_chat_id = Column(BigInteger, nullable=False)
     source_message_id = Column(BigInteger)
-    
+    # Origin device identity for mobile SMS ingestion. Drives per-device
+    # idempotency so a re-sent batch can't double-book a transaction.
+    source_device_id = Column(String(128))
+    source_device_sms_id = Column(String(128))
+
     # Parsed Transaction Data
     transaction_date = Column(DateTime(timezone=False), nullable=False)
     amount = Column(Numeric(18, 2), nullable=False)
@@ -97,6 +101,13 @@ class Transaction(Base):
             'fingerprint',
             unique=True,
             postgresql_where=sql_text('fingerprint IS NOT NULL'),
+        ),
+        # Per-device idempotency for mobile SMS ingestion. Mirrors migration 0020.
+        Index(
+            'uq_transactions_source_device_sms',
+            'source_device_id', 'source_device_sms_id',
+            unique=True,
+            postgresql_where=sql_text('source_device_sms_id IS NOT NULL'),
         ),
         Index(
             'idx_transactions_raw_message_trgm',

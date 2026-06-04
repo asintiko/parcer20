@@ -19,12 +19,25 @@ data class SmsIngestRequest(
 )
 
 @JsonClass(generateAdapter = true)
+data class SmsParsedDto(
+    val amount: String?,
+    val currency: String?,
+    @Json(name = "transaction_date") val transactionDate: String?,
+    @Json(name = "card_last_4") val cardLast4: String?,
+    val operator: String?,
+    @Json(name = "transaction_type") val transactionType: String?,
+    @Json(name = "balance_after") val balanceAfter: String?,
+    val application: String?,
+)
+
+@JsonClass(generateAdapter = true)
 data class SmsIngestResultItem(
     @Json(name = "device_sms_id") val deviceSmsId: String,
     val status: String,
     @Json(name = "transaction_id") val transactionId: Long?,
     val fingerprint: String?,
     val error: String?,
+    val parsed: SmsParsedDto? = null,
 )
 
 @JsonClass(generateAdapter = true)

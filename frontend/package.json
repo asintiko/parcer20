@@ -1,6 +1,6 @@
 {
     "name": "tbsparcer",
-    "version": "1.4.16",
+    "version": "1.4.17",
     "description": "TBSparcer Desktop Application",
     "main": "electron/main.cjs",
     "author": "TBSparcer Team",

@@ -118,4 +118,5 @@ def install_fake_auth_redis(monkeypatch):
     monkeypatch.setattr("services.auth_bot_service.get_redis", fake_get_redis)
     monkeypatch.setattr("services.auth_bot_service._get_sync_redis", lambda: fake_sync)
     monkeypatch.setattr("api.routes.auth.get_redis", fake_get_redis)
+    monkeypatch.setattr("api.routes.two_factor.get_redis", fake_get_redis)
     return fake_async, fake_sync

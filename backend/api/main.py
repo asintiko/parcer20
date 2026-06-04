@@ -31,12 +31,12 @@ from services.root_access_config_service import (
     verify_system_access_token,
 )
 from services.auth_bot_service import verify_launch_session_token
-from services.internal_api_key_service import is_valid_internal_api_key
+from services.internal_api_key_service import is_internal_request
 from services.system_settings_service import get_settings
 from api.response_helpers import error_response, build_error_payload
 
 logger = logging.getLogger(__name__)
-APP_VERSION = str(os.getenv("APP_VERSION", "1.4.12")).strip() or "1.4.12"
+APP_VERSION = str(os.getenv("APP_VERSION", "1.4.17")).strip() or "1.4.17"
 
 _launch_gate_cache_value: Optional[bool] = None
 _launch_gate_cache_expires_at: float = 0.0
@@ -299,9 +299,9 @@ class CSRFMiddleware(BaseHTTPMiddleware):
         if not request.url.path.startswith("/api/"):
             return await call_next(request)
 
-        # Internal service requests are authenticated by internal API key(s).
-        internal_header = request.headers.get("x-internal-api-key")
-        if is_valid_internal_api_key(internal_header):
+        # Internal service requests are authenticated by internal API key(s),
+        # bound to the in-cluster network so a leaked key can't bypass from outside.
+        if is_internal_request(request):
             return await call_next(request)
         # First-party desktop/web clients always send X-System-Access.
         # If it is valid, skip CSRF origin check to avoid false denies on
@@ -415,8 +415,7 @@ class SystemAccessMiddleware(BaseHTTPMiddleware):
         if path.startswith("/api/feed/") or path == "/api/feed":
             return await call_next(request)
 
-        internal_header = request.headers.get("x-internal-api-key")
-        if is_valid_internal_api_key(internal_header):
+        if is_internal_request(request):
             request.state.system_access = {"ok": True, "token_id": "internal-service"}
             return await call_next(request)
 
@@ -489,8 +488,7 @@ class LaunchSessionMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
         if path.startswith("/api/docs") or path.startswith("/api/openapi"):
             return await call_next(request)
-        internal_header = request.headers.get("x-internal-api-key")
-        if is_valid_internal_api_key(internal_header):
+        if is_internal_request(request):
             return await call_next(request)
 
         try:

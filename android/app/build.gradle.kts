@@ -1,8 +1,19 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
     id("com.google.devtools.ksp")
     id("com.google.dagger.hilt.android")
+}
+
+// Mobile ingest key is injected at build time — never source-controlled. Precedence:
+// local.properties (dev) → MOBILE_INGEST_KEY env (CI) → "" (forces manual entry in onboarding).
+val mobileIngestKey: String = run {
+    val props = Properties()
+    val lp = rootProject.file("local.properties")
+    if (lp.exists()) lp.inputStream().use(props::load)
+    props.getProperty("MOBILE_INGEST_KEY") ?: System.getenv("MOBILE_INGEST_KEY") ?: ""
 }
 
 android {
@@ -16,6 +27,7 @@ android {
         versionCode = 1
         versionName = "1.0.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+        buildConfigField("String", "MOBILE_INGEST_KEY", "\"$mobileIngestKey\"")
     }
 
     signingConfigs {
@@ -45,9 +57,13 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
     kotlinOptions { jvmTarget = "17" }
-    buildFeatures { compose = true }
+    buildFeatures {
+        compose = true
+        buildConfig = true
+    }
     composeOptions { kotlinCompilerExtensionVersion = "1.5.14" }
     packaging { resources { excludes += "/META-INF/{AL2.0,LGPL2.1}" } }
+    testOptions { unitTests.isIncludeAndroidResources = true }
 }
 
 dependencies {
@@ -84,5 +100,9 @@ dependencies {
     implementation("androidx.datastore:datastore-preferences:1.1.1")
 
     testImplementation("junit:junit:4.13.2")
+    testImplementation("org.robolectric:robolectric:4.12.2")
+    testImplementation("androidx.test:core-ktx:1.6.1")
+    testImplementation("androidx.room:room-testing:2.6.1")
+    testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.8.1")
     debugImplementation("androidx.compose.ui:ui-tooling")
 }

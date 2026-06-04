@@ -7,6 +7,7 @@ import dagger.hilt.android.qualifiers.ApplicationContext
 import java.util.UUID
 import javax.inject.Inject
 import javax.inject.Singleton
+import uz.tbsparcer.sms.BuildConfig
 
 @Singleton
 class SettingsStore @Inject constructor(@ApplicationContext ctx: Context) {
@@ -23,8 +24,11 @@ class SettingsStore @Inject constructor(@ApplicationContext ctx: Context) {
         get() = prefs.getString("base_url", DEFAULT_BASE_URL) ?: DEFAULT_BASE_URL
         set(v) = prefs.edit().putString("base_url", v).apply()
 
+    // Baked in at build time from local.properties / env, never source-controlled and never shown
+    // in the UI (the app is shared privately). Setter kept so the key can be rotated in-app via the
+    // hidden advanced settings without rebuilding.
     var mobileKey: String
-        get() = prefs.getString("mobile_key", DEFAULT_MOBILE_KEY) ?: DEFAULT_MOBILE_KEY
+        get() = prefs.getString("mobile_key", BuildConfig.MOBILE_INGEST_KEY) ?: BuildConfig.MOBILE_INGEST_KEY
         set(v) = prefs.edit().putString("mobile_key", v).apply()
 
     val deviceId: String
@@ -48,8 +52,13 @@ class SettingsStore @Inject constructor(@ApplicationContext ctx: Context) {
         get() = prefs.getString("theme_mode", "system") ?: "system"
         set(v) = prefs.edit().putString("theme_mode", v).apply()
 
+    // Set when the backend rejects the ingest key (HTTP 403). Surfaced in Home/Diagnostics
+    // so the user fixes the key instead of the sync silently hammering a dead endpoint.
+    var authError: Boolean
+        get() = prefs.getBoolean("auth_error", false)
+        set(v) = prefs.edit().putBoolean("auth_error", v).apply()
+
     companion object {
         const val DEFAULT_BASE_URL = "https://64.188.106.221.nip.io"
-        const val DEFAULT_MOBILE_KEY = "yTr6C1RoVvJw6ODpzuEaoaS7CqlyPIBi4esOqlr3drE"
     }
 }

@@ -17,6 +17,7 @@ from api.dependencies import require_mobile_ingest_key
 from database.connection import get_db_session
 from database.models import MonitoredBotChat, Transaction
 from parsers.parser_orchestrator import ParserOrchestrator
+from services import receipt_logger
 from services.access_control_service import write_audit_log
 from services.auth_bot_service import get_redis
 from services.fingerprint import compute_fingerprint_candidates
@@ -61,12 +62,25 @@ class SmsIngestRequest(BaseModel):
     messages: List[SmsMessage] = Field(..., min_length=1, max_length=50)
 
 
+class SmsParsedSummary(BaseModel):
+    amount: Optional[str] = None
+    direction: Optional[str] = None
+    currency: Optional[str] = None
+    transaction_date: Optional[str] = None
+    card_last_4: Optional[str] = None
+    operator: Optional[str] = None
+    transaction_type: Optional[str] = None
+    balance_after: Optional[str] = None
+    application: Optional[str] = None
+
+
 class SmsIngestResultItem(BaseModel):
     device_sms_id: str
     status: str  # created | duplicate | skipped | parse_error
     transaction_id: Optional[int] = None
     fingerprint: Optional[str] = None
     error: Optional[str] = None
+    parsed: Optional[SmsParsedSummary] = None
 
 
 class SmsIngestResponse(BaseModel):
@@ -233,7 +247,10 @@ def _normalize_confidence(value: Any) -> float:
 
 
 async def _enforce_sms_ingest_rate_limit(request: Request, db: Session, device_id: str) -> None:
-    actor = (device_id or "").strip() or _request_ip(request)
+    # Throttle by source IP, not by the client-supplied device_id: a caller can
+    # mint unlimited device_ids to dodge the limit. device_id stays in the audit
+    # trail for forensics only.
+    actor = _request_ip(request)
     minute_slot = int(time.time() // 60)
     key = f"sms_ingest:rate:{actor}:{minute_slot}"
 
@@ -302,8 +319,36 @@ async def ingest_sms(
     orchestrator = ParserOrchestrator(db)
 
     results: List[SmsIngestResultItem] = []
+    log_events: List[Dict[str, Any]] = []
+    src_device_id = (payload.device_id or "").strip() or None
 
     for msg in payload.messages:
+        # Idempotency by (device_id, device_sms_id): a re-sent batch (network
+        # retry, WorkManager replay) must not create a second transaction, and a
+        # forged fingerprint can no longer suppress a genuine SMS — each device
+        # message is unique by its own id regardless of fingerprint collisions.
+        src_sms_id = (msg.device_sms_id or "").strip() or None
+        if src_sms_id is not None:
+            dup_q = db.query(Transaction).filter(Transaction.source_device_sms_id == src_sms_id)
+            dup_q = (
+                dup_q.filter(Transaction.source_device_id.is_(None))
+                if src_device_id is None
+                else dup_q.filter(Transaction.source_device_id == src_device_id)
+            )
+            prior = dup_q.first()
+            if prior is not None:
+                results.append(
+                    SmsIngestResultItem(
+                        device_sms_id=msg.device_sms_id,
+                        status="duplicate",
+                        transaction_id=int(prior.id),
+                        fingerprint=prior.fingerprint,
+                        parsed=_summary_from_txn(prior),
+                    )
+                )
+                log_events.append({"kind": "duplicate", "txn": prior})
+                continue
+
         try:
             parsed = orchestrator.parse_text(msg.text)
         except Exception as exc:  # noqa: BLE001
@@ -314,6 +359,7 @@ async def ingest_sms(
                     error=f"parser_error:{str(exc)[:180]}",
                 )
             )
+            log_events.append({"kind": "failed", "reason": str(exc), "text": msg.text})
             continue
 
         if not parsed:
@@ -324,6 +370,7 @@ async def ingest_sms(
                     error="not_a_transaction",
                 )
             )
+            log_events.append({"kind": "failed", "reason": "not_a_transaction", "text": msg.text})
             continue
 
         try:
@@ -346,6 +393,7 @@ async def ingest_sms(
                     transaction_date=transaction_date,
                     card_last4=card_last4,
                     operator_raw=operator_raw,
+                    transaction_type=txn_type,
                 )
                 fp = fp_candidates[0]
                 existing = db.query(Transaction).filter(Transaction.fingerprint.in_(fp_candidates)).first()
@@ -356,8 +404,10 @@ async def ingest_sms(
                             status="duplicate",
                             transaction_id=int(existing.id),
                             fingerprint=fp,
+                            parsed=_summary_from_txn(existing),
                         )
                     )
+                    log_events.append({"kind": "duplicate", "txn": existing})
                     continue
 
                 store_amount = -abs(amount) if txn_type == "DEBIT" else abs(amount)
@@ -366,6 +416,8 @@ async def ingest_sms(
                     source_type="SMS",
                     source_chat_id=0,
                     source_message_id=None,
+                    source_device_id=src_device_id,
+                    source_device_sms_id=src_sms_id,
                     transaction_date=transaction_date,
                     amount=store_amount,
                     currency=str(parsed.get("currency") or "UZS")[:3].upper(),
@@ -390,8 +442,10 @@ async def ingest_sms(
                         status="created",
                         transaction_id=int(txn.id),
                         fingerprint=fp,
+                        parsed=_summary_from_txn(txn),
                     )
                 )
+                log_events.append({"kind": "created", "txn": txn})
         except Exception as exc:  # noqa: BLE001
             results.append(
                 SmsIngestResultItem(
@@ -400,8 +454,64 @@ async def ingest_sms(
                     error=f"ingest_error:{str(exc)[:180]}",
                 )
             )
+            log_events.append({"kind": "failed", "reason": str(exc), "text": msg.text})
 
     db.commit()
+
+    device_marker = (payload.device_id or "").strip() or "unknown"
+    SMS_CHAT_TITLE = "📱 SMS (mobile)"
+    for ev in log_events:
+        try:
+            kind = ev["kind"]
+            if kind in ("created", "duplicate"):
+                t = ev["txn"]
+                if kind == "created":
+                    receipt_logger.log_processed(
+                        task_id=None,
+                        transaction_id=int(t.id),
+                        chat_id=0,
+                        chat_title=SMS_CHAT_TITLE,
+                        message_id=None,
+                        amount=t.amount,
+                        currency=t.currency or "UZS",
+                        transaction_date=t.transaction_date,
+                        operator=t.operator_raw,
+                        receiver_name=t.receiver_name,
+                        receiver_card=t.receiver_card,
+                        sender_card=t.card_last_4,
+                        parsing_method=t.parsing_method,
+                        parsing_confidence=t.parsing_confidence,
+                        is_p2p=bool(t.is_p2p),
+                        ocr_preview=t.raw_message,
+                        request_id=f"sms:{device_marker}",
+                    )
+                else:
+                    receipt_logger.log_duplicate(
+                        task_id=None,
+                        transaction_id=int(t.id),
+                        duplicate_of_id=int(t.id),
+                        chat_id=0,
+                        chat_title=SMS_CHAT_TITLE,
+                        message_id=None,
+                        amount=t.amount,
+                        currency=t.currency or "UZS",
+                        transaction_date=t.transaction_date,
+                        operator=t.operator_raw,
+                        request_id=f"sms:{device_marker}",
+                    )
+            else:
+                receipt_logger.log_failed(
+                    task_id=None,
+                    chat_id=0,
+                    chat_title=SMS_CHAT_TITLE,
+                    message_id=None,
+                    rejection_reason=ev.get("reason"),
+                    error_summary=ev.get("reason"),
+                    ocr_preview=ev.get("text"),
+                    request_id=f"sms:{device_marker}",
+                )
+        except Exception:
+            pass
 
     created = sum(1 for item in results if item.status == "created")
     duplicates = sum(1 for item in results if item.status == "duplicate")
@@ -435,6 +545,23 @@ async def ingest_sms(
         skipped=skipped,
         errors=errors,
         results=results,
+    )
+
+
+def _summary_from_txn(txn: Transaction) -> SmsParsedSummary:
+    ttype = (txn.transaction_type or "").upper()
+    amt = txn.amount
+    bal = txn.balance_after
+    return SmsParsedSummary(
+        amount=f"{abs(Decimal(str(amt))):.2f}" if amt is not None else None,
+        direction="credit" if ttype == "CREDIT" else "debit",
+        currency=txn.currency,
+        transaction_date=txn.transaction_date.isoformat() if txn.transaction_date else None,
+        card_last_4=txn.card_last_4,
+        operator=txn.operator_raw,
+        transaction_type=ttype or None,
+        balance_after=f"{abs(Decimal(str(bal))):.2f}" if bal is not None else None,
+        application=txn.application_mapped,
     )
 
 

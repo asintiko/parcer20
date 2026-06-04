@@ -35,4 +35,30 @@ class FingerprintCalculatorTest {
             BigDecimal("1"), LocalDateTime.of(2025, 1, 1, 0, 0), "479091**6905")
         assertEquals(sha256("1.00|2025-01-01 00:00|6905"), fp)
     }
+
+    @Test fun groupedAmountCanonicalisesToPlainTwoDecimals() {
+        // "1 234 567,89" parsed upstream into BigDecimal must canonicalise to "1234567.89"
+        // (no grouping separators, dot decimal) before hashing.
+        val amount = BigDecimal("1234567.89")
+        val fp = FingerprintCalculator.computeV1(
+            amount, LocalDateTime.of(2026, 5, 31, 10, 15), "0907")
+        assertEquals(sha256("1234567.89|2026-05-31 10:15|0907"), fp)
+    }
+
+    @Test fun nullDateBecomesEmptySegment() {
+        val fp = FingerprintCalculator.computeV1(BigDecimal("5000"), null, "0907")
+        assertEquals(sha256("5000.00||0907"), fp)
+    }
+
+    @Test fun halfUpRoundingOnThirdDecimal() {
+        // .xx5 rounds half-up to the next cent: 100.005 -> 100.01
+        val fp = FingerprintCalculator.computeV1(
+            BigDecimal("100.005"), LocalDateTime.of(2025, 1, 1, 0, 0), "0907")
+        assertEquals(sha256("100.01|2025-01-01 00:00|0907"), fp)
+    }
+
+    @Test fun nullAmountBecomesZero() {
+        val fp = FingerprintCalculator.computeV1(null, null, null)
+        assertEquals(sha256("0.00||0000"), fp)
+    }
 }

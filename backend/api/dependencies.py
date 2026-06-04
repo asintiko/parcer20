@@ -21,7 +21,7 @@ from services.access_control_service import (
 )
 from services.auth_bot_service import is_session_revoked, touch_active_session, verify_launch_session_token
 from services.auth_service import verify_jwt_token
-from services.internal_api_key_service import is_valid_internal_api_key
+from services.internal_api_key_service import is_internal_request
 from services.root_access_config_service import (
     get_config_scopes,
     system_access_enforced,
@@ -54,16 +54,19 @@ def _resolve_auth_required() -> bool:
     if requested:
         return True
 
+    # Only an explicit ALLOW_INSECURE_NO_AUTH unlocks unauthenticated mode, and
+    # never when the environment is declared production. DEBUG=true and a bare
+    # dev/test env name used to be sufficient on their own — that let a stray
+    # prod .env flag silently disable auth, so both triggers were removed.
     allow_insecure = _env_flag("ALLOW_INSECURE_NO_AUTH", False)
     env_name = _runtime_env_name()
-    debug_mode = _env_flag("DEBUG", False)
-    safe_insecure_envs = {"dev", "development", "local", "test", "testing"}
-    if allow_insecure or env_name in safe_insecure_envs or debug_mode:
+    prod_envs = {"prod", "production", "live"}
+    if allow_insecure and env_name not in prod_envs:
         return False
 
     logger.warning(
-        "AUTH_REQUIRED=false ignored outside dev/test. "
-        "Set ALLOW_INSECURE_NO_AUTH=true only for isolated local debugging."
+        "AUTH_REQUIRED=false ignored. Set ALLOW_INSECURE_NO_AUTH=true in a "
+        "non-production environment to allow unauthenticated local access."
     )
     return True
 
@@ -311,6 +314,17 @@ async def get_current_app_user(
 ) -> dict:
     if current_user.get("role"):
         return current_user
+    # Compatibility shim for the QR/legacy login path, which returns a roleless
+    # payload. Gate it to those token kinds only: without this check, ANY
+    # signature-valid JWT that lacks a role (e.g. a refresh_token presented as a
+    # bearer) was silently escalated to operator/dashboard access.
+    kind = str(current_user.get("token_kind") or current_user.get("kind") or "").lower()
+    if kind not in {"qr_user", "qr_legacy", "legacy"}:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid or expired token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
     return {
         "id": _to_int(current_user.get("user_id")) or 0,
         "user_id": _to_int(current_user.get("user_id")) or 0,
@@ -514,8 +528,25 @@ def _extract_client_ip(conn: HTTPConnection) -> str:
     return "unknown"
 
 
-def _mobile_ingest_key() -> str:
-    return os.getenv("MOBILE_SMS_INGEST_KEY", "").strip()
+def configured_mobile_ingest_keys() -> List[str]:
+    """
+    Active mobile ingest keys in priority order.
+
+    Rotation mirrors the internal API key service:
+    - MOBILE_SMS_INGEST_KEY: current primary key.
+    - MOBILE_SMS_INGEST_KEY_PREVIOUS: prior key still accepted during rollout,
+      so phones on the old APK keep ingesting until the new build is shipped.
+      Drop PREVIOUS once every device has updated.
+    """
+    keys: List[str] = []
+    for value in (
+        os.getenv("MOBILE_SMS_INGEST_KEY", ""),
+        os.getenv("MOBILE_SMS_INGEST_KEY_PREVIOUS", ""),
+    ):
+        normalized = str(value or "").strip()
+        if normalized and normalized not in keys:
+            keys.append(normalized)
+    return keys
 
 
 async def get_scope_context_optional(
@@ -532,8 +563,7 @@ async def get_scope_context_optional(
     """
     otp_enabled = is_otp_enabled(db)
     scopes_enabled = has_active_scopes(db) and otp_enabled
-    internal_header = conn.headers.get("x-internal-api-key")
-    if is_valid_internal_api_key(internal_header):
+    if is_internal_request(conn):
         return {
             "scope_id": 0,
             "scope_name": "internal-service",
@@ -704,8 +734,8 @@ async def require_mobile_ingest_key(
     """
     ip = _extract_client_ip(conn)
     path = str(conn.url.path)
-    configured_key = _mobile_ingest_key()
-    if not configured_key:
+    configured_keys = configured_mobile_ingest_keys()
+    if not configured_keys:
         try:
             write_audit_log(
                 db,
@@ -719,7 +749,9 @@ async def require_mobile_ingest_key(
         raise HTTPException(status_code=503, detail="Mobile SMS ingest key is not configured")
 
     provided_key = (x_mobile_ingest_key or "").strip()
-    if not provided_key or not secrets.compare_digest(provided_key, configured_key):
+    if not provided_key or not any(
+        secrets.compare_digest(provided_key, key) for key in configured_keys
+    ):
         try:
             write_audit_log(
                 db,

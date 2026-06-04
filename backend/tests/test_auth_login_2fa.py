@@ -12,6 +12,7 @@ from database.connection import get_db_session
 from database.models import User
 from services.access_control_service import hash_password
 from services.root_access_config_service import hash_password_pbkdf2, reset_root_access_cache
+from fake_auth_redis import install_fake_auth_redis
 
 
 def _seed_2fa_user(db_session, username: str = "boss") -> User:
@@ -73,6 +74,8 @@ def client(db_session, monkeypatch, tmp_path):
     monkeypatch.setenv("SYSTEM_ACCESS_ENFORCED", "true")
     monkeypatch.setenv("SCOPES_MANAGED_BY_CONFIG", "false")
     monkeypatch.setenv("ROOT_ACCESS_SERVER_CONFIG_PATH", str(config_path))
+    monkeypatch.setenv("LAUNCH_GATE_ENABLED", "false")
+    install_fake_auth_redis(monkeypatch)
     reset_root_access_cache()
 
     original_lifespan = app.router.lifespan_context

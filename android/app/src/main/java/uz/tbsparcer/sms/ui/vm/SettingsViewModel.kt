@@ -23,5 +23,6 @@ class SettingsViewModel @Inject constructor(
     }
     fun setBackfillDate(millis: Long) { settings.backfillSinceMillis = millis }
     fun runBackfill() = WorkScheduler.runBackfill(getApplication())
+    fun runReconcile(from: Long, to: Long) = WorkScheduler.runReconcile(getApplication(), from, to)
     fun clearLocal() = viewModelScope.launch { repo.clear() }
 }
