@@ -34,7 +34,7 @@ const StyledAutocomplete = styled(Autocomplete)(() => ({
     },
     '& .MuiInputBase-input': {
         color: 'var(--color-foreground)',
-        padding: '8px 12px !important',
+        padding: '8px 12px',
     },
     '& .MuiInputLabel-root': {
         color: 'var(--color-foreground-secondary)',

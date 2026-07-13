@@ -4,14 +4,18 @@ Handles user messages and forwards them to Celery for processing
 """
 import os
 import asyncio
+import logging
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.fsm.storage.memory import MemoryStorage
 from dotenv import load_dotenv
 import json
 from workers.celery_worker import queue_receipt_task
+from core.logging_config import setup_logging
 
 load_dotenv()
+setup_logging()
+logger = logging.getLogger(__name__)
 
 # Configuration
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -131,10 +135,10 @@ async def handle_media(message: types.Message):
 
 async def main():
     """Main bot startup"""
-    print("🤖 Starting Telegram Bot...")
+    logger.info("Starting Telegram Bot")
     
     # Start polling
-    print("✅ Bot is running! Press Ctrl+C to stop.")
+    logger.info("Bot is running")
     await dp.start_polling(bot)
 
 
@@ -142,4 +146,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\n👋 Bot stopped")
+        logger.info("Bot stopped")

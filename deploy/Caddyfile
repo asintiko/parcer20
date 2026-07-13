@@ -1,0 +1,19 @@
+64.188.106.221.nip.io {
+    encode zstd gzip
+
+    # Web mini-app + API traffic
+    @mini path /mini-app*
+    reverse_proxy @mini backend:8000 {
+        header_up X-System-Access {$SYSTEM_ACCESS_TOKEN}
+    }
+
+    @api path /api/*
+    reverse_proxy @api backend:8000 {
+        header_up X-System-Access {$SYSTEM_ACCESS_TOKEN}
+    }
+
+    reverse_proxy /health backend:8000
+
+    # Frontend SPA shell
+    reverse_proxy frontend:80
+}

@@ -1,5 +1,6 @@
 import React, { useEffect, useRef } from 'react';
 import { AlignLeft, AlignCenter, AlignRight } from 'lucide-react';
+import { useRegisterOverlay } from '../utils/overlayStore';
 
 interface ContextMenuProps {
     x: number;
@@ -25,6 +26,8 @@ const COLORS = [
 
 export const ContextMenu: React.FC<ContextMenuProps> = ({ x, y, onClose, onAlign, onColor, onHideColumn, onDelete }) => {
     const menuRef = useRef<HTMLDivElement>(null);
+
+    useRegisterOverlay(true);
 
     useEffect(() => {
         const handleClickOutside = (event: MouseEvent) => {

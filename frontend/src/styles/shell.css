@@ -1,0 +1,688 @@
+/* =================================================================
+   App shell — permanent left rail + minimal topbar.
+   Editorial DNA, scoped under .rl-*.
+   ================================================================= */
+
+:root {
+    --rail-w-expanded: 240px;
+    --rail-w-collapsed: 64px;
+    --topbar-h: 56px;
+}
+
+/* ---------- Shell layout ---------- */
+.rl-shell {
+    display: grid;
+    grid-template-columns: var(--rail-w, var(--rail-w-expanded)) 1fr;
+    height: 100vh;
+    width: 100%;
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--font-sans, 'Space Grotesk', system-ui, sans-serif);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    transition: grid-template-columns 280ms cubic-bezier(0.32, 0.72, 0, 1);
+    contain: layout style;
+}
+
+.rl-shell.is-collapsed {
+    --rail-w: var(--rail-w-collapsed);
+}
+
+@media (max-width: 1023px) {
+    .rl-shell {
+        grid-template-columns: 1fr;
+        transition: none;
+    }
+}
+
+/* ---------- Rail ---------- */
+.rl-rail {
+    grid-column: 1;
+    display: flex;
+    flex-direction: column;
+    background: var(--surface);
+    border-right: 1px solid var(--border);
+    overflow: hidden;
+    min-width: 0;
+    width: 100%;
+}
+
+@media (max-width: 1023px) {
+    .rl-rail {
+        display: none;
+    }
+}
+
+/* Inner content always renders at expanded width — rail clips overflow.
+   This keeps text from reflowing during collapse animation. */
+.rl-rail-inner {
+    width: var(--rail-w-expanded);
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    transition: width 280ms cubic-bezier(0.32, 0.72, 0, 1);
+}
+
+.is-collapsed .rl-rail-inner {
+    width: var(--rail-w-collapsed);
+}
+
+/* Rail header — logo + collapse */
+.rl-rail-head {
+    display: flex;
+    align-items: center;
+    height: var(--topbar-h);
+    padding: 0 12px;
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+    gap: 10px;
+}
+
+.rl-logo {
+    display: inline-flex;
+    align-items: center;
+    gap: 10px;
+    font-family: var(--font-display, 'Instrument Serif', serif);
+    font-size: 20px;
+    color: var(--text);
+    text-decoration: none;
+    overflow: hidden;
+    white-space: nowrap;
+    flex: 1;
+    min-width: 0;
+}
+
+.rl-logo-mark {
+    width: 32px;
+    height: 32px;
+    border-radius: 6px;
+    background: var(--text);
+    color: var(--text-inverse, #fff);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    font-family: var(--font-mono, 'JetBrains Mono', monospace);
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+}
+
+.rl-logo-mark-btn {
+    border: 0;
+    cursor: pointer;
+    transition: transform 160ms ease, opacity 160ms ease;
+}
+
+.rl-logo-mark-btn:hover {
+    transform: scale(1.05);
+    opacity: 0.9;
+}
+
+.rl-logo-mark-btn:focus-visible {
+    outline: 2px solid var(--text);
+    outline-offset: 2px;
+}
+
+.rl-logo-text {
+    font-size: 14px;
+    font-weight: 500;
+    letter-spacing: 0.01em;
+    font-family: var(--font-sans);
+    color: var(--text);
+}
+
+.is-collapsed .rl-logo-text {
+    opacity: 0;
+    transition: opacity 120ms ease 0ms;
+}
+
+.rl-logo-text {
+    transition: opacity 200ms ease 80ms;
+}
+
+.rl-collapse-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 28px;
+    height: 28px;
+    border-radius: 4px;
+    border: 0;
+    background: transparent;
+    color: var(--text-muted);
+    cursor: pointer;
+    flex-shrink: 0;
+    transition: background 160ms ease, color 160ms ease;
+}
+
+.rl-collapse-btn:hover {
+    background: var(--surface-2);
+    color: var(--text);
+}
+
+/* Rail nav */
+.rl-nav {
+    flex: 1;
+    overflow-y: auto;
+    overflow-x: hidden;
+    padding: 12px 8px;
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+}
+
+.rl-nav-section-label {
+    padding: 12px 12px 4px;
+    font-family: var(--font-mono, 'JetBrains Mono', monospace);
+    font-size: 10px;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.12em;
+    font-weight: 600;
+}
+
+.is-collapsed .rl-nav-section-label {
+    /* Replace text label with a hairline separator above the next item */
+    opacity: 0;
+    height: 1px;
+    padding: 0;
+    margin: 8px auto;
+    width: 24px;
+    background: var(--border);
+    pointer-events: none;
+    transition: opacity 120ms ease 0ms, height 200ms ease, margin 200ms ease;
+}
+
+/* First section label has no separator (top of nav) */
+.is-collapsed .rl-nav > .rl-nav-section-label:first-child {
+    height: 0;
+    margin: 0;
+}
+
+.rl-nav-section-label {
+    transition: opacity 200ms ease 80ms, height 200ms ease, padding 200ms ease;
+}
+
+.rl-nav-item {
+    position: relative;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 8px 12px;
+    border-radius: 4px;
+    border: 0;
+    background: transparent;
+    color: var(--text-secondary);
+    font-size: 13.5px;
+    font-weight: 500;
+    cursor: pointer;
+    text-align: left;
+    width: 100%;
+    transition: background 140ms ease, color 140ms ease;
+    font-family: inherit;
+    text-decoration: none;
+    overflow: hidden;
+    white-space: nowrap;
+}
+
+.rl-nav-item:hover {
+    background: var(--surface-2);
+    color: var(--text);
+}
+
+.rl-nav-item:focus-visible {
+    outline: 2px solid var(--text);
+    outline-offset: -2px;
+}
+
+.rl-nav-item.is-active {
+    background: var(--surface-2);
+    color: var(--text);
+    font-weight: 600;
+}
+
+.rl-nav-item.is-active::before {
+    content: '';
+    position: absolute;
+    left: 0;
+    top: 8px;
+    bottom: 8px;
+    width: 2px;
+    border-radius: 2px;
+    background: var(--text);
+    animation: rl-bar-in 240ms cubic-bezier(0.32, 0.72, 0, 1);
+}
+
+@keyframes rl-bar-in {
+    0% { transform: scaleY(0); opacity: 0; }
+    100% { transform: scaleY(1); opacity: 1; }
+}
+
+/* Collapsed state — items become 40x40 squares centered in rail.
+   Icon stays at x=32 (center of 64px rail). */
+.is-collapsed .rl-nav {
+    align-items: center;
+    padding: 14px 0;
+    gap: 6px;
+}
+
+.is-collapsed .rl-nav-item {
+    width: 40px;
+    padding: 0;
+    height: 40px;
+    justify-content: center;
+    gap: 0;
+    margin: 0 auto;
+    border-radius: 8px;
+}
+
+.is-collapsed .rl-nav-item.is-active::before {
+    left: -12px;
+    top: 8px;
+    bottom: 8px;
+}
+
+.is-collapsed .rl-nav-icon {
+    margin: 0;
+}
+
+.is-collapsed .rl-nav-label,
+.is-collapsed .rl-nav-badge {
+    display: none;
+}
+
+.is-collapsed .rl-rail-head {
+    justify-content: center;
+    padding: 0;
+}
+
+.is-collapsed .rl-rail-foot {
+    align-items: center;
+    padding: 8px 0;
+}
+
+.is-collapsed .rl-user-trigger {
+    width: 40px;
+    padding: 0;
+    height: 36px;
+    justify-content: center;
+    gap: 0;
+}
+
+.is-collapsed .rl-user-meta,
+.is-collapsed .rl-user-chevron {
+    display: none;
+}
+
+.rl-nav-icon {
+    width: 18px;
+    height: 18px;
+    flex-shrink: 0;
+}
+
+.rl-nav-label {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.is-collapsed .rl-nav-label {
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 120ms ease 0ms;
+}
+
+.rl-nav-label {
+    transition: opacity 200ms ease 80ms;
+}
+
+.is-collapsed .rl-nav-badge {
+    opacity: 0;
+}
+
+.rl-nav-badge {
+    transition: opacity 200ms ease 80ms;
+}
+
+.rl-nav-badge {
+    margin-left: auto;
+    padding: 1px 6px;
+    border-radius: 999px;
+    background: var(--surface-3);
+    color: var(--text-muted);
+    font-size: 10.5px;
+    font-weight: 600;
+    font-family: var(--font-mono, 'JetBrains Mono', monospace);
+}
+
+.is-collapsed .rl-nav-badge {
+    opacity: 0;
+}
+
+/* Rail footer (theme + user) */
+.rl-rail-foot {
+    border-top: 1px solid var(--border);
+    flex-shrink: 0;
+    padding: 8px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.rl-theme-row {
+    display: flex;
+    gap: 4px;
+    padding: 4px;
+    background: var(--surface-2);
+    border-radius: 6px;
+    overflow: hidden;
+}
+
+/* Hide theme switcher in collapsed mode entirely */
+.is-collapsed .rl-theme-row {
+    display: none;
+}
+
+.rl-theme-btn {
+    flex: 1;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    height: 28px;
+    padding: 0 6px;
+    border: 0;
+    border-radius: 4px;
+    background: transparent;
+    color: var(--text-muted);
+    cursor: pointer;
+    font-size: 11px;
+    font-weight: 500;
+    font-family: inherit;
+    transition: all 140ms ease;
+}
+
+.rl-theme-btn:hover {
+    background: var(--surface-3);
+    color: var(--text);
+}
+
+.rl-theme-btn.is-active {
+    background: var(--surface);
+    color: var(--text);
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.06);
+}
+
+.rl-theme-btn-label {
+    transition: opacity 160ms ease;
+}
+
+.is-collapsed .rl-theme-btn-label {
+    display: none;
+}
+
+.rl-user-trigger {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    width: 100%;
+    padding: 6px 8px;
+    border: 0;
+    border-radius: 6px;
+    background: transparent;
+    color: var(--text);
+    cursor: pointer;
+    font-family: inherit;
+    transition: background 140ms ease;
+    text-align: left;
+}
+
+.rl-user-trigger:hover {
+    background: var(--surface-2);
+}
+
+.rl-user-trigger:focus-visible {
+    outline: 2px solid var(--text);
+    outline-offset: -2px;
+}
+
+.rl-user-avatar {
+    width: 28px;
+    height: 28px;
+    border-radius: 6px;
+    background: var(--text);
+    color: var(--text-inverse, #fff);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-family: var(--font-sans);
+    font-size: 11.5px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    flex-shrink: 0;
+}
+
+.rl-user-meta {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    overflow: hidden;
+}
+
+.is-collapsed .rl-user-meta,
+.is-collapsed .rl-user-chevron {
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 120ms ease 0ms;
+}
+
+.rl-user-meta,
+.rl-user-chevron {
+    transition: opacity 200ms ease 80ms;
+}
+
+.rl-user-name {
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--text);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.rl-user-role {
+    font-size: 10.5px;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    font-weight: 600;
+    font-family: var(--font-mono, 'JetBrains Mono', monospace);
+}
+
+.rl-user-chevron {
+    color: var(--text-muted);
+    flex-shrink: 0;
+}
+
+/* ---------- Topbar ---------- */
+.rl-main {
+    grid-column: 2;
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    overflow: hidden;
+}
+
+@media (max-width: 1023px) {
+    .rl-main {
+        grid-column: 1;
+    }
+}
+
+.rl-topbar {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    height: var(--topbar-h);
+    padding: 0 20px;
+    border-bottom: 1px solid var(--border);
+    background: var(--surface);
+    flex-shrink: 0;
+}
+
+.rl-burger {
+    display: none;
+    align-items: center;
+    justify-content: center;
+    width: 32px;
+    height: 32px;
+    border: 0;
+    border-radius: 4px;
+    background: transparent;
+    color: var(--text);
+    cursor: pointer;
+    transition: background 160ms ease;
+    margin-left: -6px;
+}
+
+.rl-burger:hover {
+    background: var(--surface-2);
+}
+
+@media (max-width: 1023px) {
+    .rl-burger {
+        display: inline-flex;
+    }
+}
+
+.rl-topbar-title {
+    font-size: 15px;
+    font-weight: 500;
+    color: var(--text);
+    letter-spacing: -0.005em;
+}
+
+.rl-topbar-spacer {
+    flex: 1;
+}
+
+.rl-topbar-actions {
+    display: inline-flex;
+    align-items: center;
+    gap: 12px;
+}
+
+.rl-status-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 10px;
+    border-radius: 999px;
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    font-size: 11.5px;
+    font-weight: 500;
+    color: var(--text-secondary);
+    font-family: var(--font-mono, 'JetBrains Mono', monospace);
+    letter-spacing: 0.02em;
+}
+
+.rl-status-pill.is-online {
+    color: var(--success);
+    border-color: color-mix(in srgb, var(--success) 30%, transparent);
+    background: color-mix(in srgb, var(--success) 10%, transparent);
+}
+
+.rl-status-pill.is-offline {
+    color: var(--danger);
+    border-color: color-mix(in srgb, var(--danger) 30%, transparent);
+    background: color-mix(in srgb, var(--danger) 10%, transparent);
+}
+
+.rl-status-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 999px;
+    background: currentColor;
+}
+
+.rl-content {
+    flex: 1;
+    min-height: 0;
+    overflow: hidden;
+}
+
+/* ---------- Mobile drawer ---------- */
+.rl-mobile-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(8, 10, 16, 0.5);
+    backdrop-filter: blur(2px);
+    -webkit-backdrop-filter: blur(2px);
+    z-index: 50;
+}
+
+.rl-mobile-drawer {
+    position: fixed;
+    top: 0;
+    left: 0;
+    bottom: 0;
+    width: 280px;
+    max-width: calc(100vw - 56px);
+    background: var(--surface);
+    border-right: 1px solid var(--border);
+    box-shadow: 24px 0 48px -24px rgba(0, 0, 0, 0.4);
+    z-index: 51;
+    display: flex;
+    flex-direction: column;
+}
+
+/* Use the same nav styles as rail in the drawer */
+.rl-mobile-drawer .rl-nav-label,
+.rl-mobile-drawer .rl-logo-text,
+.rl-mobile-drawer .rl-user-meta,
+.rl-mobile-drawer .rl-nav-section-label {
+    opacity: 1 !important;
+    pointer-events: auto !important;
+}
+
+/* ---------- User popover (rendered via Popover primitive) ---------- */
+.rl-user-popover {
+    min-width: 240px;
+    padding: 4px;
+}
+
+.rl-user-popover-head {
+    padding: 10px 10px 8px;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 4px;
+}
+
+.rl-user-popover-name {
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--text);
+}
+
+.rl-user-popover-meta {
+    margin-top: 2px;
+    font-size: 11px;
+    color: var(--text-muted);
+    font-family: var(--font-mono, 'JetBrains Mono', monospace);
+}
+
+/* ---------- Reduced motion ---------- */
+@media (prefers-reduced-motion: reduce) {
+    .rl-shell,
+    .rl-shell *,
+    .rl-shell *::before,
+    .rl-shell *::after {
+        animation-duration: 0ms !important;
+        transition-duration: 0ms !important;
+    }
+}

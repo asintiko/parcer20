@@ -1,16 +1,18 @@
-import { useMemo, useState, useEffect } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
     ColumnDef,
+    flexRender,
     getCoreRowModel,
     getSortedRowModel,
     SortingState,
     useReactTable,
-    flexRender,
 } from '@tanstack/react-table';
-import { Check, ChevronDown, ChevronUp, Loader2, Trash2 } from 'lucide-react';
-import { OperatorReference } from '../services/api';
+import { motion, AnimatePresence } from 'motion/react';
+import { ArrowUp, ArrowDown, ChevronsUpDown, Loader2, Trash2, Pencil, FileX } from 'lucide-react';
+import type { OperatorReference } from '../services/api';
 
 type EditableField = keyof Pick<OperatorReference, 'operator_name' | 'application_name' | 'is_p2p' | 'is_active'>;
+type Density = 'standard' | 'compact';
 
 interface ReferenceTableProps {
     data: OperatorReference[];
@@ -18,10 +20,15 @@ interface ReferenceTableProps {
     total: number;
     page: number;
     pageSize: number | 'all';
+    density?: Density;
+    selectedIds: Set<number>;
+    onToggleRow: (id: number) => void;
+    onToggleAll: (ids: number[], all: boolean) => void;
     onPageChange: (page: number) => void;
     onPageSizeChange: (size: number | 'all') => void;
     onUpdate: (id: number, field: EditableField, value: any) => void;
     onDelete: (id: number) => void;
+    onEditFull?: (item: OperatorReference) => void;
 }
 
 export function ReferenceTable({
@@ -30,10 +37,15 @@ export function ReferenceTable({
     total,
     page,
     pageSize,
+    density = 'standard',
+    selectedIds,
+    onToggleRow,
+    onToggleAll,
     onPageChange,
     onPageSizeChange,
     onUpdate,
     onDelete,
+    onEditFull,
 }: ReferenceTableProps) {
     const [sorting, setSorting] = useState<SortingState>([{ id: 'operator_name', desc: false }]);
     const isAll = pageSize === 'all';
@@ -44,14 +56,45 @@ export function ReferenceTable({
     const disablePaging = isAll || total <= resolvedPageSize;
     const displayPage = isAll ? 1 : Math.min(page, pageCount);
 
+    const visibleIds = useMemo(() => data.map((d) => d.id), [data]);
+    const allChecked = data.length > 0 && data.every((d) => selectedIds.has(d.id));
+    const someChecked = !allChecked && data.some((d) => selectedIds.has(d.id));
+
     const columns = useMemo<ColumnDef<OperatorReference>[]>(
         () => [
             {
+                id: 'select',
+                header: () => (
+                    <input
+                        type="checkbox"
+                        className="rf-toggle"
+                        aria-label="Выбрать все"
+                        checked={allChecked}
+                        ref={(el) => {
+                            if (el) el.indeterminate = someChecked;
+                        }}
+                        onChange={(e) => onToggleAll(visibleIds, e.target.checked)}
+                    />
+                ),
+                cell: ({ row }) => (
+                    <input
+                        type="checkbox"
+                        className="rf-toggle"
+                        aria-label={`Выбрать «${row.original.operator_name}»`}
+                        checked={selectedIds.has(row.original.id)}
+                        onChange={() => onToggleRow(row.original.id)}
+                    />
+                ),
+                enableSorting: false,
+                meta: { center: true, narrow: true } as any,
+            },
+            {
                 accessorKey: 'operator_name',
-                header: 'Operator / Продавец',
+                header: 'Оператор',
                 cell: ({ row, getValue }) => (
                     <EditableTextCell
                         value={getValue<string>() || ''}
+                        placeholder="—"
                         onCommit={(val) => onUpdate(row.original.id, 'operator_name', val)}
                     />
                 ),
@@ -62,6 +105,7 @@ export function ReferenceTable({
                 cell: ({ row, getValue }) => (
                     <EditableTextCell
                         value={getValue<string>() || ''}
+                        placeholder="—"
                         onCommit={(val) => onUpdate(row.original.id, 'application_name', val)}
                     />
                 ),
@@ -69,41 +113,69 @@ export function ReferenceTable({
             {
                 accessorKey: 'is_p2p',
                 header: 'P2P',
-                cell: ({ row, getValue }) => (
-                    <ToggleCell
-                        checked={!!getValue<boolean>()}
-                        onChange={(val) => onUpdate(row.original.id, 'is_p2p', val)}
-                    />
-                ),
-                meta: { align: 'center' } as any,
+                cell: ({ row, getValue }) => {
+                    const on = !!getValue<boolean>();
+                    return (
+                        <button
+                            type="button"
+                            aria-pressed={on}
+                            aria-label={on ? 'P2P включён' : 'P2P выключен'}
+                            onClick={() => onUpdate(row.original.id, 'is_p2p', !on)}
+                            className="rf-row-action"
+                            title={on ? 'P2P · нажмите чтобы выключить' : 'не P2P · нажмите чтобы включить'}
+                        >
+                            <span className={`rf-toggle-dot${on ? ' is-on' : ''}`} />
+                        </button>
+                    );
+                },
+                meta: { center: true, narrow: true } as any,
             },
             {
                 accessorKey: 'is_active',
                 header: 'Активен',
                 cell: ({ row, getValue }) => (
-                    <ToggleCell
+                    <input
+                        type="checkbox"
+                        className="rf-toggle"
+                        aria-label={`Активен: ${row.original.operator_name}`}
                         checked={!!getValue<boolean>()}
-                        onChange={(val) => onUpdate(row.original.id, 'is_active', val)}
+                        onChange={(e) => onUpdate(row.original.id, 'is_active', e.target.checked)}
                     />
                 ),
-                meta: { align: 'center' } as any,
+                meta: { center: true, narrow: true } as any,
             },
             {
                 id: 'actions',
                 header: '',
                 cell: ({ row }) => (
-                    <button
-                        onClick={() => onDelete(row.original.id)}
-                        className="text-danger hover:text-danger-hover p-2 rounded-md hover:bg-danger/10 transition-colors"
-                        title="Удалить"
-                    >
-                        <Trash2 className="w-4 h-4" />
-                    </button>
+                    <div className="rf-row-actions">
+                        {onEditFull ? (
+                            <button
+                                type="button"
+                                onClick={() => onEditFull(row.original)}
+                                className="rf-row-action"
+                                title="Редактировать"
+                                aria-label={`Редактировать ${row.original.operator_name}`}
+                            >
+                                <Pencil size={14} />
+                            </button>
+                        ) : null}
+                        <button
+                            type="button"
+                            onClick={() => onDelete(row.original.id)}
+                            className="rf-row-action is-danger"
+                            title="Удалить"
+                            aria-label={`Удалить ${row.original.operator_name}`}
+                        >
+                            <Trash2 size={14} />
+                        </button>
+                    </div>
                 ),
-                size: 60,
+                enableSorting: false,
+                meta: { center: true, narrow: true } as any,
             },
         ],
-        [onUpdate, onDelete]
+        [allChecked, someChecked, visibleIds, selectedIds, onToggleAll, onToggleRow, onUpdate, onDelete, onEditFull]
     );
 
     const table = useReactTable({
@@ -118,35 +190,40 @@ export function ReferenceTable({
     });
 
     return (
-        <div className="border border-border rounded-lg overflow-hidden bg-surface shadow-sm h-full flex flex-col">
-            <div className="overflow-auto flex-1">
-                <table className="w-full min-w-[720px]">
-                    <thead className="bg-table-header border-b border-table-border">
+        <div className="rf-table-wrap">
+            <div className="rf-table-scroll">
+                <table className={`rf-table density-${density}`}>
+                    <thead>
                         {table.getHeaderGroups().map((hg) => (
                             <tr key={hg.id}>
                                 {hg.headers.map((header) => {
+                                    const meta = (header.column.columnDef.meta as any) || {};
                                     const canSort = header.column.getCanSort();
-                                    const sorted = header.column.getIsSorted();
+                                    const sortDir = header.column.getIsSorted();
+                                    const cls = ['', meta.center ? 'is-center' : '', meta.narrow ? 'is-narrow' : '']
+                                        .filter(Boolean)
+                                        .join(' ');
                                     return (
-                                        <th
-                                            key={header.id}
-                                            className={`px-4 py-3 text-left text-xs font-semibold text-foreground-secondary uppercase tracking-wide ${(header.column.columnDef.meta as any)?.align === 'center' ? 'text-center' : ''}`}
-                                        >
-                                            {canSort ? (
+                                        <th key={header.id} className={cls}>
+                                            {header.isPlaceholder ? null : canSort ? (
                                                 <button
-                                                    className="inline-flex items-center gap-1 hover:text-foreground"
+                                                    type="button"
+                                                    className={`rf-th-sort${sortDir ? ' is-sorted' : ''}`}
                                                     onClick={header.column.getToggleSortingHandler()}
                                                 >
-                                                    {header.isPlaceholder
-                                                        ? null
-                                                        : header.column.columnDef.header?.toString() || ''}
-                                                    {sorted === 'asc' && <ChevronUp className="w-4 h-4" />}
-                                                    {sorted === 'desc' && <ChevronDown className="w-4 h-4" />}
+                                                    {flexRender(header.column.columnDef.header, header.getContext())}
+                                                    <span className="rf-th-sort-icon">
+                                                        {sortDir === 'asc' ? (
+                                                            <ArrowUp size={11} />
+                                                        ) : sortDir === 'desc' ? (
+                                                            <ArrowDown size={11} />
+                                                        ) : (
+                                                            <ChevronsUpDown size={11} />
+                                                        )}
+                                                    </span>
                                                 </button>
                                             ) : (
-                                                header.isPlaceholder
-                                                    ? null
-                                                    : header.column.columnDef.header?.toString() || ''
+                                                flexRender(header.column.columnDef.header, header.getContext())
                                             )}
                                         </th>
                                     );
@@ -154,94 +231,138 @@ export function ReferenceTable({
                             </tr>
                         ))}
                     </thead>
-                    <tbody className="divide-y divide-border">
+                    <tbody>
                         {isLoading ? (
                             <tr>
-                                <td colSpan={columns.length} className="py-10 text-center text-foreground-secondary">
-                                    <div className="flex items-center justify-center gap-2">
-                                        <Loader2 className="w-4 h-4 animate-spin" /> Загрузка...
+                                <td colSpan={columns.length}>
+                                    <div className="rf-empty">
+                                        <Loader2 size={20} className="tg-msg-process-spin" />
+                                        <div>Загружаем справочник…</div>
                                     </div>
                                 </td>
                             </tr>
                         ) : data.length === 0 ? (
                             <tr>
-                                <td colSpan={columns.length} className="py-10 text-center text-foreground-secondary">
-                                    Нет данных
+                                <td colSpan={columns.length}>
+                                    <div className="rf-empty">
+                                        <div className="rf-empty-icon">
+                                            <FileX size={22} />
+                                        </div>
+                                        <div className="rf-empty-title">Записей нет</div>
+                                        <div className="rf-empty-sub">
+                                            Очистите фильтры или добавьте первую запись через кнопку «+ Добавить».
+                                        </div>
+                                    </div>
                                 </td>
                             </tr>
                         ) : (
-                            table.getRowModel().rows.map((row) => (
-                                <tr key={row.id} className="hover:bg-table-row-hover">
-                                    {row.getVisibleCells().map((cell) => {
-                                        const centerCols = ['is_p2p', 'is_active', 'actions'];
-                                        const isCenter = centerCols.includes(cell.column.id as string);
-                                        return (
-                                            <td
-                                                key={cell.id}
-                                                className={`px-4 py-3 text-sm text-foreground ${isCenter ? 'text-center' : ''}`}
-                                            >
-                                                {flexRender(cell.column.columnDef.cell, cell.getContext())}
-                                            </td>
-                                        );
-                                    })}
-                                </tr>
-                            ))
+                            <AnimatePresence initial={false}>
+                                {table.getRowModel().rows.map((row, idx) => {
+                                    const rowSelected = selectedIds.has(row.original.id);
+                                    const inactive = !row.original.is_active;
+                                    return (
+                                        <motion.tr
+                                            key={row.original.id}
+                                            layout="position"
+                                            initial={{ opacity: 0, y: 4 }}
+                                            animate={{
+                                                opacity: 1,
+                                                y: 0,
+                                                transition: {
+                                                    duration: 0.18,
+                                                    ease: [0.16, 1, 0.3, 1],
+                                                    delay: idx < 12 ? idx * 0.012 : 0,
+                                                },
+                                            }}
+                                            exit={{ opacity: 0, transition: { duration: 0.12 } }}
+                                            className={[
+                                                rowSelected ? 'is-selected' : '',
+                                                inactive ? 'is-inactive' : '',
+                                            ]
+                                                .filter(Boolean)
+                                                .join(' ')}
+                                        >
+                                            {row.getVisibleCells().map((cell) => {
+                                                const meta = (cell.column.columnDef.meta as any) || {};
+                                                const cls = [meta.center ? 'is-center' : '', meta.narrow ? 'is-narrow' : '']
+                                                    .filter(Boolean)
+                                                    .join(' ');
+                                                return (
+                                                    <td key={cell.id} className={cls}>
+                                                        {flexRender(cell.column.columnDef.cell, cell.getContext())}
+                                                    </td>
+                                                );
+                                            })}
+                                        </motion.tr>
+                                    );
+                                })}
+                            </AnimatePresence>
                         )}
                     </tbody>
                 </table>
             </div>
 
-            <div className="flex items-center justify-between px-4 py-3 border-t border-border bg-surface-2 text-sm">
-                <div className="text-foreground-secondary">
-                    Показано {total === 0 ? 0 : pageStart}-{pageEnd} из {total}
+            <div className="rf-footer">
+                <div className="rf-footer-meta">
+                    <strong>{total === 0 ? 0 : pageStart}</strong>–<strong>{pageEnd}</strong> из{' '}
+                    <strong>{total}</strong>
                 </div>
-                <div className="flex items-center gap-3">
+                <div className="rf-pagination">
                     <select
                         value={isAll ? 'all' : String(pageSize)}
                         onChange={(e) => {
                             const val = e.target.value;
-                            if (val === 'all') {
-                                onPageSizeChange('all');
-                            } else {
-                                onPageSizeChange(Number(val));
-                            }
+                            if (val === 'all') onPageSizeChange('all');
+                            else onPageSizeChange(Number(val));
                         }}
-                        className="px-3 py-2 border border-border rounded-md bg-surface text-foreground text-sm"
+                        className="rf-app-select"
+                        aria-label="Размер страницы"
                     >
                         <option value="all">Все</option>
-                        {[20, 50, 100, 200, 500, 1000].map((size) => (
-                            <option key={size} value={size.toString()}>
-                                {`${size} / стр`}
+                        {[20, 50, 100, 200, 500, 1000].map((s) => (
+                            <option key={s} value={String(s)}>
+                                {`${s} / стр`}
                             </option>
                         ))}
                     </select>
-                    <div className="flex items-center gap-2">
-                        <button
-                            onClick={() => onPageChange(Math.max(1, page - 1))}
-                            disabled={disablePaging || displayPage === 1}
-                            className="px-3 py-2 border border-border rounded-md disabled:opacity-50 hover:bg-surface-2"
-                        >
-                            Назад
-                        </button>
-                        <div className="px-2">
-                            {displayPage} / {pageCount}
-                        </div>
-                        <button
-                            onClick={() => onPageChange(page + 1)}
-                            disabled={disablePaging || page * resolvedPageSize >= total}
-                            className="px-3 py-2 border border-border rounded-md disabled:opacity-50 hover:bg-surface-2"
-                        >
-                            Вперёд
-                        </button>
-                    </div>
+                    <button
+                        type="button"
+                        className="rf-page-btn"
+                        onClick={() => onPageChange(Math.max(1, page - 1))}
+                        disabled={disablePaging || displayPage === 1}
+                        aria-label="Предыдущая страница"
+                    >
+                        ‹
+                    </button>
+                    <span className="rf-pagination-page">
+                        {displayPage} / {pageCount}
+                    </span>
+                    <button
+                        type="button"
+                        className="rf-page-btn"
+                        onClick={() => onPageChange(page + 1)}
+                        disabled={disablePaging || page * resolvedPageSize >= total}
+                        aria-label="Следующая страница"
+                    >
+                        ›
+                    </button>
                 </div>
             </div>
         </div>
     );
 }
 
-function EditableTextCell({ value, onCommit }: { value: string; onCommit: (v: string) => void }) {
+function EditableTextCell({
+    value,
+    placeholder,
+    onCommit,
+}: {
+    value: string;
+    placeholder?: string;
+    onCommit: (v: string) => void;
+}) {
     const [draft, setDraft] = useState(value);
+    const ref = useRef<HTMLInputElement | null>(null);
 
     useEffect(() => {
         setDraft(value);
@@ -254,39 +375,22 @@ function EditableTextCell({ value, onCommit }: { value: string; onCommit: (v: st
 
     return (
         <input
-            className="w-full bg-transparent border border-border/60 rounded-md px-2 py-1 text-sm focus:outline-none focus:ring-2 focus:ring-primary"
+            ref={ref}
+            className="rf-cell-input"
             value={draft}
+            placeholder={placeholder}
             onChange={(e) => setDraft(e.target.value)}
             onBlur={commit}
             onKeyDown={(e) => {
                 if (e.key === 'Enter') {
-                    (e.target as HTMLInputElement).blur();
+                    e.preventDefault();
+                    (e.currentTarget as HTMLInputElement).blur();
                 }
                 if (e.key === 'Escape') {
                     setDraft(value);
-                    (e.target as HTMLInputElement).blur();
+                    (e.currentTarget as HTMLInputElement).blur();
                 }
             }}
         />
-    );
-}
-
-function ToggleCell({ checked, onChange }: { checked: boolean; onChange: (v: boolean) => void }) {
-    return (
-        <label className="inline-flex items-center cursor-pointer select-none">
-            <input
-                type="checkbox"
-                className="sr-only peer"
-                checked={checked}
-                onChange={(e) => onChange(e.target.checked)}
-            />
-            <div className="w-9 h-5 bg-border peer-checked:bg-primary rounded-full relative transition-colors">
-                <span
-                    className={`absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-surface shadow-sm transition-all ${checked ? 'translate-x-4' : ''
-                        }`}
-                />
-            </div>
-            {checked && <Check className="w-4 h-4 text-primary ml-2" />}
-        </label>
     );
 }

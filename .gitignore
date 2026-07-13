@@ -6,6 +6,7 @@ __pycache__/
 .Python
 env/
 venv/
+.venv/
 ENV/
 build/
 develop-eggs/
@@ -54,6 +55,7 @@ yarn-error.log*
 frontend/dist/
 frontend/build/
 frontend/release/
+/deploy/excel-feed/*.xlsx
 
 # Database
 *.db
@@ -76,3 +78,40 @@ htmlcov/
 
 # Alembic
 backend/alembic/versions/*.pyc
+
+# Vendored Telegram Web (tweb) static bundle
+**/public/tweb/
+
+# MCP / tooling artifacts
+.playwright-mcp/
+.serena/
+.codex_artifacts/
+
+# Local desktop bootstrap credentials (never commit or serve publicly)
+/frontend/client-access.json
+/frontend/public/client-access.json
+
+# Backups
+*.bak
+
+# Media
+*.mp4
+*.mov
+
+# Root debug screenshots
+/*.png
+
+# Real access credentials (keep only .example templates)
+security/*.json
+!security/*.example.json
+
+# Junk / agent scratch
+/,
+agentcontinue.md
+
+# Build artifacts / installers (too large for git)
+*.exe
+*.msi
+*.dmg
+*.p12
+*.pfx

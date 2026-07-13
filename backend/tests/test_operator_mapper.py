@@ -8,6 +8,7 @@ def seed_mappings(session):
         OperatorReference(operator_name="OQ P2P", application_name="OQ P2P", is_p2p=True, is_active=True),
         OperatorReference(operator_name="PAYNET", application_name="Paynet", is_p2p=False, is_active=True),
         OperatorReference(operator_name="PAY", application_name="CatchAll Pay", is_p2p=False, is_active=True),
+        OperatorReference(operator_name="КОРЗИНКА", application_name="Korzinka", is_p2p=False, is_active=True),
         OperatorReference(operator_name="REGEX ONLY", application_name="RegexOnly", is_p2p=False, is_active=False),
     ]
     session.add_all(mappings)
@@ -46,3 +47,19 @@ def test_operator_mapper_returns_none_for_inactive_or_no_match(db_session):
 
     result_unknown = mapper.map_operator_details("UNKNOWN OPERATOR")
     assert result_unknown is None
+
+
+def test_operator_mapper_preserves_unicode_letters(db_session):
+    seed_mappings(db_session)
+    mapper = OperatorMapper(db_session)
+
+    result = mapper.map_operator_details("Оплата — Корзинка, Ташкент")
+    assert result is not None
+    assert result["application_name"] == "Korzinka"
+
+
+def test_operator_mapper_does_not_match_inside_token(db_session):
+    seed_mappings(db_session)
+    mapper = OperatorMapper(db_session)
+
+    assert mapper.map_operator_details("PAYMENT SERVICE") is None

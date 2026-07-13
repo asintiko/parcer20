@@ -4,14 +4,17 @@ Listens to specific chat IDs and forwards receipts to processing
 """
 import os
 import asyncio
+import logging
 from telethon import TelegramClient, events
 from telethon.errors import FloodWaitError, SessionPasswordNeededError
 from dotenv import load_dotenv
-import json
 from datetime import datetime
 from workers.celery_worker import queue_receipt_task
+from core.logging_config import setup_logging
 
 load_dotenv()
+setup_logging()
+logger = logging.getLogger(__name__)
 
 # Configuration
 API_ID = int(os.getenv("TELEGRAM_API_ID"))
@@ -28,21 +31,24 @@ async def resolve_peers(client: TelegramClient):
     Resolve peer entities for target chats
     This is critical for MTProto to cache access_hash
     """
-    print("🔍 Resolving target chat entities...")
+    logger.info("Resolving target chat entities")
     
     for chat_id in TARGET_CHATS:
         try:
             # Try to get entity (this caches the access_hash)
             entity = await client.get_entity(chat_id)
-            print(f"✅ Resolved chat ID {chat_id}: {getattr(entity, 'title', 'User')}")
+            logger.info("Resolved chat ID %s: %s", chat_id, getattr(entity, "title", "User"))
         except Exception as e:
-            print(f"⚠️  Could not resolve chat ID {chat_id}: {e}")
-            print(f"   Make sure you have interacted with this chat before or it's accessible to your account")
+            logger.warning(
+                "Could not resolve chat ID %s: %s. Ensure this chat is accessible for current account.",
+                chat_id,
+                e,
+            )
 
 
 async def start_userbot():
     """Start MTProto userbot and monitor target chats"""
-    print("🤖 Starting Telegram Userbot (MTProto)...")
+    logger.info("Starting Telegram Userbot (MTProto)")
     
     # Create Telethon client
     client = TelegramClient(SESSION_PATH, API_ID, API_HASH)
@@ -65,7 +71,7 @@ async def start_userbot():
         if not any(keyword in raw_text for keyword in keywords):
             return
         
-        print(f"📨 New receipt detected from chat {chat_id} (sender: {sender_id})")
+        logger.info("New receipt detected from chat %s (sender=%s)", chat_id, sender_id)
         
         # Add to processing queue
         try:
@@ -75,23 +81,27 @@ async def start_userbot():
                 'source_chat_id': chat_id,
                 'source_message_id': msg_id,
                 'sender_id': sender_id,
-                'timestamp': datetime.now().isoformat(),
+                'source_received_at': (
+                    event.message.date.isoformat()
+                    if event.message.date
+                    else datetime.now().isoformat()
+                ),
                 'added_via': 'userbot'
             }
             
             task_id = queue_receipt_task(task_data)
-            print(f"✅ Задача отправлена в Celery (task_id={task_id})")
+            logger.info("Task dispatched to Celery: task_id=%s", task_id)
             
         except Exception as e:
-            print(f"❌ Error dispatching receipt task: {e}")
+            logger.exception("Error dispatching receipt task: %s", e)
     
     # Start client
     await client.start(phone=PHONE)
-    print("✅ Userbot authenticated")
+    logger.info("Userbot authenticated")
     
     # Check authorization
     if not await client.is_user_authorized():
-        print("⚠️  User not authorized, requesting code...")
+        logger.warning("User is not authorized, requesting login code")
         await client.send_code_request(PHONE)
         code = input("Enter the code you received: ")
         try:
@@ -103,8 +113,8 @@ async def start_userbot():
     # Resolve target peers
     await resolve_peers(client)
     
-    print(f"✅ Monitoring {len(TARGET_CHATS)} chats: {TARGET_CHATS}")
-    print("✅ Userbot is running! Press Ctrl+C to stop.")
+    logger.info("Monitoring %s chats: %s", len(TARGET_CHATS), TARGET_CHATS)
+    logger.info("Userbot is running")
     
     # Keep alive
     await client.run_until_disconnected()
@@ -121,21 +131,26 @@ async def main():
             break
         except FloodWaitError as e:
             wait_time = e.seconds
-            print(f"⚠️  Flood wait error. Waiting {wait_time} seconds...")
+            logger.warning("Flood wait error. Waiting %s seconds...", wait_time)
             await asyncio.sleep(wait_time)
             retry_count += 1
         except KeyboardInterrupt:
-            print("\n👋 Userbot stopped by user")
+            logger.info("Userbot stopped by user")
             break
         except Exception as e:
-            print(f"❌ Unexpected error: {e}")
+            logger.exception("Unexpected userbot error: %s", e)
             retry_count += 1
             if retry_count < max_retries:
                 wait_time = min(2 ** retry_count, 60)  # Exponential backoff (max 60s)
-                print(f"🔄 Retrying in {wait_time} seconds... (attempt {retry_count}/{max_retries})")
+                logger.warning(
+                    "Retrying in %s seconds (attempt %s/%s)",
+                    wait_time,
+                    retry_count,
+                    max_retries,
+                )
                 await asyncio.sleep(wait_time)
             else:
-                print("❌ Max retries reached. Exiting.")
+                logger.error("Max retries reached. Exiting.")
                 break
 
 

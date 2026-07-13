@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef, KeyboardEvent, useMemo } from 'react';
 import { formatDate, formatTime, formatDateTime, EMPTY_VALUE } from '../utils/dateTimeFormatters';
 import { DatePicker, TimePicker, DateTimePicker } from './DateTimePicker';
+import { formatAmount } from '../utils/formatAmount';
 
 // Type mappings for different columns
 export type CellType = 'text' | 'number' | 'date' | 'time' | 'datetime' | 'select' | 'checkbox';
@@ -185,7 +186,7 @@ export const EditableCell: React.FC<EditableCellProps> = ({
         if (cellType === 'number') {
             const num = typeof val === 'number' ? val : parseFloat(String(val));
             if (!isNaN(num)) {
-                return Math.abs(num).toFixed(2).replace('.', ',');
+                return formatAmount(num);
             }
             return EMPTY_VALUE;
         }
@@ -201,7 +202,7 @@ export const EditableCell: React.FC<EditableCellProps> = ({
     };
 
     const renderInput = () => {
-        const baseClass = `w-full px-2 py-1 border-2 rounded outline-none text-sm bg-editable-cell-bg text-editable-cell-text ${
+        const baseClass = `w-full px-2 py-1 border-2 rounded outline-none focus:ring-2 focus:ring-primary/50 text-sm bg-editable-cell-bg text-editable-cell-text ${
             error ? 'border-editable-cell-border-error' : 'border-editable-cell-border'
         } ${isSaving ? 'opacity-50' : ''}`;
 
@@ -248,7 +249,7 @@ export const EditableCell: React.FC<EditableCellProps> = ({
                                 }
                             }}
                             disabled={isSaving}
-                            zIndex={9999}
+                            zIndex={35}
                         />
                     </div>
                 );
@@ -265,7 +266,7 @@ export const EditableCell: React.FC<EditableCellProps> = ({
                                 }
                             }}
                             disabled={isSaving}
-                            zIndex={9999}
+                            zIndex={35}
                         />
                     </div>
                 );
@@ -282,7 +283,7 @@ export const EditableCell: React.FC<EditableCellProps> = ({
                                 }
                             }}
                             disabled={isSaving}
-                            zIndex={9999}
+                            zIndex={35}
                         />
                     </div>
                 );

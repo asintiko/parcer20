@@ -1,5 +1,5 @@
-import ExcelJS from 'exceljs';
-import { Transaction } from './api';
+import type ExcelJS from 'exceljs';
+import { AccessScope, Transaction, securityApi } from './api';
 import { formatDate, formatTime, formatDateTime } from '../utils/dateTimeFormatters';
 
 type Alignment = 'left' | 'center' | 'right';
@@ -21,6 +21,7 @@ const HEADER_FONT_SIZE = 10;
 /** Alignment mapping by column ID (not position — safe with reorder/hide) */
 const COLUMN_ALIGNMENT: Record<string, Alignment> = {
     row_number: 'center',
+    operation_number: 'center',
     date_time: 'center',
     transaction_date: 'center',
     time: 'center',
@@ -40,25 +41,24 @@ const COLUMN_ALIGNMENT: Record<string, Alignment> = {
     parsing_confidence: 'center',
 };
 
-/** Calculate display width of a string (cyrillic chars are ~1.2x wider) */
-const calcTextWidth = (text: string): number => {
-    let width = 0;
-    for (let i = 0; i < text.length; i++) {
-        const code = text.charCodeAt(i);
-        // Cyrillic range: U+0400–U+04FF
-        if (code >= 0x0400 && code <= 0x04FF) {
-            width += 1.2;
-        } else if (code >= 0x30 && code <= 0x39) {
-            // Digits 0-9
-            width += 0.9;
-        } else if (code === 0x20) {
-            // Space
-            width += 0.6;
-        } else {
-            width += 1.0;
-        }
-    }
-    return width;
+/**
+ * Fixed widths for columns with known, constant-format data.
+ * Values are in Excel character units (≈ number of characters in Calibri 11pt).
+ */
+const FIXED_WIDTHS: Record<string, number> = {
+    row_number: 5,           // "№" → "9999"
+    operation_number: 9,     // "№ опер." → "999999"
+    date_time: 17,           // "Дата и Время" → "30.01.2026 11:40"
+    transaction_date: 11,    // "Дата" → "30.01.2026"
+    time: 6,                 // "Время" → "11:40"
+    day: 5,                  // "День" → "пт"
+    card_last_4: 5,          // "ПК" → "1234"
+    is_p2p: 4,               // "П2П" → "1"
+    transaction_type: 11,    // "Тип" → "Пополнение"
+    currency: 7,             // "Валюта" → "UZS"
+    source_type: 9,          // "Источник" → "Телеграм"
+    parsing_method: 6,       // → "Regex"
+    parsing_confidence: 9,   // → "100%"
 };
 
 const colorToARGB = (color?: string) => {
@@ -83,12 +83,21 @@ const colorToARGB = (color?: string) => {
     return undefined;
 };
 
-const formatExcelValue = (row: Transaction, columnId: string, rowIndex: number) => {
+const formatExcelValue = (
+    row: Transaction,
+    columnId: string,
+    rowIndex: number,
+    totalRows: number,
+    operationNumberDescending: boolean,
+) => {
     const value = (row as any)[columnId];
     const txDate = row.transaction_date ? new Date(row.transaction_date) : null;
 
     if (columnId === 'row_number') {
         return rowIndex + 1;
+    }
+    if (columnId === 'operation_number') {
+        return operationNumberDescending ? Math.max(totalRows - rowIndex, 0) : rowIndex + 1;
     }
     if (columnId === 'date_time') return txDate ? formatDateTime(txDate) : '';
     if (columnId === 'transaction_date') return txDate ? formatDate(txDate) : '';
@@ -133,6 +142,31 @@ const formatExcelValue = (row: Transaction, columnId: string, rowIndex: number) 
     return value ?? '';
 };
 
+const isTransactionWithinScope = (row: Transaction, scope?: AccessScope | null): boolean => {
+    if (!scope) return true;
+    const txDate = row.transaction_date ? new Date(row.transaction_date) : null;
+    if (!txDate || Number.isNaN(txDate.getTime())) return false;
+
+    const scopeYears = scope.years || [];
+    if (scopeYears.length && !scopeYears.includes(txDate.getFullYear())) {
+        return false;
+    }
+
+    if (scope.period_start) {
+        const from = new Date(scope.period_start);
+        if (!Number.isNaN(from.getTime()) && txDate < from) {
+            return false;
+        }
+    }
+    if (scope.period_end) {
+        const to = new Date(scope.period_end);
+        if (!Number.isNaN(to.getTime()) && txDate > to) {
+            return false;
+        }
+    }
+    return true;
+};
+
 const getNumberFormat = (columnId: string) => {
     if (columnId === 'amount' || columnId === 'balance_after') return '#,##0.00';
     if (columnId === 'date_time') return 'yyyy.mm.dd hh:mm';
@@ -148,11 +182,55 @@ type ExportOptions = {
     cellStyles?: StyleMap;
     fileName?: string;
     includeAlternating?: boolean;
+    operationNumberDescending?: boolean;
+    operationNumberTotal?: number;
 };
 
 export const exportTransactionsToExcel = async (options: ExportOptions) => {
-    const { rows, columns, columnStyles = {}, cellStyles = {}, fileName = 'transactions.xlsx', includeAlternating = false } = options;
-    const workbook = new ExcelJS.Workbook();
+    const {
+        rows,
+        columns,
+        columnStyles = {},
+        cellStyles = {},
+        fileName = 'transactions.xlsx',
+        includeAlternating = false,
+        operationNumberDescending = false,
+        operationNumberTotal,
+    } = options;
+    let exportRows = rows;
+    try {
+        const [lockResponse, scopeStatus] = await Promise.all([
+            securityApi.getLockedPeriods(),
+            securityApi.getStatus(),
+        ]);
+        const periods = lockResponse?.periods || [];
+        const currentScope = scopeStatus?.current_scope || null;
+
+        exportRows = rows.filter((row) => isTransactionWithinScope(row, currentScope));
+
+        if (periods.length) {
+            exportRows = exportRows.filter((row) => {
+                const txDate = row.transaction_date ? new Date(row.transaction_date) : null;
+                if (!txDate || Number.isNaN(txDate.getTime())) return true;
+                const txDateOnly = new Date(txDate.getFullYear(), txDate.getMonth(), txDate.getDate()).getTime();
+                return !periods.some((period) => {
+                    const from = new Date(period.date_from);
+                    const to = new Date(period.date_to);
+                    if (Number.isNaN(from.getTime()) || Number.isNaN(to.getTime())) return false;
+                    const fromOnly = new Date(from.getFullYear(), from.getMonth(), from.getDate()).getTime();
+                    const toOnly = new Date(to.getFullYear(), to.getMonth(), to.getDate()).getTime();
+                    return txDateOnly >= fromOnly && txDateOnly <= toOnly;
+                });
+            });
+        }
+    } catch {
+        // Export should still work if lock metadata endpoint is temporarily unavailable.
+    }
+
+    // Pulled in on demand so the ~900KB exceljs bundle never lands in the
+    // startup chunk — only when a user actually triggers an export.
+    const { default: ExcelJSModule } = await import('exceljs');
+    const workbook = new ExcelJSModule.Workbook();
     const sheet = workbook.addWorksheet('Транзакции', {
         properties: { defaultRowHeight: 15 },
         pageSetup: { fitToPage: true },
@@ -186,9 +264,15 @@ export const exportTransactionsToExcel = async (options: ExportOptions) => {
     });
 
     // --- Data rows ---
-    rows.forEach((row, rowIdx) => {
+    exportRows.forEach((row, rowIdx) => {
         const excelRow = sheet.addRow(
-            columns.map(col => formatExcelValue(row, col.id, rowIdx))
+            columns.map(col => formatExcelValue(
+                row,
+                col.id,
+                rowIdx,
+                operationNumberTotal ?? exportRows.length,
+                operationNumberDescending,
+            ))
         );
         excelRow.height = 15;
         const isEven = rowIdx % 2 === 1;
@@ -226,30 +310,45 @@ export const exportTransactionsToExcel = async (options: ExportOptions) => {
         });
     });
 
-    // --- Auto-fit column widths by actual content ---
+    // --- Auto-fit column widths ---
     sheet.columns.forEach((col, idx) => {
         const colId = columns[idx]?.id;
-        const headerText = String(col.header ?? '');
-        let maxWidth = calcTextWidth(headerText);
 
-        // Scan all data values in this column
-        const excelCol = sheet.getColumn(idx + 1);
-        excelCol.eachCell({ includeEmpty: false }, (cell, rowNumber) => {
-            if (rowNumber === 1) return; // skip header, already counted
-            const val = cell.value;
-            const text = val === null || val === undefined ? '' : String(val);
-            const w = calcTextWidth(text);
-            if (w > maxWidth) maxWidth = w;
-        });
-
-        // For numbers with format (#,##0.00), account for thousand separators
-        if (colId === 'amount' || colId === 'balance_after') {
-            maxWidth = Math.max(maxWidth, 12); // minimum for formatted numbers
+        // Fixed widths for columns with known constant format
+        const fixed = colId ? FIXED_WIDTHS[colId] : undefined;
+        if (fixed) {
+            col.width = fixed;
+            return;
         }
 
-        // Add padding and clamp
-        const fitted = Math.min(Math.ceil(maxWidth) + 3, 50);
-        col.width = Math.max(fitted, 4);
+        // Dynamic columns: measure by string length
+        const headerLen = String(col.header ?? '').length;
+        let maxLen = headerLen;
+        const isNumericCol = colId === 'amount' || colId === 'balance_after';
+
+        const excelCol = sheet.getColumn(idx + 1);
+        excelCol.eachCell({ includeEmpty: false }, (cell, rowNumber) => {
+            if (rowNumber === 1) return;
+            const val = cell.value;
+            let len: number;
+
+            if (isNumericCol && typeof val === 'number') {
+                // Formatted number with separators: "1 234 567,89"
+                len = new Intl.NumberFormat('ru-RU', {
+                    minimumFractionDigits: 2,
+                    maximumFractionDigits: 2,
+                }).format(Math.abs(val)).length;
+            } else {
+                len = val === null || val === undefined ? 0 : String(val).length;
+            }
+
+            if (len > maxLen) maxLen = len;
+        });
+
+        // +1 char padding, clamp to max 40, and enforce sane minimum
+        // width for numeric columns to avoid Excel "###" rendering.
+        const computed = Math.min(maxLen + 1, 40);
+        col.width = isNumericCol ? Math.max(computed, 14) : Math.max(computed, 8);
     });
 
     // --- Write & download ---
