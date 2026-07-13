@@ -9,8 +9,9 @@ Supports multiple extraction methods with fallback:
 import base64
 import logging
 import os
+import re
 import tempfile
-from typing import List
+from typing import List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -29,14 +30,32 @@ except ImportError:
     logger.warning("pdfplumber not installed - text extraction limited")
 
 try:
-    from pdf2image import convert_from_path
     import pytesseract
-    OCR_AVAILABLE = True
+    TESSERACT_AVAILABLE = True
 except ImportError:
-    OCR_AVAILABLE = False
-    logger.warning("pdf2image/pytesseract not installed - OCR disabled")
+    TESSERACT_AVAILABLE = False
+    logger.warning("pytesseract not installed - OCR disabled")
+
+try:
+    from PIL import Image, ImageFilter, ImageOps
+    PIL_AVAILABLE = True
+except ImportError:
+    PIL_AVAILABLE = False
+    logger.warning("Pillow not installed - image OCR preprocessing disabled")
+
+try:
+    from pdf2image import convert_from_path
+    PDF_OCR_AVAILABLE = TESSERACT_AVAILABLE
+except ImportError:
+    PDF_OCR_AVAILABLE = False
+    logger.warning("pdf2image not installed - PDF OCR disabled")
 
 MIN_TEXT_LENGTH = 80
+MAX_IMAGE_PIXELS = max(1_000_000, int(os.getenv("RECEIPT_MAX_IMAGE_PIXELS", "40000000")))
+MAX_PDF_PAGE_AREA_POINTS = max(
+    1_000_000,
+    int(os.getenv("RECEIPT_MAX_PDF_PAGE_AREA_POINTS", "20000000")),
+)
 
 
 def extract_text_from_pdf(path: str, max_pages: int = 2, use_ocr: bool = True) -> str:
@@ -49,6 +68,7 @@ def extract_text_from_pdf(path: str, max_pages: int = 2, use_ocr: bool = True) -
     3. OCR via Tesseract if text is sparse or missing
     """
     text = ""
+    _validate_pdf_geometry(path, max_pages)
 
     if PDFPLUMBER_AVAILABLE:
         text = _extract_with_pdfplumber(path, max_pages)
@@ -62,8 +82,8 @@ def extract_text_from_pdf(path: str, max_pages: int = 2, use_ocr: bool = True) -
             logger.info(f"PDF text extracted via PyMuPDF: {len(text)} chars")
             return text
 
-    if use_ocr and OCR_AVAILABLE and len(text.strip()) < MIN_TEXT_LENGTH:
-        ocr_text = _extract_with_ocr(path, max_pages, lang='rus+eng')
+    if use_ocr and PDF_OCR_AVAILABLE and len(text.strip()) < MIN_TEXT_LENGTH:
+        ocr_text = _extract_with_ocr(path, max_pages, lang=_preferred_ocr_lang())
         if ocr_text:
             logger.info(f"PDF text extracted via OCR: {len(ocr_text)} chars")
             return ocr_text
@@ -78,17 +98,36 @@ def extract_text_from_pdf(path: str, max_pages: int = 2, use_ocr: bool = True) -
 def _extract_with_pymupdf(path: str, max_pages: int) -> str:
     try:
         doc = fitz.open(path)
-        texts: List[str] = []
-        for page_index in range(min(max_pages, doc.page_count)):
-            page = doc.load_page(page_index)
-            page_text = page.get_text("text") or ""
-            if page_text.strip():
-                texts.append(page_text)
-        doc.close()
-        return "\n".join(texts).strip()
+        try:
+            texts: List[str] = []
+            for page_index in range(min(max_pages, doc.page_count)):
+                page = doc.load_page(page_index)
+                page_text = page.get_text("text") or ""
+                if page_text.strip():
+                    texts.append(page_text)
+            return "\n".join(texts).strip()
+        finally:
+            doc.close()
     except Exception as err:
         logger.debug("PyMuPDF extraction failed: %s", err)
         return ""
+
+
+def _validate_pdf_geometry(path: str, max_pages: int) -> None:
+    """Reject pathological page dimensions before rasterization allocates memory."""
+    try:
+        doc = fitz.open(path)
+        try:
+            for page_index in range(min(max_pages, doc.page_count)):
+                rect = doc.load_page(page_index).rect
+                if float(rect.width) * float(rect.height) > MAX_PDF_PAGE_AREA_POINTS:
+                    raise ValueError(f"PDF page {page_index + 1} dimensions exceed safety limit")
+        finally:
+            doc.close()
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError(f"Invalid PDF: {exc}") from exc
 
 
 def _extract_with_pdfplumber(path: str, max_pages: int) -> str:
@@ -108,7 +147,7 @@ def _extract_with_pdfplumber(path: str, max_pages: int) -> str:
 
 
 def _extract_with_ocr(path: str, max_pages: int, lang: str = 'rus+eng', dpi: int = 300) -> str:
-    if not OCR_AVAILABLE:
+    if not PDF_OCR_AVAILABLE:
         return ""
     try:
         images = convert_from_path(
@@ -120,7 +159,17 @@ def _extract_with_ocr(path: str, max_pages: int, lang: str = 'rus+eng', dpi: int
 
         texts: List[str] = []
         for i, image in enumerate(images):
-            text = pytesseract.image_to_string(image, lang=lang)
+            prepared = _preprocess_for_ocr(image)
+            try:
+                text = pytesseract.image_to_string(
+                    prepared,
+                    lang=lang,
+                    config="--oem 1 --psm 6",
+                    timeout=_OCR_TIMEOUT_SECONDS,
+                )
+            except RuntimeError as err:
+                logger.warning("Tesseract timeout/error on page %s: %s", i + 1, err)
+                continue
             if text.strip():
                 texts.append(text)
                 logger.debug("OCR extracted %s chars from page %s", len(text), i + 1)
@@ -129,6 +178,126 @@ def _extract_with_ocr(path: str, max_pages: int, lang: str = 'rus+eng', dpi: int
     except Exception as err:
         logger.debug("OCR extraction failed: %s", err)
         return ""
+
+
+def _preferred_ocr_lang(default: str = "rus+eng") -> str:
+    if not TESSERACT_AVAILABLE:
+        return default
+    try:
+        langs = set(pytesseract.get_languages(config=""))
+    except Exception:
+        return default
+    if "uzb" in langs:
+        return "rus+eng+uzb"
+    if "uzb_cyrl" in langs:
+        return "rus+eng+uzb_cyrl"
+    return default
+
+
+_OCR_MIN_WIDTH = int(os.getenv("OCR_MIN_WIDTH", "1500"))
+_OCR_PSM_MODES = (6, 4, 11)
+_OCR_TIMEOUT_SECONDS = int(os.getenv("OCR_TIMEOUT_SECONDS", "20"))
+
+
+def _preprocess_for_ocr(image):
+    if not PIL_AVAILABLE:
+        return image
+    if int(image.width) * int(image.height) > MAX_IMAGE_PIXELS:
+        raise ValueError("Image dimensions exceed OCR safety limit")
+    img = ImageOps.grayscale(image)
+    if img.width < _OCR_MIN_WIDTH:
+        scale = max(2, (_OCR_MIN_WIDTH + img.width - 1) // img.width)
+        if int(img.width * scale) * int(img.height * scale) > MAX_IMAGE_PIXELS:
+            scale = max(1, int((MAX_IMAGE_PIXELS / max(1, img.width * img.height)) ** 0.5))
+        img = img.resize((img.width * scale, img.height * scale), Image.LANCZOS)
+    img = ImageOps.autocontrast(img, cutoff=2)
+    img = img.filter(ImageFilter.UnsharpMask(radius=1.2, percent=140, threshold=2))
+    return img
+
+
+def extract_text_from_image_path(path: str, lang: Optional[str] = None) -> str:
+    if not TESSERACT_AVAILABLE or not PIL_AVAILABLE:
+        return ""
+    ocr_lang = lang or _preferred_ocr_lang()
+    try:
+        image = Image.open(path)
+        prepared = _preprocess_for_ocr(image)
+    except Exception as err:
+        logger.debug("Image OCR open/preprocess failed for %s: %s", path, err)
+        return ""
+
+    best_text = ""
+    for psm in _OCR_PSM_MODES:
+        config = f"--oem 1 --psm {psm}"
+        try:
+            text = pytesseract.image_to_string(
+                prepared,
+                lang=ocr_lang,
+                config=config,
+                timeout=_OCR_TIMEOUT_SECONDS,
+            ) or ""
+        except RuntimeError as err:
+            logger.warning("Tesseract timeout for %s psm=%s: %s", path, psm, err)
+            continue
+        except Exception as err:
+            logger.debug("Image OCR psm=%s failed for %s: %s", psm, path, err)
+            continue
+        if len(text.strip()) > len(best_text.strip()):
+            best_text = text
+        if _is_sufficient_ocr_text(text):
+            break
+    return _strip_ocr_noise(best_text.strip())
+
+
+def _is_sufficient_ocr_text(text: str) -> bool:
+    cleaned = text.strip()
+    if len(cleaned) < MIN_TEXT_LENGTH:
+        return False
+    has_amount = bool(re.search(r"\d[\d\s.,]{2,}", cleaned))
+    has_receipt_marker = bool(
+        re.search(r"(?i)(uzs|сум|so['’]?m|карта|karta|перевод|o'tkaz|payment|оплата)", cleaned)
+    )
+    return has_amount and has_receipt_marker
+
+
+def _strip_ocr_noise(text: str) -> str:
+    """Drop OCR-output that's obviously garbage.
+
+    Returns "" when alphanumeric ratio is below threshold (i.e. random punctuation
+    soup from a blank/black page). Avoids feeding nonsense to regex/AI.
+    """
+    if not text:
+        return ""
+    total = len(text)
+    if total < 10:
+        return ""
+    alnum = sum(1 for ch in text if ch.isalnum())
+    ratio = alnum / total if total else 0
+    if ratio < 0.20:
+        logger.warning("OCR noise filtered: ratio=%.2f len=%d", ratio, total)
+        return ""
+    return text
+
+
+def extract_text_from_image_bytes(image_bytes: bytes, lang: Optional[str] = None) -> str:
+    if not image_bytes:
+        return ""
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".img") as tmp:
+        tmp.write(image_bytes)
+        tmp_path = tmp.name
+    try:
+        return extract_text_from_image_path(tmp_path, lang=lang)
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
+
+
+def render_image_to_base64(path: str) -> str:
+    with open(path, "rb") as file:
+        data = file.read()
+    return base64.b64encode(data).decode("ascii")
 
 
 def extract_text_from_pdf_bytes(pdf_bytes: bytes, max_pages: int = 2, use_ocr: bool = True) -> str:
@@ -149,8 +318,14 @@ def render_pdf_pages_to_png_base64(path: str, max_pages: int = 2, dpi: int = 150
     """
     Render first `max_pages` pages of a PDF to PNG and return base64-encoded strings.
     """
+    return list(iter_pdf_pages_png_base64(path=path, max_pages=max_pages, dpi=dpi))
+
+
+def iter_pdf_pages_png_base64(path: str, max_pages: int = 2, dpi: int = 150):
+    """
+    Stream PDF pages one-by-one as base64 PNG to avoid holding all rendered pages in memory.
+    """
     doc = fitz.open(path)
-    images: List[str] = []
     try:
         zoom = dpi / 72.0
         matrix = fitz.Matrix(zoom, zoom)
@@ -158,10 +333,9 @@ def render_pdf_pages_to_png_base64(path: str, max_pages: int = 2, dpi: int = 150
             page = doc.load_page(page_index)
             pix = page.get_pixmap(matrix=matrix, alpha=False)
             png_bytes = pix.tobytes("png")
-            images.append(base64.b64encode(png_bytes).decode("ascii"))
+            yield base64.b64encode(png_bytes).decode("ascii")
     finally:
         doc.close()
-    return images
 
 
 def render_pdf_bytes_to_png_base64(pdf_bytes: bytes, max_pages: int = 2, dpi: int = 150) -> List[str]:

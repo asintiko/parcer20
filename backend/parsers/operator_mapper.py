@@ -2,7 +2,11 @@
 Operator name to application mapping module
 Uses operator_reference as single source of truth.
 """
+import os
 import re
+import threading
+import time
+import unicodedata
 from typing import Optional, List, Tuple, Dict
 
 from sqlalchemy.orm import Session
@@ -10,17 +14,65 @@ from sqlalchemy.orm import Session
 from database.models import OperatorReference
 
 
+# Process-wide cache: TTL-aware, shared across requests to avoid SELECT * per receipt.
+_CACHE_TTL_SECONDS = float(os.getenv("OPERATOR_MAPPER_CACHE_TTL", "120"))
+_cache_lock = threading.Lock()
+_cache_data: List[Tuple[int, str, str, bool]] = []
+_cache_loaded_at: float = 0.0
+
+
+def _load_cache(db_session: Session) -> List[Tuple[int, str, str, bool]]:
+    rows = (
+        db_session.query(OperatorReference)
+        .filter(OperatorReference.is_active == True)  # noqa: E712
+        .all()
+    )
+    return [
+        (
+            row.id,
+            OperatorMapper.normalize_operator(row.operator_name),
+            row.application_name,
+            bool(row.is_p2p),
+        )
+        for row in rows
+        if row.operator_name and row.application_name
+    ]
+
+
+def _get_cached(db_session: Session, force: bool = False) -> List[Tuple[int, str, str, bool]]:
+    global _cache_data, _cache_loaded_at
+    now = time.time()
+    with _cache_lock:
+        if force or not _cache_data or (now - _cache_loaded_at) > _CACHE_TTL_SECONDS:
+            try:
+                _cache_data = _load_cache(db_session)
+                _cache_loaded_at = now
+            except Exception:  # noqa: BLE001
+                # On failure keep stale cache rather than blowing up the request.
+                pass
+        return _cache_data
+
+
+def invalidate_operator_mapper_cache() -> None:
+    """Force next caller to reload from DB (call this after operator CRUD)."""
+    global _cache_data, _cache_loaded_at
+    with _cache_lock:
+        _cache_data = []
+        _cache_loaded_at = 0.0
+
+
 class OperatorMapper:
     """
     Maps raw operator strings to applications using operator_reference.
 
-    Cache layout: (id, operator_name_normalized, application_name, is_p2p)
+    Cache layout: (id, operator_name_normalized, application_name, is_p2p).
+    Process-wide TTL cache (default 120s) — overridable via OPERATOR_MAPPER_CACHE_TTL env.
     """
 
     def __init__(self, db_session: Session):
         self.db_session = db_session
-        self.mappings_cache: List[Tuple[int, str, str, bool]] = []
-        self.refresh_cache()
+        # Initial load (uses shared cache).
+        self.mappings_cache: List[Tuple[int, str, str, bool]] = _get_cached(db_session)
 
     @staticmethod
     def normalize_operator(value: str) -> str:
@@ -32,29 +84,22 @@ class OperatorMapper:
         """
         if not value:
             return ""
-        normalized = value.upper()
-        normalized = re.sub(r"[\s\t\n]+", " ", normalized)
-        normalized = re.sub(r"[^A-Z0-9 ]", " ", normalized)
+        normalized = unicodedata.normalize("NFKC", str(value)).upper()
+        normalized = "".join(
+            char if char.isalnum() else " "
+            for char in normalized
+        )
         normalized = " ".join(normalized.split())
         return normalized
 
+    @staticmethod
+    def _contains_token_sequence(value: str, pattern: str) -> bool:
+        """Match normalized phrases only at token boundaries."""
+        return bool(re.search(rf"(?:^| ){re.escape(pattern)}(?: |$)", value))
+
     def refresh_cache(self) -> None:
-        """Reload cache from operator_reference (only active rows)."""
-        rows = (
-            self.db_session.query(OperatorReference)
-            .filter(OperatorReference.is_active == True)  # noqa: E712
-            .all()
-        )
-        self.mappings_cache = [
-            (
-                row.id,
-                self.normalize_operator(row.operator_name),
-                row.application_name,
-                bool(row.is_p2p),
-            )
-            for row in rows
-            if row.operator_name and row.application_name
-        ]
+        """Reload cache from operator_reference (only active rows). Force = bypass TTL."""
+        self.mappings_cache = _get_cached(self.db_session, force=True)
 
     def map_operator_details(self, operator_raw: str) -> Optional[Dict]:
         """
@@ -82,7 +127,7 @@ class OperatorMapper:
                 exact_match = (ref_id, pattern, app, is_p2p)
                 break
 
-            if pattern in normalized_input:
+            if self._contains_token_sequence(normalized_input, pattern):
                 plen = len(pattern)
                 if plen > best_len:
                     best_len = plen
@@ -138,7 +183,10 @@ class OperatorMapper:
             score = 0.0
             if pattern == normalized_input:
                 score += 100  # exact match bonus
-            if pattern in normalized_input or normalized_input in pattern:
+            if (
+                self._contains_token_sequence(normalized_input, pattern)
+                or self._contains_token_sequence(pattern, normalized_input)
+            ):
                 score += len(pattern)
 
             pattern_tokens = set(pattern.split())

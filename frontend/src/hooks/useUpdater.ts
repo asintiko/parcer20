@@ -17,25 +17,57 @@ type UpdateEvent =
     | { status: 'downloaded'; info?: any }
     | { status: 'error'; error?: string };
 
+type ElectronUpdatesBridge = {
+    getVersion: () => Promise<string>;
+    check: () => Promise<unknown>;
+    download: () => Promise<unknown>;
+    install: (options?: { isSilent?: boolean; isForceRunAfter?: boolean }) => Promise<unknown> | unknown;
+    onEvent: (callback: (evt: UpdateEvent) => void) => (() => void) | void;
+};
+
+function resolveUpdaterBridge(): { isDesktopRuntime: boolean; bridge: ElectronUpdatesBridge | null } {
+    if (typeof window === 'undefined') {
+        return { isDesktopRuntime: false, bridge: null };
+    }
+
+    const electronApi = (window as any).electronAPI;
+    const isDesktopRuntime =
+        Boolean(electronApi?.isElectron) || navigator.userAgent.toLowerCase().includes('electron');
+    const candidate = electronApi?.updates as Partial<ElectronUpdatesBridge> | undefined;
+
+    const bridge =
+        candidate &&
+        typeof candidate.getVersion === 'function' &&
+        typeof candidate.check === 'function' &&
+        typeof candidate.download === 'function' &&
+        typeof candidate.install === 'function' &&
+        typeof candidate.onEvent === 'function'
+            ? (candidate as ElectronUpdatesBridge)
+            : null;
+
+    return { isDesktopRuntime, bridge };
+}
+
 export function useUpdater() {
-    const isElectron = typeof window !== 'undefined' && (window as any).electronAPI?.updates;
+    const { isDesktopRuntime, bridge } = resolveUpdaterBridge();
+    const isElectron = Boolean(isDesktopRuntime && bridge);
     const [status, setStatus] = useState<UpdateStatus>('idle');
     const [version, setVersion] = useState<string | null>(null);
     const [error, setError] = useState<string | null>(null);
     const [progress, setProgress] = useState<any>(null);
 
     useEffect(() => {
-        if (!isElectron) return;
+        if (!isElectron || !bridge) return;
         (async () => {
             try {
-                const v = await (window as any).electronAPI.updates.getVersion();
+                const v = await bridge.getVersion();
                 setVersion(v);
             } catch {
                 /* ignore */
             }
         })();
 
-        const off = (window as any).electronAPI.updates.onEvent((evt: UpdateEvent) => {
+        const off = bridge.onEvent((evt: UpdateEvent) => {
             setError(null);
             setProgress(null);
             switch (evt.status) {
@@ -66,26 +98,26 @@ export function useUpdater() {
         return () => {
             off && off();
         };
-    }, [isElectron]);
+    }, [isElectron, bridge]);
 
     const check = useCallback(async () => {
-        if (!isElectron) return;
+        if (!isElectron || !bridge) return;
         setStatus('checking');
         setError(null);
-        await (window as any).electronAPI.updates.check();
-    }, [isElectron]);
+        await bridge.check();
+    }, [isElectron, bridge]);
 
     const download = useCallback(async () => {
-        if (!isElectron) return;
+        if (!isElectron || !bridge) return;
         setError(null);
         setStatus('downloading');
-        await (window as any).electronAPI.updates.download();
-    }, [isElectron]);
+        await bridge.download();
+    }, [isElectron, bridge]);
 
     const install = useCallback(() => {
-        if (!isElectron) return;
-        (window as any).electronAPI.updates.install({ isSilent: false, isForceRunAfter: false });
-    }, [isElectron]);
+        if (!isElectron || !bridge) return;
+        bridge.install({ isSilent: false, isForceRunAfter: false });
+    }, [isElectron, bridge]);
 
     return {
         isElectron,

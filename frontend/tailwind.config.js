@@ -105,8 +105,9 @@ export default {
                 income: 'var(--income)',
             },
             fontFamily: {
-                sans: ['Inter', 'system-ui', 'sans-serif'],
-                mono: ['JetBrains Mono', 'monospace'],
+                sans: ['Space Grotesk', 'Inter', 'system-ui', 'sans-serif'],
+                serif: ['Instrument Serif', 'Cormorant Garamond', 'Georgia', 'serif'],
+                mono: ['JetBrains Mono', 'ui-monospace', 'monospace'],
             },
             fontSize: {
                 'table-sm': ['13px', '1.4'],

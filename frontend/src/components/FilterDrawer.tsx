@@ -1,5 +1,5 @@
-import React, { useState, useEffect } from 'react';
-import { X, Calendar, Search, DollarSign, Smartphone, Hash } from 'lucide-react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { Sheet } from './motion/Sheet';
 import { DatePicker } from './DateTimePicker';
 
 interface FilterState {
@@ -13,7 +13,11 @@ interface FilterState {
     operators: string[];
     apps: string[];
     sourceType: 'ALL' | 'TELEGRAM' | 'SMS' | 'MANUAL';
+    telegramSourceIds: number[];
     cardId: string;
+    parsingMethod?: string;
+    confidenceMin?: number;
+    confidenceMax?: number;
 }
 
 interface FilterDrawerProps {
@@ -23,6 +27,7 @@ interface FilterDrawerProps {
     initialFilters?: Partial<FilterState>;
     operatorOptions?: string[];
     appOptions?: string[];
+    telegramSourceOptions?: Array<{ chat_id: number; title: string; chat_type?: 'bot' | 'group' | 'supergroup' | 'channel' | 'private' | null; count: number }>;
 }
 
 const DEFAULT_FILTERS: FilterState = {
@@ -36,11 +41,51 @@ const DEFAULT_FILTERS: FilterState = {
     operators: [],
     apps: [],
     sourceType: 'ALL',
+    telegramSourceIds: [],
     cardId: '',
+    parsingMethod: undefined,
+    confidenceMin: undefined,
+    confidenceMax: undefined,
 };
 
-const TRANS_TYPES = ['DEBIT', 'CREDIT', 'CONVERSION', 'REVERSAL']; // Mapped values might differ, using keys for now
-const DAYS_MAP = [
+function normalizeFilterState(input?: Partial<FilterState>): FilterState {
+    const nextSourceType = input?.sourceType;
+    const nextTelegramSourceIds = Array.isArray(input?.telegramSourceIds) ? [...input.telegramSourceIds] : [];
+    const normalizedSourceType =
+        nextSourceType === 'SMS' || nextSourceType === 'MANUAL'
+            ? nextSourceType
+            : nextTelegramSourceIds.length > 0
+                ? 'TELEGRAM'
+                : 'ALL';
+    return {
+        ...DEFAULT_FILTERS,
+        ...input,
+        daysOfWeek: Array.isArray(input?.daysOfWeek) ? [...input.daysOfWeek] : [],
+        transactionTypes: Array.isArray(input?.transactionTypes) ? [...input.transactionTypes] : [],
+        operators: Array.isArray(input?.operators) ? [...input.operators] : [],
+        apps: Array.isArray(input?.apps) ? [...input.apps] : [],
+        sourceType: normalizedSourceType,
+        telegramSourceIds: nextTelegramSourceIds,
+        parsingMethod: input?.parsingMethod || undefined,
+        confidenceMin:
+            typeof input?.confidenceMin === 'number' && Number.isFinite(input.confidenceMin)
+                ? input.confidenceMin
+                : undefined,
+        confidenceMax:
+            typeof input?.confidenceMax === 'number' && Number.isFinite(input.confidenceMax)
+                ? input.confidenceMax
+                : undefined,
+    };
+}
+
+const TRANS_TYPES: Array<{ value: string; label: string }> = [
+    { value: 'DEBIT', label: 'Списание' },
+    { value: 'CREDIT', label: 'Пополнение' },
+    { value: 'CONVERSION', label: 'Конверсия' },
+    { value: 'REVERSAL', label: 'Отмена' },
+];
+
+const DAYS_MAP: Array<{ id: number; label: string }> = [
     { id: 1, label: 'Пн' },
     { id: 2, label: 'Вт' },
     { id: 3, label: 'Ср' },
@@ -50,6 +95,38 @@ const DAYS_MAP = [
     { id: 0, label: 'Вс' },
 ];
 
+const PARSING_METHODS: Array<{ value: string; label: string }> = [
+    { value: 'regex', label: 'Regex' },
+    { value: 'gpt', label: 'GPT' },
+    { value: 'manual', label: 'Ручной' },
+    { value: 'operator_mapper', label: 'Mapper' },
+];
+
+const SOURCE_PILLS: Array<{ value: 'ALL' | 'TELEGRAM' | 'SMS' | 'MANUAL'; label: string }> = [
+    { value: 'ALL', label: 'Все' },
+    { value: 'TELEGRAM', label: 'Telegram' },
+    { value: 'SMS', label: 'СМС' },
+    { value: 'MANUAL', label: 'Ручной' },
+];
+
+const CURRENCY_PILLS: Array<{ value: 'ALL' | 'UZS' | 'USD'; label: string }> = [
+    { value: 'ALL', label: 'Все' },
+    { value: 'UZS', label: 'UZS' },
+    { value: 'USD', label: 'USD' },
+];
+
+const getChatTypeLabel = (type?: string | null) => {
+    const map: Record<string, string> = {
+        bot: 'Бот',
+        group: 'Группа',
+        supergroup: 'Супергруппа',
+        channel: 'Канал',
+        private: 'Личка',
+    };
+    if (!type) return 'Telegram';
+    return map[type] || type;
+};
+
 export const FilterDrawer: React.FC<FilterDrawerProps> = ({
     isOpen,
     onClose,
@@ -57,41 +134,60 @@ export const FilterDrawer: React.FC<FilterDrawerProps> = ({
     initialFilters,
     operatorOptions = [],
     appOptions = [],
+    telegramSourceOptions = [],
 }) => {
-    const [filters, setFilters] = useState<FilterState>({ ...DEFAULT_FILTERS, ...initialFilters });
-    const [isVisible, setIsVisible] = useState(false);
-    const [isMounted, setIsMounted] = useState(false);
+    const normalizedInitialFilters = useMemo(() => normalizeFilterState(initialFilters), [initialFilters]);
+    const normalizedInitialFiltersKey = useMemo(
+        () => JSON.stringify(normalizedInitialFilters),
+        [normalizedInitialFilters],
+    );
+    const lastHydratedFiltersKeyRef = useRef(normalizedInitialFiltersKey);
+    const [filters, setFilters] = useState<FilterState>(() => normalizedInitialFilters);
     const [operatorSearch, setOperatorSearch] = useState('');
     const [appSearch, setAppSearch] = useState('');
+    const [sourceSearch, setSourceSearch] = useState('');
 
-    // Animation Logic
-    useEffect(() => {
-        if (isOpen) {
-            setIsMounted(true);
-            setTimeout(() => setIsVisible(true), 10);
-        } else {
-            setIsVisible(false);
-            setTimeout(() => setIsMounted(false), 300);
-        }
-    }, [isOpen]);
-
-    // Handlers
     const toggleDay = (day: number) => {
-        setFilters(prev => ({
+        setFilters((prev) => ({
             ...prev,
             daysOfWeek: prev.daysOfWeek.includes(day)
-                ? prev.daysOfWeek.filter(d => d !== day)
-                : [...prev.daysOfWeek, day]
+                ? prev.daysOfWeek.filter((d) => d !== day)
+                : [...prev.daysOfWeek, day],
         }));
     };
 
     const toggleList = (key: 'operators' | 'apps' | 'transactionTypes', value: string) => {
-        setFilters(prev => ({
+        setFilters((prev) => ({
             ...prev,
             [key]: prev[key].includes(value)
-                ? prev[key].filter(v => v !== value)
-                : [...prev[key], value]
+                ? prev[key].filter((v) => v !== value)
+                : [...prev[key], value],
         }));
+    };
+
+    const toggleTelegramSource = (chatId: number) => {
+        setFilters((prev) => {
+            const nextTelegramSourceIds = prev.telegramSourceIds.includes(chatId)
+                ? prev.telegramSourceIds.filter((id) => id !== chatId)
+                : [...prev.telegramSourceIds, chatId];
+            return {
+                ...prev,
+                sourceType: nextTelegramSourceIds.length > 0 ? 'TELEGRAM' : prev.sourceType === 'TELEGRAM' ? 'ALL' : prev.sourceType,
+                telegramSourceIds: nextTelegramSourceIds,
+            };
+        });
+    };
+
+    const setSourceType = (sourceType: FilterState['sourceType']) => {
+        setFilters((prev) => ({
+            ...prev,
+            sourceType,
+            telegramSourceIds: sourceType === 'TELEGRAM' ? prev.telegramSourceIds : [],
+        }));
+    };
+
+    const setParsingMethod = (value?: string) => {
+        setFilters((prev) => ({ ...prev, parsingMethod: value }));
     };
 
     const handleApply = () => {
@@ -100,14 +196,31 @@ export const FilterDrawer: React.FC<FilterDrawerProps> = ({
     };
 
     const handleReset = () => {
-        setFilters({ ...DEFAULT_FILTERS });
+        const resetFilters = normalizeFilterState();
+        setFilters(resetFilters);
         setOperatorSearch('');
         setAppSearch('');
+        setSourceSearch('');
+        onApply(resetFilters);
     };
 
     useEffect(() => {
-        setFilters(prev => ({ ...DEFAULT_FILTERS, ...prev, ...initialFilters }));
-    }, [initialFilters]);
+        if (lastHydratedFiltersKeyRef.current === normalizedInitialFiltersKey) {
+            return;
+        }
+        if (!isOpen) {
+            setFilters(normalizedInitialFilters);
+            lastHydratedFiltersKeyRef.current = normalizedInitialFiltersKey;
+        }
+    }, [isOpen, normalizedInitialFilters, normalizedInitialFiltersKey]);
+
+    useEffect(() => {
+        if (!isOpen) return;
+        if (lastHydratedFiltersKeyRef.current !== normalizedInitialFiltersKey) {
+            setFilters(normalizedInitialFilters);
+            lastHydratedFiltersKeyRef.current = normalizedInitialFiltersKey;
+        }
+    }, [isOpen, normalizedInitialFilters, normalizedInitialFiltersKey]);
 
     const filteredOperators = operatorOptions
         .filter((op) => op.toLowerCase().includes(operatorSearch.toLowerCase()))
@@ -117,278 +230,425 @@ export const FilterDrawer: React.FC<FilterDrawerProps> = ({
         .filter((app) => app.toLowerCase().includes(appSearch.toLowerCase()))
         .sort((a, b) => a.localeCompare(b));
 
-    if (!isMounted) return null;
+    const filteredTelegramSources = telegramSourceOptions
+        .filter((item) => item.title.toLowerCase().includes(sourceSearch.toLowerCase()))
+        .sort((a, b) => a.title.localeCompare(b.title));
+
+    const confidenceMinPercent =
+        typeof filters.confidenceMin === 'number' && Number.isFinite(filters.confidenceMin)
+            ? Math.round(filters.confidenceMin * 100)
+            : '';
+    const confidenceMaxPercent =
+        typeof filters.confidenceMax === 'number' && Number.isFinite(filters.confidenceMax)
+            ? Math.round(filters.confidenceMax * 100)
+            : '';
 
     return (
-        <div className="fixed inset-0 z-[60] flex justify-end">
-            {/* Backdrop */}
-            <div
-                className={`fixed inset-0 bg-black/20 backdrop-blur-sm transition-opacity duration-300 ease-in-out ${isVisible ? 'opacity-100' : 'opacity-0'
-                    }`}
-                onClick={onClose}
-            />
-
-            {/* Drawer */}
-            <div
-                className={`relative w-full max-w-md bg-surface h-full shadow-2xl flex flex-col transform transition-transform duration-300 ease-in-out border-l border-border ${isVisible ? 'translate-x-0' : 'translate-x-full'
-                    }`}
-            >
-                {/* Header */}
-                <div className="flex items-center justify-between p-4 border-b border-border bg-surface">
-                    <h2 className="text-lg font-semibold text-foreground flex items-center gap-2">
-                        <Search className="w-5 h-5 text-primary" />
+        <Sheet
+            open={isOpen}
+            onClose={onClose}
+            width={520}
+            ariaLabel="Фильтры транзакций"
+            title={
+                <div style={{ minWidth: 0 }}>
+                    <div className="tx-detail-eyebrow">Уточнение</div>
+                    <h3
+                        className="sp-sheet-title"
+                        style={{
+                            fontFamily: "var(--font-display, 'Instrument Serif', serif)",
+                            fontSize: 22,
+                            fontWeight: 400,
+                            letterSpacing: '-0.01em',
+                            marginTop: 4,
+                        }}
+                    >
                         Фильтры
-                    </h2>
-                    <button onClick={onClose} className="p-1 hover:bg-surface-2 rounded-full text-foreground-secondary focus:outline-none focus:ring-2 focus:ring-primary">
-                        <X className="w-6 h-6" />
-                    </button>
+                    </h3>
                 </div>
-
-                {/* Content */}
-                <div className="flex-1 overflow-y-auto p-5 space-y-8">
-
-                    {/* Group A: Time */}
-                    <section>
-                        <h3 className="section-title flex items-center gap-2">
-                            <Calendar className="w-4 h-4" /> Временные рамки
-                        </h3>
-                        <div className="grid grid-cols-2 gap-4 mt-3">
-                            <div>
-                                <label className="text-xs text-foreground-muted mb-1 block">Дата С</label>
-                                <DatePicker
-                                    value={filters.dateFrom || null}
-                                    onChange={(val) => setFilters({ ...filters, dateFrom: val || '' })}
-                                    zIndex={1500}
-                                />
-                            </div>
-                            <div>
-                                <label className="text-xs text-foreground-muted mb-1 block">Дата По</label>
-                                <DatePicker
-                                    value={filters.dateTo || null}
-                                    onChange={(val) => setFilters({ ...filters, dateTo: val || '' })}
-                                    zIndex={1500}
-                                />
-                            </div>
-                        </div>
-                        <div className="mt-4">
-                            <label className="text-xs text-foreground-muted mb-2 block">Дни недели</label>
-                            <div className="flex gap-1 flex-wrap">
-                                {DAYS_MAP.map(day => (
-                                    <button
-                                        key={day.id}
-                                        onClick={() => toggleDay(day.id)}
-                                        className={`w-9 h-9 rounded-full text-xs font-medium transition-colors focus:outline-none focus:ring-2 focus:ring-primary ${filters.daysOfWeek.includes(day.id)
-                                                ? 'bg-primary text-foreground-inverse'
-                                                : 'bg-surface-2 text-foreground-secondary hover:bg-surface-3'
-                                            }`}
-                                    >
-                                        {day.label}
-                                    </button>
-                                ))}
-                            </div>
-                        </div>
-                    </section>
-
-                    {/* Group B: Finance */}
-                    <section>
-                        <h3 className="section-title flex items-center gap-2">
-                            <DollarSign className="w-4 h-4" /> Финансы
-                        </h3>
-                        <div className="grid grid-cols-2 gap-4 mt-3">
-                            <input
-                                type="number"
-                                placeholder="От (сум)"
-                                value={filters.amountMin}
-                                onChange={e => setFilters({ ...filters, amountMin: e.target.value })}
-                                className="input-base"
-                            />
-                            <input
-                                type="number"
-                                placeholder="До (сум)"
-                                value={filters.amountMax}
-                                onChange={e => setFilters({ ...filters, amountMax: e.target.value })}
-                                className="input-base"
-                            />
-                        </div>
-                        <div className="mt-4">
-                            <label className="text-xs text-foreground-muted mb-1 block">Валюта</label>
-                            <div className="flex rounded-md shadow-sm" role="group">
-                                {['ALL', 'UZS', 'USD'].map((curr) => (
-                                    <button
-                                        key={curr}
-                                        onClick={() => setFilters({ ...filters, currency: curr as any })}
-                                        className={`flex-1 px-4 py-2 text-sm font-medium border border-border first:rounded-l-lg last:rounded-r-lg focus:outline-none focus:ring-2 focus:ring-primary ${filters.currency === curr
-                                                ? 'bg-primary-light text-primary border-primary/30 z-10'
-                                                : 'bg-surface text-foreground border-border hover:bg-surface-2'
-                                            } -ml-px first:ml-0`}
-                                    >
-                                        {curr === 'ALL' ? 'Все' : curr}
-                                    </button>
-                                ))}
-                            </div>
-                        </div>
-                        <div className="mt-4">
-                            <label className="text-xs text-foreground-muted mb-2 block">Тип операции</label>
-                            <div className="flex flex-wrap gap-2">
-                                {TRANS_TYPES.map(type => (
-                                    <label key={type} className="flex items-center gap-2 p-2 border border-border rounded-md cursor-pointer hover:bg-surface-2">
-                                        <input
-                                            type="checkbox"
-                                            checked={filters.transactionTypes.includes(type)}
-                                            onChange={() => toggleList('transactionTypes', type)}
-                                            className="custom-checkbox"
-                                        />
-                                        <span className="text-sm text-foreground">{getTypeLabel(type)}</span>
-                                    </label>
-                                ))}
-                            </div>
-                        </div>
-                    </section>
-
-                    {/* Group C: Entities */}
-                    <section>
-                        <h3 className="section-title flex items-center gap-2">
-                            <Smartphone className="w-4 h-4" /> Сущности
-                        </h3>
-                        <div className="mt-3 space-y-2">
-                            <div className="flex items-center justify-between">
-                                <label className="text-xs text-foreground-muted">Операторы</label>
-                                <div className="flex gap-2 text-[11px] text-primary">
-                                    <button onClick={() => setFilters({ ...filters, operators: filteredOperators })}>Выбрать все</button>
-                                    <button onClick={() => setFilters({ ...filters, operators: [] })}>Снять все</button>
-                                </div>
-                            </div>
-                            <input
-                                value={operatorSearch}
-                                onChange={(e) => setOperatorSearch(e.target.value)}
-                                placeholder="Поиск оператора"
-                                className="input-base text-sm"
-                            />
-                            <div className="grid grid-cols-2 gap-2 max-h-40 overflow-auto border border-border rounded-md p-2">
-                                {filteredOperators.map(op => (
-                                    <label key={op} className="flex items-center gap-2 text-sm text-foreground">
-                                        <input
-                                            type="checkbox"
-                                            checked={filters.operators.includes(op)}
-                                            onChange={() => toggleList('operators', op)}
-                                            className="rounded text-primary focus:ring-primary border-border"
-                                        />
-                                        {op}
-                                    </label>
-                                ))}
-                                {filteredOperators.length === 0 && (
-                                    <div className="text-xs text-foreground-secondary col-span-2">Ничего не найдено</div>
-                                )}
-                            </div>
-                        </div>
-                        <div className="mt-4 space-y-2">
-                            <div className="flex items-center justify-between">
-                                <label className="text-xs text-foreground-muted">Приложения</label>
-                                <div className="flex gap-2 text-[11px] text-primary">
-                                    <button onClick={() => setFilters({ ...filters, apps: filteredApps })}>Выбрать все</button>
-                                    <button onClick={() => setFilters({ ...filters, apps: [] })}>Снять все</button>
-                                </div>
-                            </div>
-                            <input
-                                value={appSearch}
-                                onChange={(e) => setAppSearch(e.target.value)}
-                                placeholder="Поиск приложения"
-                                className="input-base text-sm"
-                            />
-                            <div className="grid grid-cols-2 gap-2 max-h-40 overflow-auto border border-border rounded-md p-2">
-                                {filteredApps.map(app => (
-                                    <label key={app} className="flex items-center gap-2 text-sm text-foreground">
-                                        <input
-                                            type="checkbox"
-                                            checked={filters.apps.includes(app)}
-                                            onChange={() => toggleList('apps', app)}
-                                            className="rounded text-primary focus:ring-primary border-border"
-                                        />
-                                        {app}
-                                    </label>
-                                ))}
-                                {filteredApps.length === 0 && (
-                                    <div className="text-xs text-foreground-secondary col-span-2">Ничего не найдено</div>
-                                )}
-                            </div>
-                        </div>
-                        <div className="mt-4">
-                            <label className="text-xs text-foreground-muted mb-2 block">Источник</label>
-                            <div className="flex gap-4">
-                                {['ALL', 'TELEGRAM', 'SMS', 'MANUAL'].map(src => (
-                                    <label key={src} className="flex items-center gap-2 text-sm text-foreground">
-                                        <input
-                                            type="radio"
-                                            name="sourceType"
-                                            checked={filters.sourceType === src}
-                                            onChange={() => setFilters({ ...filters, sourceType: src as any })}
-                                            className="text-primary focus:ring-primary"
-                                        />
-                                        {getSourceLabel(src)}
-                                    </label>
-                                ))}
-                            </div>
-                        </div>
-                    </section>
-
-                    {/* Group D: ID */}
-                    <section>
-                        <h3 className="section-title flex items-center gap-2">
-                            <Hash className="w-4 h-4" /> Идентификаторы
-                        </h3>
-                        <div className="mt-3">
-                            <input
-                                type="text"
-                                placeholder="Поиск по номеру ПК..."
-                                value={filters.cardId}
-                                onChange={e => setFilters({ ...filters, cardId: e.target.value })}
-                                className="input-base"
-                            />
-                        </div>
-                    </section>
-                </div>
-
-                {/* Footer */}
-                <div className="p-4 border-t border-border bg-surface-2 flex gap-3">
-                    <button
-                        onClick={handleReset}
-                        className="flex-1 px-4 py-2 bg-surface border border-border text-foreground font-medium rounded-lg hover:bg-surface-3 transition-colors focus:outline-none focus:ring-2 focus:ring-primary"
-                    >
-                        Сбросить
+            }
+            subtitle="Точная настройка выборки. Применяется ко всем колонкам."
+            footer={
+                <>
+                    <button type="button" className="sp-btn" onClick={handleReset}>
+                        Сбросить всё
                     </button>
-                    <button
-                        onClick={handleApply}
-                        className="flex-1 px-4 py-2 bg-primary text-foreground-inverse font-medium rounded-lg hover:bg-primary-hover transition-colors shadow-sm focus:outline-none focus:ring-2 focus:ring-primary focus:ring-offset-2 focus:ring-offset-surface"
-                    >
+                    <span className="sp-spacer" />
+                    <button type="button" className="sp-btn" onClick={onClose}>
+                        Отмена
+                    </button>
+                    <button type="button" className="sp-btn sp-btn-primary" onClick={handleApply}>
                         Применить
                     </button>
-                </div>
+                </>
+            }
+        >
+            <div className="tx-filters">
+                <section className="tx-filter-group">
+                    <h4 className="tx-filter-group-title">Период</h4>
+                    <div className="tx-filter-row">
+                        <div className="tx-field">
+                            <label className="tx-field-label">с</label>
+                            <DatePicker
+                                value={filters.dateFrom || null}
+                                onChange={(val) => setFilters({ ...filters, dateFrom: val || '' })}
+                                zIndex={1500}
+                            />
+                        </div>
+                        <div className="tx-field">
+                            <label className="tx-field-label">по</label>
+                            <DatePicker
+                                value={filters.dateTo || null}
+                                onChange={(val) => setFilters({ ...filters, dateTo: val || '' })}
+                                zIndex={1500}
+                            />
+                        </div>
+                    </div>
+                    <div className="tx-filter-pills" style={{ marginTop: 4 }}>
+                        {DAYS_MAP.map((day) => (
+                            <button
+                                key={day.id}
+                                type="button"
+                                className={`tx-filter-pill${filters.daysOfWeek.includes(day.id) ? ' is-active' : ''}`}
+                                onClick={() => toggleDay(day.id)}
+                            >
+                                {day.label}
+                            </button>
+                        ))}
+                    </div>
+                </section>
+
+                <section className="tx-filter-group">
+                    <h4 className="tx-filter-group-title">Финансы</h4>
+                    <div className="tx-filter-row">
+                        <div className="tx-field">
+                            <label className="tx-field-label">Сумма от</label>
+                            <input
+                                type="number"
+                                className="tx-field-input"
+                                value={filters.amountMin}
+                                onChange={(e) => setFilters({ ...filters, amountMin: e.target.value })}
+                                placeholder="0"
+                            />
+                        </div>
+                        <div className="tx-field">
+                            <label className="tx-field-label">Сумма до</label>
+                            <input
+                                type="number"
+                                className="tx-field-input"
+                                value={filters.amountMax}
+                                onChange={(e) => setFilters({ ...filters, amountMax: e.target.value })}
+                                placeholder="∞"
+                            />
+                        </div>
+                    </div>
+                    <div className="tx-filter-pills">
+                        {CURRENCY_PILLS.map((c) => (
+                            <button
+                                key={c.value}
+                                type="button"
+                                className={`tx-filter-pill${filters.currency === c.value ? ' is-active' : ''}`}
+                                onClick={() => setFilters({ ...filters, currency: c.value })}
+                            >
+                                {c.label}
+                            </button>
+                        ))}
+                    </div>
+                    <div className="tx-filter-pills">
+                        {TRANS_TYPES.map((type) => (
+                            <button
+                                key={type.value}
+                                type="button"
+                                className={`tx-filter-pill${filters.transactionTypes.includes(type.value) ? ' is-active' : ''}`}
+                                onClick={() => toggleList('transactionTypes', type.value)}
+                            >
+                                {type.label}
+                            </button>
+                        ))}
+                    </div>
+                </section>
+
+                <section className="tx-filter-group">
+                    <h4 className="tx-filter-group-title">Источник</h4>
+                    <div className="tx-filter-pills">
+                        {SOURCE_PILLS.map((s) => (
+                            <button
+                                key={s.value}
+                                type="button"
+                                className={`tx-filter-pill${filters.sourceType === s.value ? ' is-active' : ''}`}
+                                onClick={() => setSourceType(s.value)}
+                            >
+                                {s.label}
+                            </button>
+                        ))}
+                    </div>
+                    <div className="tx-field" style={{ marginTop: 4 }}>
+                        <label className="tx-field-label">Поиск Telegram-источника</label>
+                        <input
+                            type="text"
+                            className="tx-field-input"
+                            value={sourceSearch}
+                            onChange={(e) => setSourceSearch(e.target.value)}
+                            placeholder="Бот, группа, канал"
+                        />
+                    </div>
+                    <div className="tx-filter-checkboxes" style={{ gridTemplateColumns: '1fr', maxHeight: 180 }}>
+                        {filteredTelegramSources.length === 0 ? (
+                            <div className="tx-filter-empty">Нет актуальных источников</div>
+                        ) : (
+                            filteredTelegramSources.map((item) => (
+                                <label key={item.chat_id} className="tx-filter-check">
+                                    <input
+                                        type="checkbox"
+                                        checked={filters.telegramSourceIds.includes(item.chat_id)}
+                                        onChange={() => toggleTelegramSource(item.chat_id)}
+                                    />
+                                    <span style={{ minWidth: 0 }}>
+                                        <div style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                            {item.title}
+                                        </div>
+                                        <div
+                                            style={{
+                                                fontFamily: "var(--font-mono, monospace)",
+                                                fontSize: 10.5,
+                                                color: 'var(--text-muted)',
+                                                letterSpacing: '0.04em',
+                                                marginTop: 2,
+                                            }}
+                                        >
+                                            {getChatTypeLabel(item.chat_type)} · {item.count}
+                                        </div>
+                                    </span>
+                                </label>
+                            ))
+                        )}
+                    </div>
+                </section>
+
+                <section className="tx-filter-group">
+                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                        <h4 className="tx-filter-group-title">Операторы</h4>
+                        <div style={{ display: 'flex', gap: 12 }}>
+                            <button
+                                type="button"
+                                onClick={() => setFilters({ ...filters, operators: filteredOperators })}
+                                style={{
+                                    fontFamily: 'var(--font-mono, monospace)',
+                                    fontSize: 10.5,
+                                    color: 'var(--text-muted)',
+                                    background: 'transparent',
+                                    border: 0,
+                                    cursor: 'pointer',
+                                    textTransform: 'uppercase',
+                                    letterSpacing: '0.1em',
+                                }}
+                            >
+                                Все
+                            </button>
+                            <button
+                                type="button"
+                                onClick={() => setFilters({ ...filters, operators: [] })}
+                                style={{
+                                    fontFamily: 'var(--font-mono, monospace)',
+                                    fontSize: 10.5,
+                                    color: 'var(--text-muted)',
+                                    background: 'transparent',
+                                    border: 0,
+                                    cursor: 'pointer',
+                                    textTransform: 'uppercase',
+                                    letterSpacing: '0.1em',
+                                }}
+                            >
+                                Снять
+                            </button>
+                        </div>
+                    </div>
+                    <div className="tx-field">
+                        <input
+                            type="text"
+                            className="tx-field-input"
+                            value={operatorSearch}
+                            onChange={(e) => setOperatorSearch(e.target.value)}
+                            placeholder="Поиск оператора"
+                        />
+                    </div>
+                    <div className="tx-filter-checkboxes">
+                        {filteredOperators.length === 0 ? (
+                            <div className="tx-filter-empty">Ничего не найдено</div>
+                        ) : (
+                            filteredOperators.map((op) => (
+                                <label key={op} className="tx-filter-check">
+                                    <input
+                                        type="checkbox"
+                                        checked={filters.operators.includes(op)}
+                                        onChange={() => toggleList('operators', op)}
+                                    />
+                                    <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                        {op}
+                                    </span>
+                                </label>
+                            ))
+                        )}
+                    </div>
+                </section>
+
+                <section className="tx-filter-group">
+                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                        <h4 className="tx-filter-group-title">Приложения</h4>
+                        <div style={{ display: 'flex', gap: 12 }}>
+                            <button
+                                type="button"
+                                onClick={() => setFilters({ ...filters, apps: filteredApps })}
+                                style={{
+                                    fontFamily: 'var(--font-mono, monospace)',
+                                    fontSize: 10.5,
+                                    color: 'var(--text-muted)',
+                                    background: 'transparent',
+                                    border: 0,
+                                    cursor: 'pointer',
+                                    textTransform: 'uppercase',
+                                    letterSpacing: '0.1em',
+                                }}
+                            >
+                                Все
+                            </button>
+                            <button
+                                type="button"
+                                onClick={() => setFilters({ ...filters, apps: [] })}
+                                style={{
+                                    fontFamily: 'var(--font-mono, monospace)',
+                                    fontSize: 10.5,
+                                    color: 'var(--text-muted)',
+                                    background: 'transparent',
+                                    border: 0,
+                                    cursor: 'pointer',
+                                    textTransform: 'uppercase',
+                                    letterSpacing: '0.1em',
+                                }}
+                            >
+                                Снять
+                            </button>
+                        </div>
+                    </div>
+                    <div className="tx-field">
+                        <input
+                            type="text"
+                            className="tx-field-input"
+                            value={appSearch}
+                            onChange={(e) => setAppSearch(e.target.value)}
+                            placeholder="Поиск приложения"
+                        />
+                    </div>
+                    <div className="tx-filter-checkboxes">
+                        {filteredApps.length === 0 ? (
+                            <div className="tx-filter-empty">Ничего не найдено</div>
+                        ) : (
+                            filteredApps.map((app) => (
+                                <label key={app} className="tx-filter-check">
+                                    <input
+                                        type="checkbox"
+                                        checked={filters.apps.includes(app)}
+                                        onChange={() => toggleList('apps', app)}
+                                    />
+                                    <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                        {app}
+                                    </span>
+                                </label>
+                            ))
+                        )}
+                    </div>
+                </section>
+
+                <section className="tx-filter-group">
+                    <h4 className="tx-filter-group-title">Парсер · уверенность</h4>
+                    <div className="tx-filter-pills">
+                        <button
+                            type="button"
+                            className={`tx-filter-pill${!filters.parsingMethod ? ' is-active' : ''}`}
+                            onClick={() => setParsingMethod(undefined)}
+                        >
+                            Все
+                        </button>
+                        {PARSING_METHODS.map((m) => (
+                            <button
+                                key={m.value}
+                                type="button"
+                                className={`tx-filter-pill${filters.parsingMethod === m.value ? ' is-active' : ''}`}
+                                onClick={() => setParsingMethod(filters.parsingMethod === m.value ? undefined : m.value)}
+                            >
+                                {m.label}
+                            </button>
+                        ))}
+                    </div>
+                    <div className="tx-filter-row">
+                        <div className="tx-field">
+                            <label className="tx-field-label">Уверенность от %</label>
+                            <input
+                                type="number"
+                                min="0"
+                                max="100"
+                                step="1"
+                                className="tx-field-input"
+                                value={confidenceMinPercent}
+                                onChange={(e) => {
+                                    const raw = e.target.value;
+                                    if (raw === '') {
+                                        setFilters({ ...filters, confidenceMin: undefined });
+                                        return;
+                                    }
+                                    const parsed = Number(raw);
+                                    if (!Number.isFinite(parsed)) return;
+                                    setFilters({
+                                        ...filters,
+                                        confidenceMin: Math.max(0, Math.min(100, parsed)) / 100,
+                                    });
+                                }}
+                                placeholder="0"
+                            />
+                        </div>
+                        <div className="tx-field">
+                            <label className="tx-field-label">Уверенность до %</label>
+                            <input
+                                type="number"
+                                min="0"
+                                max="100"
+                                step="1"
+                                className="tx-field-input"
+                                value={confidenceMaxPercent}
+                                onChange={(e) => {
+                                    const raw = e.target.value;
+                                    if (raw === '') {
+                                        setFilters({ ...filters, confidenceMax: undefined });
+                                        return;
+                                    }
+                                    const parsed = Number(raw);
+                                    if (!Number.isFinite(parsed)) return;
+                                    setFilters({
+                                        ...filters,
+                                        confidenceMax: Math.max(0, Math.min(100, parsed)) / 100,
+                                    });
+                                }}
+                                placeholder="100"
+                            />
+                        </div>
+                    </div>
+                </section>
+
+                <section className="tx-filter-group">
+                    <h4 className="tx-filter-group-title">Идентификаторы</h4>
+                    <div className="tx-field">
+                        <label className="tx-field-label">Последние 4 цифры карты</label>
+                        <input
+                            type="text"
+                            className="tx-field-input"
+                            value={filters.cardId}
+                            onChange={(e) => setFilters({ ...filters, cardId: e.target.value })}
+                            placeholder="1234"
+                            maxLength={4}
+                            inputMode="numeric"
+                        />
+                    </div>
+                </section>
             </div>
-        </div>
+        </Sheet>
     );
 };
-
-// Helpers
-const getTypeLabel = (type: string) => {
-    const map: Record<string, string> = {
-        DEBIT: 'Списание',
-        CREDIT: 'Пополнение',
-        CONVERSION: 'Конверсия',
-        REVERSAL: 'Отмена'
-    };
-    return map[type] || type;
-};
-
-const getSourceLabel = (src: string) => {
-    const map: Record<string, string> = {
-        ALL: 'Все',
-        TELEGRAM: 'Телеграм',
-        SMS: 'СМС',
-        MANUAL: 'Ручной',
-    };
-    return map[src] || src;
-};
-
-// CSS Utilities (injected for simplicity, ideally in index.css)
-// .input-base: w-full px-3 py-2 border border-gray-300 rounded-md focus:ring-1 focus:ring-blue-500 focus:border-blue-500 outline-none text-sm
-// .section-title: text-sm font-bold text-gray-900 uppercase tracking-wide

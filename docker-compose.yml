@@ -1,15 +1,20 @@
+x-default-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "3"
+
 services:
   postgres:
     image: postgres:15-alpine
     container_name: uzbek_parser_db
+    logging: *default-logging
     environment:
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: ${POSTGRES_DB}
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./receipt_parser_dump.sql:/docker-entrypoint-initdb.d/00_receipt_parser_dump.sql
-      - ./backend/database/schema.sql:/docker-entrypoint-initdb.d/schema.sql
     # Security: ports only accessible on localhost, not exposed externally
     ports:
       - "127.0.0.1:9990:5432"
@@ -41,32 +46,41 @@ services:
           memory: 256M
 
   backend:
+    image: ${BACKEND_IMAGE:-parcer-backend:latest}
     build:
       context: ./backend
       dockerfile: Dockerfile
     container_name: uzbek_parser_backend
+    logging: *default-logging
     env_file:
       - .env
+    environment:
+      ROOT_ACCESS_SERVER_CONFIG_PATH: /app/config/root-access.server.json
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
     volumes:
-      - ./backend:/app
+      - ./security/root-access.server.json:/app/config/root-access.server.json:ro
       - backend_sessions:/app/sessions
       - tdlib_data:/app/sessions/tdlib
       - tdlib_files:/app/sessions/tdlib/files
     ports:
-      - "8000:8000"
-    command: uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
+      - "${BACKEND_BIND_IP:-127.0.0.1}:8000:8000"
+    command: uvicorn api.main:app --host 0.0.0.0 --port 8000 --workers 1 --proxy-headers --forwarded-allow-ips=*
     restart: unless-stopped
+    stop_grace_period: 90s
+    mem_limit: 1536m
 
   userbot:
+    image: ${BACKEND_IMAGE:-parcer-backend:latest}
     build:
       context: ./backend
       dockerfile: Dockerfile
     container_name: uzbek_parser_userbot
+    logging: *default-logging
+    profiles: ["userbot"]
     env_file:
       - .env
     depends_on:
@@ -75,18 +89,34 @@ services:
       redis:
         condition: service_healthy
     volumes:
-      - ./backend:/app
-      - backend_sessions:/app/sessions
-      - tdlib_data:/app/sessions/tdlib
-      - tdlib_files:/app/sessions/tdlib/files
+      - userbot_sessions:/app/sessions
     command: python -m ingestion.telegram_userbot
     restart: unless-stopped
 
   telegram_bot:
+    image: ${BACKEND_IMAGE:-parcer-backend:latest}
     build:
       context: ./backend
       dockerfile: Dockerfile
     container_name: uzbek_parser_telegram_bot
+    logging: *default-logging
+    env_file:
+      - .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: python -m ingestion.telegram_bot
+    restart: unless-stopped
+
+  auth_bot:
+    image: ${BACKEND_IMAGE:-parcer-backend:latest}
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: uzbek_parser_auth_bot
+    logging: *default-logging
     env_file:
       - .env
     depends_on:
@@ -95,15 +125,18 @@ services:
       redis:
         condition: service_healthy
     volumes:
-      - ./backend:/app
-    command: python -m ingestion.telegram_bot
+      - ./security/root-access.server.json:/app/config/root-access.server.json:ro
+    command: python -m services.auth_bot_handler
     restart: unless-stopped
+    mem_limit: 128m
 
   celery_worker:
+    image: ${BACKEND_IMAGE:-parcer-backend:latest}
     build:
       context: ./backend
       dockerfile: Dockerfile
     container_name: uzbek_parser_celery_worker
+    logging: *default-logging
     env_file:
       - .env
     depends_on:
@@ -111,26 +144,110 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-    volumes:
-      - ./backend:/app
-    command: celery -A workers.celery_worker worker --loglevel=info
+    command: >-
+      celery -A workers.celery_worker worker --loglevel=info
+      -n fast@%h -Q receipts.fast,celery
+      --concurrency=3 --prefetch-multiplier=1 --max-tasks-per-child=200
     restart: unless-stopped
+    stop_grace_period: 120s
+    mem_limit: 768m
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A workers.celery_worker inspect ping --timeout 5"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  celery_ocr_worker:
+    image: ${BACKEND_IMAGE:-parcer-backend:latest}
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: uzbek_parser_celery_ocr_worker
+    logging: *default-logging
+    env_file:
+      - .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: >-
+      celery -A workers.celery_worker worker --loglevel=info
+      -n ocr@%h -Q receipts.ocr
+      --concurrency=1 --prefetch-multiplier=1 --max-tasks-per-child=30
+    restart: unless-stopped
+    stop_grace_period: 180s
+    mem_limit: 1024m
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A workers.celery_worker inspect ping --timeout 5"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  celery_maintenance_worker:
+    image: ${BACKEND_IMAGE:-parcer-backend:latest}
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: uzbek_parser_celery_maintenance_worker
+    logging: *default-logging
+    env_file:
+      - .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: >-
+      celery -A workers.celery_worker worker --loglevel=info
+      -n maintenance@%h -Q maintenance
+      --concurrency=1 --prefetch-multiplier=1 --max-tasks-per-child=200
+    restart: unless-stopped
+    stop_grace_period: 90s
+    mem_limit: 512m
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A workers.celery_worker inspect ping --timeout 5"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
 
   frontend:
     build:
       context: ./frontend
       dockerfile: Dockerfile
     container_name: uzbek_parser_frontend
+    logging: *default-logging
     ports:
-      - "5173:80"
+      - "${FRONTEND_BIND_IP:-127.0.0.1}:5173:80"
     depends_on:
       - backend
     environment:
       - VITE_API_URL=http://localhost:8000
     restart: unless-stopped
 
+  caddy:
+    image: caddy:2-alpine
+    container_name: uzbek_parser_caddy
+    logging: *default-logging
+    depends_on:
+      - frontend
+      - backend
+    environment:
+      SYSTEM_ACCESS_TOKEN: ${SYSTEM_ACCESS_TOKEN}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    restart: unless-stopped
+
 volumes:
   postgres_data:
   backend_sessions:
+  userbot_sessions:
   tdlib_data:
   tdlib_files:
+  caddy_data:
+  caddy_config:

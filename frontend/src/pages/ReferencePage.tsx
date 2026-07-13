@@ -1,31 +1,52 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { referenceApi, OperatorReferenceCreate } from '../services/api';
+import { Search, Plus, Download, Upload, Rows3, Rows2, X } from 'lucide-react';
+import { AnimatePresence, motion } from 'motion/react';
+import { referenceApi, type OperatorReference, type OperatorReferenceCreate } from '../services/api';
 import { ReferenceTable } from '../components/ReferenceTable';
+import { DescriptionsPanel } from '../components/DescriptionsPanel';
 import { useToast } from '../components/Toast';
-import { Search, Plus, Download, Upload, Filter, X, CheckCircle2 } from 'lucide-react';
+import { Sheet } from '../components/motion/Sheet';
+import { ConfirmDialog } from '../components/motion/ConfirmDialog';
+import '../styles/reference.css';
 
 type PageSizeOption = number | 'all';
-const PAGE_SIZE_DEFAULT: PageSizeOption = 'all';
+const PAGE_SIZE_DEFAULT: PageSizeOption = 100;
+type StatusFilter = 'all' | 'active' | 'inactive' | 'p2p';
+type Density = 'standard' | 'compact';
+type Section = 'operators' | 'descriptions';
+
+const STATUS_FILTERS: { key: StatusFilter; label: string }[] = [
+    { key: 'all', label: 'Все' },
+    { key: 'active', label: 'Активные' },
+    { key: 'inactive', label: 'Неактивные' },
+    { key: 'p2p', label: 'P2P' },
+];
 
 export function ReferencePage() {
     const queryClient = useQueryClient();
     const { showToast } = useToast();
 
+    const [section, setSection] = useState<Section>('operators');
     const [page, setPage] = useState(1);
     const [pageSize, setPageSize] = useState<PageSizeOption>(PAGE_SIZE_DEFAULT);
     const [search, setSearch] = useState('');
     const [debouncedSearch, setDebouncedSearch] = useState('');
     const [applicationFilter, setApplicationFilter] = useState<string>('');
-    const [activeOnly, setActiveOnly] = useState(false);
-    const [p2pOnly, setP2pOnly] = useState(false);
+    const [statusFilter, setStatusFilter] = useState<StatusFilter>('all');
+    const [density, setDensity] = useState<Density>('standard');
+    const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set());
+
+    const [editTarget, setEditTarget] = useState<OperatorReference | null>(null);
     const [isAddOpen, setIsAddOpen] = useState(false);
+    const [confirmDelete, setConfirmDelete] = useState<{ ids: number[]; label: string } | null>(null);
 
     const fileInputRef = useRef<HTMLInputElement>(null);
+    const searchRef = useRef<HTMLInputElement>(null);
 
     // Debounce search
     useEffect(() => {
-        const t = setTimeout(() => setDebouncedSearch(search.trim()), 300);
+        const t = setTimeout(() => setDebouncedSearch(search.trim()), 240);
         return () => clearTimeout(t);
     }, [search]);
 
@@ -34,27 +55,51 @@ export function ReferencePage() {
         queryFn: referenceApi.getApplications,
     });
 
-    const listQuery = useQuery(
-        {
-            queryKey: ['reference-list', pageSize === 'all' ? 'all' : page, pageSize, debouncedSearch, applicationFilter, activeOnly, p2pOnly],
-            queryFn: () =>
-                referenceApi.getOperators({
-                    page: pageSize === 'all' ? 1 : page,
-                    page_size: pageSize === 'all' ? undefined : pageSize,
-                    all: pageSize === 'all' ? true : undefined,
-                    search: debouncedSearch || undefined,
-                    application: applicationFilter || undefined,
-                    is_active: activeOnly ? true : undefined,
-                    is_p2p: p2pOnly ? true : undefined,
-                }),
-        }
-    );
+    // Stats use a separate, unfiltered query so chips always show absolute counts.
+    const statsQuery = useQuery({
+        queryKey: ['reference-stats'],
+        queryFn: () => referenceApi.getOperators({ all: true }),
+    });
+
+    const listQuery = useQuery({
+        queryKey: [
+            'reference-list',
+            pageSize === 'all' ? 'all' : page,
+            pageSize,
+            debouncedSearch,
+            applicationFilter,
+            statusFilter,
+        ],
+        queryFn: () =>
+            referenceApi.getOperators({
+                page: pageSize === 'all' ? 1 : page,
+                page_size: pageSize === 'all' ? undefined : pageSize,
+                all: pageSize === 'all' ? true : undefined,
+                search: debouncedSearch || undefined,
+                application: applicationFilter || undefined,
+                is_active:
+                    statusFilter === 'active' ? true : statusFilter === 'inactive' ? false : undefined,
+                is_p2p: statusFilter === 'p2p' ? true : undefined,
+            }),
+    });
+
+    const stats = useMemo(() => {
+        const items: OperatorReference[] = (statsQuery.data as any)?.items || [];
+        const total = items.length;
+        const active = items.filter((i) => i.is_active).length;
+        const p2p = items.filter((i) => i.is_p2p).length;
+        const apps = new Set(items.map((i) => i.application_name).filter(Boolean)).size;
+        const inactive = total - active;
+        return { total, active, inactive, p2p, apps };
+    }, [statsQuery.data]);
 
     const createMutation = useMutation({
         mutationFn: referenceApi.createOperator,
         onSuccess: () => {
-            showToast('success', 'Добавлено');
+            showToast('success', 'Запись добавлена');
             queryClient.invalidateQueries({ queryKey: ['reference-list'] });
+            queryClient.invalidateQueries({ queryKey: ['reference-stats'] });
+            queryClient.invalidateQueries({ queryKey: ['reference-applications'] });
             setIsAddOpen(false);
         },
         onError: () => showToast('error', 'Не удалось добавить'),
@@ -64,8 +109,8 @@ export function ReferencePage() {
         mutationFn: ({ id, data }: { id: number; data: Partial<OperatorReferenceCreate> }) =>
             referenceApi.updateOperator(id, data),
         onSuccess: () => {
-            showToast('success', 'Сохранено');
             queryClient.invalidateQueries({ queryKey: ['reference-list'] });
+            queryClient.invalidateQueries({ queryKey: ['reference-stats'] });
         },
         onError: () => showToast('error', 'Не удалось сохранить'),
     });
@@ -73,8 +118,8 @@ export function ReferencePage() {
     const deleteMutation = useMutation({
         mutationFn: referenceApi.deleteOperator,
         onSuccess: () => {
-            showToast('success', 'Удалено');
             queryClient.invalidateQueries({ queryKey: ['reference-list'] });
+            queryClient.invalidateQueries({ queryKey: ['reference-stats'] });
         },
         onError: () => showToast('error', 'Не удалось удалить'),
     });
@@ -82,9 +127,16 @@ export function ReferencePage() {
     const importMutation = useMutation({
         mutationFn: referenceApi.importFromExcel,
         onSuccess: (res) => {
-            showToast('success', `Импортировано: ${res.imported}, пропущено: ${res.skipped}`);
-            if (res.errors?.length) console.error(res.errors);
+            showToast('success', `Импортировано: ${res.imported} · пропущено: ${res.skipped}`);
+            if (res.errors?.length) {
+                showToast('warning', `Импорт с ошибками: ${res.errors.length}`, {
+                    duration: 8000,
+                    details: res.errors.join('\n'),
+                });
+            }
             queryClient.invalidateQueries({ queryKey: ['reference-list'] });
+            queryClient.invalidateQueries({ queryKey: ['reference-stats'] });
+            queryClient.invalidateQueries({ queryKey: ['reference-applications'] });
         },
         onError: () => showToast('error', 'Ошибка импорта'),
     });
@@ -94,9 +146,33 @@ export function ReferencePage() {
     };
 
     const handleDelete = (id: number) => {
-        if (confirm('Удалить запись?')) {
-            deleteMutation.mutate(id);
-        }
+        const item = ((listQuery.data as any)?.items || []).find((i: OperatorReference) => i.id === id);
+        setConfirmDelete({ ids: [id], label: item?.operator_name || '' });
+    };
+
+    const handleBulkDelete = () => {
+        const ids = Array.from(selectedIds);
+        setConfirmDelete({ ids, label: `${ids.length} записей` });
+    };
+
+    const handleBulkActive = (active: boolean) => {
+        Array.from(selectedIds).forEach((id) =>
+            updateMutation.mutate({ id, data: { is_active: active } }),
+        );
+        setSelectedIds(new Set());
+        showToast('success', active ? 'Записи активированы' : 'Записи деактивированы');
+    };
+
+    const handleConfirmDelete = async () => {
+        if (!confirmDelete) return;
+        await Promise.all(confirmDelete.ids.map((id) => deleteMutation.mutateAsync(id)));
+        showToast('success', confirmDelete.ids.length > 1 ? 'Удалено' : 'Запись удалена');
+        setSelectedIds((s) => {
+            const n = new Set(s);
+            confirmDelete.ids.forEach((id) => n.delete(id));
+            return n;
+        });
+        setConfirmDelete(null);
     };
 
     const handleExport = async () => {
@@ -105,9 +181,10 @@ export function ReferencePage() {
             const url = window.URL.createObjectURL(blob);
             const a = document.createElement('a');
             a.href = url;
-            a.download = 'operators.xlsx';
+            a.download = `operators-${new Date().toISOString().slice(0, 10)}.xlsx`;
             a.click();
             window.URL.revokeObjectURL(url);
+            showToast('success', 'Файл сохранён');
         } catch {
             showToast('error', 'Экспорт не удался');
         }
@@ -120,116 +197,321 @@ export function ReferencePage() {
         if (fileInputRef.current) fileInputRef.current.value = '';
     };
 
+    // ⌘K / Ctrl+K → focus search; ⌘N / Ctrl+N → add new
+    useEffect(() => {
+        const onKey = (e: KeyboardEvent) => {
+            const mod = e.metaKey || e.ctrlKey;
+            if (mod && e.key.toLowerCase() === 'k') {
+                e.preventDefault();
+                searchRef.current?.focus();
+            }
+            if (mod && e.key.toLowerCase() === 'n' && section === 'operators') {
+                e.preventDefault();
+                setIsAddOpen(true);
+            }
+            if (e.key === 'Escape' && document.activeElement === searchRef.current) {
+                setSearch('');
+            }
+        };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+    }, [section]);
+
     const total = (listQuery.data as any)?.total || 0;
-    const items = (listQuery.data as any)?.items || [];
+    const items: OperatorReference[] = (listQuery.data as any)?.items || [];
+
+    const onToggleRow = (id: number) =>
+        setSelectedIds((s) => {
+            const n = new Set(s);
+            if (n.has(id)) n.delete(id);
+            else n.add(id);
+            return n;
+        });
+
+    const onToggleAll = (ids: number[], all: boolean) =>
+        setSelectedIds((s) => {
+            const n = new Set(s);
+            if (all) ids.forEach((id) => n.add(id));
+            else ids.forEach((id) => n.delete(id));
+            return n;
+        });
 
     return (
-        <div className="p-6 space-y-4 h-full flex flex-col bg-bg">
-            <header className="flex flex-wrap gap-3 items-center justify-between">
-                <div>
-                    <h1 className="text-2xl font-semibold text-foreground">Справочник операторов</h1>
-                    <p className="text-sm text-foreground-secondary">Единый источник маппинга оператор → приложение</p>
+        <div className="rf-shell">
+            <header className="rf-head">
+                <div className="rf-eyebrow">
+                    <span className="rf-eyebrow-dot" />
+                    {section === 'operators'
+                        ? 'Справочник · operator → application'
+                        : 'Справочник · описания → operator'}
                 </div>
-                <div className="flex flex-wrap gap-2">
+                <div className="rf-head-row">
+                    <div className="rf-head-text">
+                        {section === 'operators' ? (
+                            <>
+                                <h1 className="rf-title">
+                                    Справочник <em>операторов</em>
+                                </h1>
+                                <p className="rf-subtitle">
+                                    Единый источник маппинга: имя продавца на чеке → нормализованное приложение.
+                                    Используется в каскаде распознавания.
+                                </p>
+                            </>
+                        ) : (
+                            <>
+                                <h1 className="rf-title">
+                                    Справочник <em>описаний</em>
+                                </h1>
+                                <p className="rf-subtitle">
+                                    Человекочитаемые описания мерчантов. Описание привязывается к операторам и
+                                    подставляется в каждый чек с тем же продавцом.
+                                </p>
+                            </>
+                        )}
+                    </div>
+                    {section === 'operators' ? (
+                        <div className="rf-head-actions">
+                            <button
+                                type="button"
+                                className="rf-btn"
+                                onClick={() => fileInputRef.current?.click()}
+                                disabled={importMutation.isPending}
+                            >
+                                <Upload size={14} />
+                                {importMutation.isPending ? 'Импорт…' : 'Импорт'}
+                            </button>
+                            <button type="button" className="rf-btn" onClick={handleExport}>
+                                <Download size={14} />
+                                Экспорт
+                            </button>
+                            <button
+                                type="button"
+                                className="rf-btn rf-btn-primary"
+                                onClick={() => setIsAddOpen(true)}
+                                title="⌘N · добавить запись"
+                            >
+                                <Plus size={14} />
+                                Добавить
+                            </button>
+                        </div>
+                    ) : null}
+                </div>
+                <div className="rf-chips rf-tabs" role="tablist" aria-label="Раздел справочника">
                     <button
-                        onClick={() => fileInputRef.current?.click()}
-                        className="inline-flex items-center gap-2 px-4 py-2 rounded-md bg-surface border border-border text-sm hover:bg-surface-2"
+                        type="button"
+                        role="tab"
+                        aria-selected={section === 'operators'}
+                        className={`rf-chip${section === 'operators' ? ' is-active' : ''}`}
+                        onClick={() => setSection('operators')}
                     >
-                        <Upload className="w-4 h-4" /> Импорт Excel
+                        Операторы
+                        <span className="rf-chip-count">{stats.total}</span>
                     </button>
                     <button
-                        onClick={handleExport}
-                        className="inline-flex items-center gap-2 px-4 py-2 rounded-md bg-surface border border-border text-sm hover:bg-surface-2"
+                        type="button"
+                        role="tab"
+                        aria-selected={section === 'descriptions'}
+                        className={`rf-chip${section === 'descriptions' ? ' is-active' : ''}`}
+                        onClick={() => setSection('descriptions')}
                     >
-                        <Download className="w-4 h-4" /> Экспорт Excel
-                    </button>
-                    <button
-                        onClick={() => setIsAddOpen(true)}
-                        className="inline-flex items-center gap-2 px-4 py-2 rounded-md bg-primary text-foreground-inverse text-sm hover:bg-primary-hover"
-                    >
-                        <Plus className="w-4 h-4" /> Добавить
+                        Описания
                     </button>
                 </div>
             </header>
 
-            <div className="bg-surface border border-border rounded-lg p-4 shadow-sm">
-                <div className="flex flex-wrap gap-3 items-center">
-                    <div className="relative flex-1 min-w-[240px]">
-                        <Search className="w-4 h-4 text-foreground-muted absolute left-3 top-1/2 -translate-y-1/2" />
-                        <input
-                            value={search}
-                            onChange={(e) => {
-                                setSearch(e.target.value);
-                                setPage(1);
-                            }}
-                            placeholder="Поиск по оператору или приложению"
-                            className="w-full pl-9 pr-3 py-2 border border-border rounded-md bg-input-bg text-input-text focus:ring-2 focus:ring-primary"
-                        />
+            {section === 'descriptions' ? <DescriptionsPanel /> : (
+            <>
+
+
+            <div className="rf-stats" role="region" aria-label="Сводка справочника">
+                <div className="rf-stat">
+                    <div className="rf-stat-label">Всего</div>
+                    <div className="rf-stat-value">{stats.total}</div>
+                    <div className="rf-stat-meta">записей в справочнике</div>
+                </div>
+                <div className="rf-stat is-accent">
+                    <div className="rf-stat-label">Активных</div>
+                    <div className="rf-stat-value">{stats.active}</div>
+                    <div className="rf-stat-meta">
+                        {stats.total ? Math.round((stats.active / stats.total) * 100) : 0}% от общего
                     </div>
-
-                    <div className="flex items-center gap-2">
-                        <Filter className="w-4 h-4 text-foreground-muted" />
-                        <select
-                            value={applicationFilter}
-                            onChange={(e) => {
-                                setApplicationFilter(e.target.value);
-                                setPage(1);
-                            }}
-                            className="px-3 py-2 border border-border rounded-md bg-input-bg text-sm text-input-text"
-                        >
-                            <option value="">Все приложения</option>
-                            {appsQuery.data?.map((app) => (
-                                <option key={app} value={app}>
-                                    {app}
-                                </option>
-                            ))}
-                        </select>
-                    </div>
-
-                    <label className="flex items-center gap-2 text-sm text-foreground">
-                        <input
-                            type="checkbox"
-                            checked={activeOnly}
-                            onChange={(e) => {
-                                setActiveOnly(e.target.checked);
-                                setPage(1);
-                            }}
-                            className="w-4 h-4 text-primary border-border rounded"
-                        />
-                        Только активные
-                    </label>
-
-                    <label className="flex items-center gap-2 text-sm text-foreground">
-                        <input
-                            type="checkbox"
-                            checked={p2pOnly}
-                            onChange={(e) => {
-                                setP2pOnly(e.target.checked);
-                                setPage(1);
-                            }}
-                            className="w-4 h-4 text-primary border-border rounded"
-                        />
-                        Только P2P
-                    </label>
+                </div>
+                <div className="rf-stat">
+                    <div className="rf-stat-label">P2P</div>
+                    <div className="rf-stat-value">{stats.p2p}</div>
+                    <div className="rf-stat-meta">помечено как P2P</div>
+                </div>
+                <div className="rf-stat">
+                    <div className="rf-stat-label">Приложений</div>
+                    <div className="rf-stat-value">{stats.apps}</div>
+                    <div className="rf-stat-meta">уникальных целей</div>
                 </div>
             </div>
 
-            <div className="flex-1 min-h-0">
-                <ReferenceTable
-                    data={items}
-                    total={total}
-                    page={page}
-                    pageSize={pageSize}
-                    isLoading={listQuery.isLoading || listQuery.isFetching}
-                    onPageChange={setPage}
-                    onPageSizeChange={(size) => {
-                        setPageSize(size);
+            <div className="rf-toolbar">
+                <div className="rf-search">
+                    <Search size={14} className="rf-search-icon" aria-hidden />
+                    <input
+                        ref={searchRef}
+                        type="search"
+                        className="rf-search-input"
+                        value={search}
+                        onChange={(e) => {
+                            setSearch(e.target.value);
+                            setPage(1);
+                        }}
+                        placeholder="Поиск по оператору или приложению"
+                        aria-label="Поиск по справочнику"
+                    />
+                    {search ? (
+                        <button
+                            type="button"
+                            onClick={() => {
+                                setSearch('');
+                                searchRef.current?.focus();
+                            }}
+                            className="rf-search-kbd"
+                            style={{ cursor: 'pointer' }}
+                            aria-label="Очистить поиск"
+                        >
+                            ESC
+                        </button>
+                    ) : (
+                        <span className="rf-search-kbd" aria-hidden>
+                            ⌘K
+                        </span>
+                    )}
+                </div>
+
+                <div className="rf-chips" role="tablist" aria-label="Фильтр по статусу">
+                    {STATUS_FILTERS.map(({ key, label }) => {
+                        const count =
+                            key === 'all'
+                                ? stats.total
+                                : key === 'active'
+                                ? stats.active
+                                : key === 'inactive'
+                                ? stats.inactive
+                                : stats.p2p;
+                        const active = statusFilter === key;
+                        return (
+                            <button
+                                key={key}
+                                type="button"
+                                role="tab"
+                                aria-selected={active}
+                                className={`rf-chip${active ? ' is-active' : ''}`}
+                                onClick={() => {
+                                    setStatusFilter(key);
+                                    setPage(1);
+                                }}
+                            >
+                                {label}
+                                <span className="rf-chip-count">{count}</span>
+                            </button>
+                        );
+                    })}
+                </div>
+
+                <select
+                    className="rf-app-select"
+                    value={applicationFilter}
+                    onChange={(e) => {
+                        setApplicationFilter(e.target.value);
                         setPage(1);
                     }}
-                    onUpdate={handleUpdate}
-                    onDelete={handleDelete}
-                />
+                    aria-label="Фильтр по приложению"
+                >
+                    <option value="">Все приложения</option>
+                    {appsQuery.data?.map((app) => (
+                        <option key={app} value={app}>
+                            {app}
+                        </option>
+                    ))}
+                </select>
+
+                <span className="rf-toolbar-spacer" />
+
+                <button
+                    type="button"
+                    className="rf-btn rf-btn-icon"
+                    onClick={() => setDensity((d) => (d === 'standard' ? 'compact' : 'standard'))}
+                    aria-label={density === 'standard' ? 'Компактный режим' : 'Обычный режим'}
+                    title={density === 'standard' ? 'Компактный режим' : 'Обычный режим'}
+                >
+                    {density === 'standard' ? <Rows2 size={14} /> : <Rows3 size={14} />}
+                </button>
             </div>
+
+            <AnimatePresence>
+                {selectedIds.size > 0 ? (
+                    <motion.div
+                        className="rf-bulk"
+                        role="region"
+                        aria-label="Массовые действия"
+                        initial={{ y: -6, opacity: 0 }}
+                        animate={{ y: 0, opacity: 1 }}
+                        exit={{ y: -6, opacity: 0 }}
+                        transition={{ duration: 0.18, ease: [0.16, 1, 0.3, 1] }}
+                    >
+                        <span className="rf-bulk-count">
+                            <strong>{selectedIds.size}</strong> выбрано
+                        </span>
+                        <button
+                            type="button"
+                            className="rf-bulk-action"
+                            onClick={() => handleBulkActive(true)}
+                        >
+                            Активировать
+                        </button>
+                        <button
+                            type="button"
+                            className="rf-bulk-action"
+                            onClick={() => handleBulkActive(false)}
+                        >
+                            Деактивировать
+                        </button>
+                        <span className="rf-bulk-spacer" />
+                        <button
+                            type="button"
+                            className="rf-bulk-action is-danger"
+                            onClick={handleBulkDelete}
+                        >
+                            Удалить · {selectedIds.size}
+                        </button>
+                        <button
+                            type="button"
+                            className="rf-bulk-action"
+                            onClick={() => setSelectedIds(new Set())}
+                            aria-label="Снять выбор"
+                            title="Снять выбор"
+                            style={{ width: 26, padding: 0, justifyContent: 'center' }}
+                        >
+                            <X size={13} />
+                        </button>
+                    </motion.div>
+                ) : null}
+            </AnimatePresence>
+
+            <ReferenceTable
+                data={items}
+                total={total}
+                page={page}
+                pageSize={pageSize}
+                density={density}
+                isLoading={listQuery.isLoading || listQuery.isFetching}
+                selectedIds={selectedIds}
+                onToggleRow={onToggleRow}
+                onToggleAll={onToggleAll}
+                onPageChange={setPage}
+                onPageSizeChange={(size) => {
+                    setPageSize(size);
+                    setPage(1);
+                }}
+                onUpdate={handleUpdate}
+                onDelete={handleDelete}
+                onEditFull={(item) => setEditTarget(item)}
+            />
 
             <input
                 ref={fileInputRef}
@@ -237,101 +519,198 @@ export function ReferencePage() {
                 accept=".xlsx,.xls"
                 onChange={handleImportFile}
                 className="hidden"
+                style={{ display: 'none' }}
             />
 
-            {isAddOpen && (
-                <AddModal
-                    onClose={() => setIsAddOpen(false)}
+            <Sheet
+                open={isAddOpen}
+                onClose={() => setIsAddOpen(false)}
+                title="Новая запись"
+                subtitle="оператор → приложение"
+                ariaLabel="Добавить запись в справочник"
+                width={420}
+                footer={
+                    <>
+                        <span className="sp-spacer" />
+                        <button
+                            type="button"
+                            className="sp-btn"
+                            onClick={() => setIsAddOpen(false)}
+                            disabled={createMutation.isPending}
+                        >
+                            Отмена
+                        </button>
+                    </>
+                }
+            >
+                <ReferenceForm
+                    suggestedApps={appsQuery.data || []}
+                    busy={createMutation.isPending}
                     onSubmit={(payload) => createMutation.mutate(payload)}
-                    isSubmitting={createMutation.isPending}
+                    submitLabel="Добавить"
                 />
+            </Sheet>
+
+            <Sheet
+                open={editTarget !== null}
+                onClose={() => setEditTarget(null)}
+                title="Редактирование"
+                subtitle={editTarget?.operator_name || ''}
+                ariaLabel="Редактировать запись"
+                width={420}
+                footer={
+                    <>
+                        <span className="sp-spacer" />
+                        <button
+                            type="button"
+                            className="sp-btn"
+                            onClick={() => setEditTarget(null)}
+                        >
+                            Закрыть
+                        </button>
+                    </>
+                }
+            >
+                {editTarget ? (
+                    <ReferenceForm
+                        suggestedApps={appsQuery.data || []}
+                        initial={editTarget}
+                        busy={updateMutation.isPending}
+                        onSubmit={(payload) => {
+                            updateMutation.mutate({ id: editTarget.id, data: payload });
+                            setEditTarget(null);
+                            showToast('success', 'Сохранено');
+                        }}
+                        submitLabel="Сохранить"
+                    />
+                ) : null}
+            </Sheet>
+
+            <ConfirmDialog
+                open={confirmDelete !== null}
+                title={
+                    confirmDelete && confirmDelete.ids.length > 1
+                        ? `Удалить ${confirmDelete.ids.length} записей?`
+                        : 'Удалить запись?'
+                }
+                description={
+                    confirmDelete?.label
+                        ? `Будет удалено: ${confirmDelete.label}.`
+                        : 'Это действие необратимо.'
+                }
+                confirmLabel={confirmDelete && confirmDelete.ids.length > 1 ? 'Удалить все' : 'Удалить'}
+                tone="danger"
+                onConfirm={handleConfirmDelete}
+                onClose={() => setConfirmDelete(null)}
+            />
+            </>
             )}
         </div>
     );
 }
 
-function AddModal({
-    onClose,
-    onSubmit,
-    isSubmitting,
-}: {
-    onClose: () => void;
+interface ReferenceFormProps {
+    initial?: Partial<OperatorReferenceCreate>;
+    suggestedApps: string[];
+    busy?: boolean;
     onSubmit: (data: OperatorReferenceCreate) => void;
-    isSubmitting: boolean;
-}) {
+    submitLabel?: string;
+}
+
+function ReferenceForm({
+    initial,
+    suggestedApps,
+    busy,
+    onSubmit,
+    submitLabel = 'Сохранить',
+}: ReferenceFormProps) {
     const [form, setForm] = useState<OperatorReferenceCreate>({
-        operator_name: '',
-        application_name: '',
-        is_active: true,
-        is_p2p: false,
+        operator_name: initial?.operator_name || '',
+        application_name: initial?.application_name || '',
+        is_p2p: initial?.is_p2p ?? false,
+        is_active: initial?.is_active ?? true,
     });
+    const [error, setError] = useState<string | null>(null);
+
+    const handleSubmit = (e: React.FormEvent) => {
+        e.preventDefault();
+        if (!form.operator_name.trim() || !form.application_name.trim()) {
+            setError('Оператор и приложение обязательны');
+            return;
+        }
+        setError(null);
+        onSubmit({
+            operator_name: form.operator_name.trim(),
+            application_name: form.application_name.trim(),
+            is_p2p: form.is_p2p,
+            is_active: form.is_active,
+        });
+    };
+
+    const listId = useMemo(() => `rf-apps-${Math.random().toString(36).slice(2, 8)}`, []);
 
     return (
-        <div className="fixed inset-0 bg-black/50 backdrop-blur-sm flex items-center justify-center z-50">
-            <div className="bg-surface w-full max-w-md rounded-lg border border-border shadow-xl">
-                <div className="flex items-center justify-between px-4 py-3 border-b border-border">
-                    <div className="flex items-center gap-2 text-foreground">
-                        <CheckCircle2 className="w-4 h-4 text-primary" />
-                        <h3 className="text-lg font-semibold">Новая запись</h3>
-                    </div>
-                    <button onClick={onClose} className="text-foreground-muted hover:text-foreground">
-                        <X className="w-5 h-5" />
-                    </button>
-                </div>
-                <div className="p-4 space-y-3">
-                    <div>
-                        <label className="block text-sm text-foreground mb-1">Оператор / продавец</label>
-                        <input
-                            className="w-full px-3 py-2 border border-border rounded-md bg-input-bg text-input-text focus:ring-2 focus:ring-primary"
-                            value={form.operator_name}
-                            onChange={(e) => setForm({ ...form, operator_name: e.target.value })}
-                        />
-                    </div>
-                    <div>
-                        <label className="block text-sm text-foreground mb-1">Приложение</label>
-                        <input
-                            className="w-full px-3 py-2 border border-border rounded-md bg-input-bg text-input-text focus:ring-2 focus:ring-primary"
-                            value={form.application_name}
-                            onChange={(e) => setForm({ ...form, application_name: e.target.value })}
-                        />
-                    </div>
-                    <div className="flex items-center gap-4">
-                        <label className="flex items-center gap-2 text-sm text-foreground">
-                            <input
-                                type="checkbox"
-                                checked={form.is_p2p ?? false}
-                                onChange={(e) => setForm({ ...form, is_p2p: e.target.checked })}
-                                className="w-4 h-4 text-primary border-border rounded"
-                            />
-                            P2P
-                        </label>
-                        <label className="flex items-center gap-2 text-sm text-foreground">
-                            <input
-                                type="checkbox"
-                                checked={form.is_active ?? true}
-                                onChange={(e) => setForm({ ...form, is_active: e.target.checked })}
-                                className="w-4 h-4 text-primary border-border rounded"
-                            />
-                            Активен
-                        </label>
-                    </div>
-                </div>
-                <div className="flex justify-end gap-2 px-4 py-3 border-t border-border bg-surface-2">
-                    <button
-                        onClick={onClose}
-                        className="px-4 py-2 rounded-md border border-border text-foreground hover:bg-surface"
-                    >
-                        Отмена
-                    </button>
-                    <button
-                        onClick={() => onSubmit(form)}
-                        disabled={!form.operator_name.trim() || !form.application_name.trim() || isSubmitting}
-                        className="px-4 py-2 rounded-md bg-primary text-foreground-inverse hover:bg-primary-hover disabled:opacity-50"
-                    >
-                        {isSubmitting ? 'Сохранение...' : 'Добавить'}
-                    </button>
-                </div>
+        <form className="rf-form" onSubmit={handleSubmit}>
+            <div className="rf-field">
+                <label className="rf-field-label" htmlFor="rf-op">
+                    Оператор · продавец
+                </label>
+                <input
+                    id="rf-op"
+                    className="rf-field-input"
+                    value={form.operator_name}
+                    onChange={(e) => setForm({ ...form, operator_name: e.target.value })}
+                    placeholder="Например: Магнит"
+                    autoFocus
+                />
             </div>
-        </div>
+            <div className="rf-field">
+                <label className="rf-field-label" htmlFor="rf-app">
+                    Приложение
+                </label>
+                <input
+                    id="rf-app"
+                    className="rf-field-input"
+                    value={form.application_name}
+                    onChange={(e) => setForm({ ...form, application_name: e.target.value })}
+                    placeholder="uzcard / humo / ofd / ..."
+                    list={listId}
+                />
+                <datalist id={listId}>
+                    {suggestedApps.map((app) => (
+                        <option key={app} value={app} />
+                    ))}
+                </datalist>
+            </div>
+            <div className="rf-field-row">
+                <label className="rf-field-toggle">
+                    <input
+                        type="checkbox"
+                        className="rf-toggle"
+                        checked={form.is_p2p ?? false}
+                        onChange={(e) => setForm({ ...form, is_p2p: e.target.checked })}
+                    />
+                    P2P
+                </label>
+                <label className="rf-field-toggle">
+                    <input
+                        type="checkbox"
+                        className="rf-toggle"
+                        checked={form.is_active ?? true}
+                        onChange={(e) => setForm({ ...form, is_active: e.target.checked })}
+                    />
+                    Активен
+                </label>
+            </div>
+            {error ? <div className="rf-field-error">{error}</div> : null}
+            <button
+                type="submit"
+                className="rf-btn rf-btn-primary"
+                disabled={busy || !form.operator_name.trim() || !form.application_name.trim()}
+                style={{ alignSelf: 'flex-start' }}
+            >
+                {busy ? 'Сохраняем…' : submitLabel}
+            </button>
+        </form>
     );
 }
