@@ -201,32 +201,16 @@ test('Telegram media uses only owner-bound authenticated file routes', () => {
     assert.doesNotMatch(legacyItem, /\/api\/tg\/files\//);
 });
 
-test('Windows release config fails closed without signing material', () => {
+test('Windows release config supports the explicitly approved unsigned channel', () => {
     const configPath = path.join(electronDir, 'release-config.cjs');
-    const previous = {
-        publisher: process.env.WINDOWS_PUBLISHER_NAME,
-        link: process.env.CSC_LINK,
-        password: process.env.CSC_KEY_PASSWORD,
-    };
+    delete require.cache[require.resolve(configPath)];
     delete process.env.WINDOWS_PUBLISHER_NAME;
     delete process.env.CSC_LINK;
     delete process.env.CSC_KEY_PASSWORD;
-    assert.throws(() => require(configPath), /WINDOWS_PUBLISHER_NAME/);
-
-    process.env.WINDOWS_PUBLISHER_NAME = 'Example Publisher';
-    process.env.CSC_LINK = '/external/certificate.pfx';
-    process.env.CSC_KEY_PASSWORD = 'external-secret';
     const config = require(configPath);
-    assert.equal(config.forceCodeSigning, true);
-    assert.equal(config.win.verifyUpdateCodeSignature, true);
-    assert.deepEqual(config.win.publisherName, ['Example Publisher']);
-
-    if (previous.publisher === undefined) delete process.env.WINDOWS_PUBLISHER_NAME;
-    else process.env.WINDOWS_PUBLISHER_NAME = previous.publisher;
-    if (previous.link === undefined) delete process.env.CSC_LINK;
-    else process.env.CSC_LINK = previous.link;
-    if (previous.password === undefined) delete process.env.CSC_KEY_PASSWORD;
-    else process.env.CSC_KEY_PASSWORD = previous.password;
+    assert.equal(config.forceCodeSigning, false);
+    assert.equal(config.win.verifyUpdateCodeSignature, false);
+    assert.equal(Object.hasOwn(config.win, 'publisherName'), false);
 });
 
 test('packaged updater checks after startup and continues periodic checks', () => {
@@ -234,4 +218,5 @@ test('packaged updater checks after startup and continues periodic checks', () =
     assert.match(main, /webContents\.once\('did-finish-load'[\s\S]*checkForUpdatesSafely/);
     assert.match(main, /setInterval\(\(\) => void checkForUpdatesSafely\(\)/);
     assert.match(main, /await autoUpdater\.checkForUpdates\(\)/);
+    assert.doesNotMatch(main, /assertWindowsPublisherTrust|verifiedUpdateReady/);
 });
