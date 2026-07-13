@@ -10,7 +10,6 @@ const {
     isAllowedApiRequest,
     isSafeMiniAppUrl,
     isTrustedRendererUrl,
-    parsePublisherNamesFromUpdaterConfig,
 } = require('./security-policy.cjs');
 
 let mainWindow;
@@ -545,20 +544,7 @@ app.on('window-all-closed', () => {
     }
 });
 
-let verifiedUpdateReady = false;
-
-function assertWindowsPublisherTrust() {
-    if (process.platform !== 'win32' || !app.isPackaged) return [];
-    const updaterConfigPath = path.join(process.resourcesPath, 'app-update.yml');
-    if (!fs.existsSync(updaterConfigPath)) {
-        throw new Error('Updater publisher configuration is missing');
-    }
-    const publisherNames = parsePublisherNamesFromUpdaterConfig(fs.readFileSync(updaterConfigPath, 'utf8'));
-    if (!publisherNames.length) {
-        throw new Error('Updater publisher allowlist is empty');
-    }
-    return publisherNames;
-}
+let downloadedUpdateReady = false;
 
 function setupAutoUpdates() {
     const sendToRenderer = (channel, payload) => {
@@ -603,7 +589,6 @@ function setupAutoUpdates() {
             sendToRenderer('updates:event', { status: 'not-available', info: { reason: 'dev-mode' } });
             return true;
         }
-        assertWindowsPublisherTrust();
         await autoUpdater.checkForUpdates();
         return true;
     });
@@ -613,7 +598,6 @@ function setupAutoUpdates() {
             sendToRenderer('updates:event', { status: 'not-available', info: { reason: 'dev-mode' } });
             return true;
         }
-        assertWindowsPublisherTrust();
         await autoUpdater.downloadUpdate();
         return true;
     });
@@ -623,7 +607,7 @@ function setupAutoUpdates() {
             sendToRenderer('updates:event', { status: 'not-available', info: { reason: 'dev-mode' } });
             return true;
         }
-        if (!verifiedUpdateReady) throw new Error('No publisher-verified update is ready to install');
+        if (!downloadedUpdateReady) throw new Error('No downloaded update is ready to install');
         const { isSilent = false, isForceRunAfter = false } = opts;
         autoUpdater.quitAndInstall(isSilent, isForceRunAfter);
         return true;
@@ -633,15 +617,9 @@ function setupAutoUpdates() {
 
     autoUpdater.autoDownload = false;
     autoUpdater.autoInstallOnAppQuit = false;
-    try {
-        assertWindowsPublisherTrust();
-    } catch (error) {
-        sendToRenderer('updates:event', { status: 'error', error: error?.message || String(error) });
-        return;
-    }
     autoUpdater.on('checking-for-update', () => sendToRenderer('updates:event', { status: 'checking' }));
     autoUpdater.on('update-available', (info) => {
-        verifiedUpdateReady = false;
+        downloadedUpdateReady = false;
         sendToRenderer('updates:event', { status: 'available', info });
     });
     autoUpdater.on('update-not-available', (info) => sendToRenderer('updates:event', { status: 'not-available', info }));
@@ -649,17 +627,16 @@ function setupAutoUpdates() {
         sendToRenderer('updates:event', { status: 'downloading', progress: progressObj })
     );
     autoUpdater.on('update-downloaded', (info) => {
-        verifiedUpdateReady = true;
+        downloadedUpdateReady = true;
         sendToRenderer('updates:event', { status: 'downloaded', info });
     });
     autoUpdater.on('error', (err) => {
-        verifiedUpdateReady = false;
+        downloadedUpdateReady = false;
         sendToRenderer('updates:event', { status: 'error', error: err?.message || String(err) });
     });
 
     const checkForUpdatesSafely = async () => {
         try {
-            assertWindowsPublisherTrust();
             await autoUpdater.checkForUpdates();
         } catch (error) {
             sendToRenderer('updates:event', { status: 'error', error: error?.message || String(error) });

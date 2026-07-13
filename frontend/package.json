@@ -1,6 +1,6 @@
 {
     "name": "tbsparcer",
-    "version": "1.4.24",
+    "version": "1.4.25",
     "description": "TBSparcer Desktop Application",
     "main": "electron/main.cjs",
     "author": "TBSparcer Team",
@@ -20,7 +20,7 @@
         "test:electron-security": "node --test electron/tests/*.test.cjs"
     },
     "build": {
-        "forceCodeSigning": true,
+        "forceCodeSigning": false,
         "appId": "com.tbsparcer.app",
         "productName": "TBSparcer",
         "directories": {
@@ -45,9 +45,9 @@
             }
         ],
         "win": {
-            "verifyUpdateCodeSignature": true,
+            "verifyUpdateCodeSignature": false,
             "requestedExecutionLevel": "requireAdministrator",
-            "icon": "build/icons/app.ico",
+            "icon": "electron/assets/app.ico",
             "target": [
                 {
                     "target": "nsis",
@@ -68,11 +68,10 @@
             "perMachine": true,
             "allowToChangeInstallationDirectory": true,
             "allowElevation": true,
-            "installerIcon": "build/icons/app.ico",
-            "uninstallerIcon": "build/icons/app.ico",
-            "installerHeaderIcon": "build/icons/app.ico",
-            "artifactName": "${productName}-Setup-${version}.${ext}",
-            "include": "build/installer.nsh"
+            "installerIcon": "electron/assets/app.ico",
+            "uninstallerIcon": "electron/assets/app.ico",
+            "installerHeaderIcon": "electron/assets/app.ico",
+            "artifactName": "${productName}-Setup-${version}.${ext}"
         },
         "portable": {
             "artifactName": "${productName}-Portable-${version}.${ext}"
