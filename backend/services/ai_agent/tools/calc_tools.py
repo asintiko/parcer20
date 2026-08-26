@@ -93,9 +93,9 @@ def _resolve_period(args: Dict[str, Any]) -> Tuple[datetime, datetime, str]:
 def _scope_chat_ids(scope: Optional[dict]) -> Optional[List[int]]:
     if not scope or not isinstance(scope, dict):
         return None
-    chats = scope.get("allowed_chat_ids")
-    if not chats:
+    if "allowed_chat_ids" not in scope:
         return None
+    chats = scope.get("allowed_chat_ids") or []
     try:
         return [int(c) for c in chats]
     except Exception:  # noqa: BLE001
@@ -125,11 +125,8 @@ def _filtered_query(
     if args.get("transaction_type"):
         q = q.filter(Transaction.transaction_type == str(args["transaction_type"]).upper())
     chat_ids = _scope_chat_ids(scope)
-    if chat_ids:
-        q = q.filter(
-            (Transaction.source_chat_id.in_(chat_ids))
-            | (Transaction.source_chat_id.is_(None))
-        )
+    if chat_ids is not None:
+        q = q.filter(Transaction.source_chat_id.in_(chat_ids))
     return q
 
 

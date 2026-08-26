@@ -13,6 +13,11 @@ import androidx.work.workDataOf
 import java.util.concurrent.TimeUnit
 
 object WorkScheduler {
+    private const val PERIODIC_SYNC = "sms_sync"
+    private const val IMMEDIATE_SYNC = "sms_sync_now"
+    private const val BACKFILL = "sms_backfill"
+    private const val RECONCILE = "sms_reconcile"
+
     private val netConstraint = Constraints.Builder()
         .setRequiredNetworkType(NetworkType.CONNECTED).build()
 
@@ -22,7 +27,7 @@ object WorkScheduler {
             .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
             .build()
         WorkManager.getInstance(ctx)
-            .enqueueUniquePeriodicWork("sms_sync", ExistingPeriodicWorkPolicy.KEEP, req)
+            .enqueueUniquePeriodicWork(PERIODIC_SYNC, ExistingPeriodicWorkPolicy.KEEP, req)
     }
 
     fun syncNow(ctx: Context) {
@@ -31,14 +36,14 @@ object WorkScheduler {
             .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
             .build()
         WorkManager.getInstance(ctx)
-            .enqueueUniqueWork("sms_sync_now", ExistingWorkPolicy.REPLACE, req)
+            .enqueueUniqueWork(IMMEDIATE_SYNC, ExistingWorkPolicy.REPLACE, req)
     }
 
     fun runBackfill(ctx: Context) {
         val req = OneTimeWorkRequestBuilder<BackfillWorker>()
             .setConstraints(netConstraint).build()
         WorkManager.getInstance(ctx)
-            .enqueueUniqueWork("sms_backfill", ExistingWorkPolicy.REPLACE, req)
+            .enqueueUniqueWork(BACKFILL, ExistingWorkPolicy.REPLACE, req)
     }
 
     fun runReconcile(ctx: Context, from: Long, to: Long) {
@@ -48,6 +53,14 @@ object WorkScheduler {
             .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
             .build()
         WorkManager.getInstance(ctx)
-            .enqueueUniqueWork("sms_reconcile", ExistingWorkPolicy.REPLACE, req)
+            .enqueueUniqueWork(RECONCILE, ExistingWorkPolicy.REPLACE, req)
+    }
+
+    fun pauseMonitoring(ctx: Context) {
+        val workManager = WorkManager.getInstance(ctx)
+        workManager.cancelUniqueWork(PERIODIC_SYNC)
+        workManager.cancelUniqueWork(IMMEDIATE_SYNC)
+        workManager.cancelUniqueWork(BACKFILL)
+        workManager.cancelUniqueWork(RECONCILE)
     }
 }

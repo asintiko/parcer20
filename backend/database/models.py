@@ -5,7 +5,7 @@ from datetime import datetime
 from typing import Optional
 from sqlalchemy import (
     BigInteger, Boolean, CheckConstraint, Column, Date, DateTime,
-    Float, Integer, JSON, Numeric, String, Text, Index, UniqueConstraint, Uuid,
+    Float, ForeignKey, Integer, JSON, Numeric, String, Text, Index, UniqueConstraint, Uuid,
     text as sql_text,
 )
 from sqlalchemy.orm import declarative_base
@@ -53,9 +53,7 @@ class Transaction(Base):
     parsing_method = Column(String(20))
     is_p2p = Column(Boolean, default=False)
     
-    # Fingerprint for duplicate detection (SHA256 of amount|date|card|operator|type).
-    # Partial unique index lives in migration 007 + __table_args__ below — keeps DB
-    # in sync with ORM-managed Base.metadata.create_all() in tests.
+    # Fuzzy reconciliation fingerprint (never a hard source identity).
     fingerprint = Column(String(64))
 
     created_at = Column(DateTime(timezone=False), server_default=func.now(), nullable=False)
@@ -66,6 +64,11 @@ class Transaction(Base):
         CheckConstraint(
             "transaction_type IN ('DEBIT', 'CREDIT', 'CONVERSION', 'REVERSAL')", 
             name='check_transaction_type'
+        ),
+        CheckConstraint(
+            "(transaction_type = 'DEBIT' AND amount <= 0) OR "
+            "(transaction_type <> 'DEBIT' AND amount >= 0)",
+            name='check_transaction_amount_sign',
         ),
         CheckConstraint(
             "parsing_confidence >= 0 AND parsing_confidence <= 1", 
@@ -94,12 +97,11 @@ class Transaction(Base):
         Index('idx_transactions_source', 'source_type', 'source_chat_id'),
         # idx_transactions_source_msg removed: duplicate of uq_transactions_source_msg.
         Index('idx_transactions_updated_id', 'updated_at', 'id'),
-        # Partial UNIQUE on fingerprint — closes the dedup race condition.
-        # Mirrors migration 007_unique_fingerprint.sql.
+        # Fingerprints are fuzzy reconciliation candidates, never hard identity.
         Index(
-            'uq_transactions_fingerprint',
+            'idx_transactions_fingerprint_candidate',
             'fingerprint',
-            unique=True,
+            unique=False,
             postgresql_where=sql_text('fingerprint IS NOT NULL'),
         ),
         # Per-device idempotency for mobile SMS ingestion. Mirrors migration 0020.
@@ -185,10 +187,21 @@ class ReceiptProcessingTask(Base):
     task_id = Column(String(255), unique=True, nullable=False)
     chat_id = Column(BigInteger, nullable=False)
     message_id = Column(BigInteger, nullable=False)
-    status = Column(String(20), nullable=False)  # queued | processing | done | failed
+    status = Column(String(20), nullable=False)  # queued | processing | retry | done | failed | dead
     transaction_id = Column(BigInteger)  # References transactions.id
     error = Column(Text)
     raw_message = Column(Text, nullable=True)  # Source message text (stored for failed tasks)
+    payload_json = Column(Text, nullable=True)
+    force_reprocess = Column(Boolean, nullable=False, default=False, server_default="false")
+    publish_state = Column(String(20), nullable=False, default="published", server_default="published")
+    publish_attempts = Column(Integer, nullable=False, default=0, server_default="0")
+    processing_attempts = Column(Integer, nullable=False, default=0, server_default="0")
+    next_retry_at = Column(DateTime(timezone=False), nullable=True)
+    heartbeat_at = Column(DateTime(timezone=False), nullable=True)
+    published_at = Column(DateTime(timezone=False), nullable=True)
+    started_at = Column(DateTime(timezone=False), nullable=True)
+    finished_at = Column(DateTime(timezone=False), nullable=True)
+    last_error_kind = Column(String(40), nullable=True)
     created_at = Column(DateTime(timezone=False), server_default=func.now(), nullable=False)
     updated_at = Column(DateTime(timezone=False), server_default=func.now(), onupdate=func.now())
 
@@ -196,10 +209,37 @@ class ReceiptProcessingTask(Base):
         UniqueConstraint('chat_id', 'message_id', name='uq_receipt_tasks_chat_msg'),
         Index('idx_receipt_tasks_status', 'status'),
         Index('idx_receipt_tasks_chat_msg', 'chat_id', 'message_id'),
+        Index('idx_receipt_tasks_outbox', 'publish_state', 'next_retry_at'),
+        Index('idx_receipt_tasks_heartbeat', 'status', 'heartbeat_at'),
     )
 
     def __repr__(self):
         return f"<ReceiptProcessingTask(task_id={self.task_id}, chat={self.chat_id}, msg={self.message_id}, status={self.status})>"
+
+
+class ReceiptTaskDLQ(Base):
+    """Durable terminal receipt failures retained for investigation or replay."""
+
+    __tablename__ = "receipt_task_dlq"
+
+    id = Column(BigInteger().with_variant(Integer, "sqlite"), primary_key=True, autoincrement=True)
+    task_id = Column(String(255), nullable=False)
+    tracking_task_id = Column(BigInteger, nullable=True)
+    chat_id = Column(BigInteger, nullable=True)
+    message_id = Column(BigInteger, nullable=True)
+    payload_json = Column(Text, nullable=False)
+    error_text = Column(Text, nullable=True)
+    traceback = Column(Text, nullable=True)
+    retries = Column(Integer, nullable=False, default=0, server_default="0")
+    reason = Column(String(40), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    replayed_at = Column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        Index("idx_receipt_task_dlq_task_id", "task_id"),
+        Index("idx_receipt_task_dlq_created", "created_at"),
+        Index("idx_receipt_task_dlq_chat_msg", "chat_id", "message_id"),
+    )
 
 
 class MonitoredBotChat(Base):
@@ -210,6 +250,9 @@ class MonitoredBotChat(Base):
     chat_id = Column(BigInteger, primary_key=True)
     enabled = Column(Boolean, nullable=False, server_default='true')
     last_processed_message_id = Column(BigInteger, nullable=False, server_default='0')
+    scan_cursor_message_id = Column(BigInteger, nullable=False, server_default='0')
+    scan_backfill_from_message_id = Column(BigInteger, nullable=True)
+    scan_backfill_target_message_id = Column(BigInteger, nullable=True)
     last_error = Column(Text)
 
     # Group support and filtering
@@ -316,6 +359,48 @@ class OperatorReference(Base):
         return f"<OperatorReference(operator='{self.operator_name}', app='{self.application_name}', p2p={self.is_p2p})>"
 
 
+class Description(Base):
+    """Free-text description bound to one or more normalized merchant operators.
+
+    Shared entity: a single Description can be linked to many operators via
+    OperatorDescriptionLink, so editing the text updates every operator at once.
+    """
+    __tablename__ = 'descriptions'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    text = Column(Text, nullable=False)
+    created_by_user_id = Column(BigInteger, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    def __repr__(self):
+        return f"<Description(id={self.id}, text='{(self.text or '')[:32]}')>"
+
+
+class OperatorDescriptionLink(Base):
+    """Link of a normalized operator key to a Description (one operator -> one description)."""
+    __tablename__ = 'operator_description_links'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    operator_key = Column(String(500), nullable=False, unique=True)
+    description_id = Column(
+        Integer,
+        ForeignKey('descriptions.id', ondelete='CASCADE'),
+        nullable=False,
+    )
+    source = Column(String(20), nullable=False, default='manual', server_default='manual')
+    created_by_user_id = Column(BigInteger, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        Index('idx_operator_desc_link_key', 'operator_key', unique=True),
+        Index('idx_operator_desc_link_desc', 'description_id'),
+    )
+
+    def __repr__(self):
+        return f"<OperatorDescriptionLink(key='{self.operator_key}', description_id={self.description_id})>"
+
+
 class HiddenBotChat(Base):
     """Model for storing hidden bot chats (TDLib client)"""
     __tablename__ = 'hidden_bot_chats'
@@ -376,7 +461,7 @@ class TgChatMessage(Base):
 
 
 class TgHistoryCursor(Base):
-    """Progress cursor/status for background full history loading per chat."""
+    """Independent progress for manual history loading and monitored sync."""
     __tablename__ = "tg_history_cursors"
 
     chat_id = Column(BigInteger, primary_key=True)
@@ -389,10 +474,21 @@ class TgHistoryCursor(Base):
     last_batch_at = Column(DateTime(timezone=True), nullable=True)
     lag_messages = Column(BigInteger, nullable=False, default=0, server_default="0")
     lag_seconds = Column(BigInteger, nullable=False, default=0, server_default="0")
+    monitor_cursor_message_id = Column(
+        BigInteger, nullable=False, default=0, server_default="0"
+    )
+    monitor_backfill_from_message_id = Column(BigInteger, nullable=True)
+    monitor_backfill_target_message_id = Column(BigInteger, nullable=True)
+    monitor_status = Column(
+        String(20), nullable=False, default="idle", server_default="idle"
+    )
+    monitor_error = Column(Text, nullable=True)
+    monitor_last_batch_at = Column(DateTime(timezone=True), nullable=True)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
 
     __table_args__ = (
         Index("idx_tg_history_cursors_status", "status"),
+        Index("idx_tg_history_cursors_monitor_status", "monitor_status"),
         Index("idx_tg_history_cursors_updated", "updated_at"),
         Index("idx_tg_history_cursors_lag", "lag_messages", "lag_seconds"),
     )
@@ -611,6 +707,19 @@ class AgentRun(Base):
         return f"<AgentRun(id={self.id}, thread={self.thread_id}, status={self.status})>"
 
 
+AGENT_RUN_EVENT_TYPES = (
+    "planning_started",
+    "tool_selected",
+    "tool_started",
+    "tool_progress",
+    "tool_finished",
+    "tool_failed",
+    "awaiting_confirmation",
+    "completed",
+    "failed",
+)
+
+
 class AgentRunEvent(Base):
     """Micro-events for live agent execution timeline."""
     __tablename__ = "agent_run_events"
@@ -625,7 +734,7 @@ class AgentRunEvent(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "event_type IN ('planning_started', 'tool_selected', 'tool_started', 'tool_progress', 'tool_finished', 'awaiting_confirmation', 'completed', 'failed')",
+            "event_type IN (" + ", ".join(f"'{item}'" for item in AGENT_RUN_EVENT_TYPES) + ")",
             name="check_agent_run_event_type",
         ),
         CheckConstraint("status IN ('pending', 'running', 'completed', 'failed')", name="check_agent_run_event_status"),

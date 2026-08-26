@@ -86,8 +86,8 @@ def test_run_monitored_chat_sync_disabled_via_env(monkeypatch):
         asyncio.run(svc._run_monitored_chat_sync())  # must complete without error
 
 
-def test_run_monitored_chat_sync_falls_back_to_celery(monkeypatch):
-    """`MONITORED_CHAT_SYNC_VIA_BACKEND=false` → enqueue Celery, no in-process call."""
+def test_run_monitored_chat_sync_rejects_unsafe_celery_fallback(monkeypatch):
+    """The unauthenticated Celery TDLib fallback is ignored even if configured."""
     monkeypatch.setenv("MONITORED_CHAT_SYNC_VIA_BACKEND", "false")
     svc = _make_service()
 
@@ -100,15 +100,33 @@ def test_run_monitored_chat_sync_falls_back_to_celery(monkeypatch):
 
     fake_sync_module = types.ModuleType("services.monitored_chat_sync")
 
-    async def boom(**_):
-        raise AssertionError("sync_all_active_chats should not run when fallback active")
+    called = []
 
-    fake_sync_module.sync_all_active_chats = boom
+    async def fake_sync_all(**_):
+        called.append(True)
+        return []
 
-    with patch.dict(sys.modules, {"services.monitored_chat_sync": fake_sync_module}):
+    fake_sync_module.sync_all_active_chats = fake_sync_all
+
+    fake_tdlib_module = types.ModuleType("services.telegram_tdlib_manager")
+
+    class _FakeTDLibUnavailableError(RuntimeError):
+        pass
+
+    fake_tdlib_module.TDLibUnavailableError = _FakeTDLibUnavailableError
+    fake_tdlib_module.get_tdlib_manager = lambda: types.SimpleNamespace()
+
+    with patch.dict(
+        sys.modules,
+        {
+            "services.monitored_chat_sync": fake_sync_module,
+            "services.telegram_tdlib_manager": fake_tdlib_module,
+        },
+    ):
         asyncio.run(svc._run_monitored_chat_sync())
 
-    assert sent_tasks == ["monitored_chat_sync_tick"]
+    assert called == [True]
+    assert sent_tasks == []
 
 
 def test_run_monitored_chat_sync_swallows_per_chat_errors():
@@ -116,11 +134,13 @@ def test_run_monitored_chat_sync_swallows_per_chat_errors():
     svc = _make_service()
 
     fake_sync_module = types.ModuleType("services.monitored_chat_sync")
-    captured_results = []
+    captured_errors = []
 
     async def fake_sync_all(*, fetch_callable):
-        items = await fetch_callable(chat_id=1, from_message_id=0, limit=5)
-        captured_results.append(items)
+        try:
+            await fetch_callable(chat_id=1, from_message_id=0, limit=5)
+        except Exception as exc:  # noqa: BLE001
+            captured_errors.append(str(exc))
         return [{"chat_id": 1, "new_rows": 0}]
 
     fake_sync_module.sync_all_active_chats = fake_sync_all
@@ -146,19 +166,21 @@ def test_run_monitored_chat_sync_swallows_per_chat_errors():
     ):
         asyncio.run(svc._run_monitored_chat_sync())
 
-    assert captured_results == [[]], "fetch should return [] on per-chat exception"
+    assert captured_errors == ["tdlib boom"]
 
 
 def test_run_monitored_chat_sync_handles_tdlib_unavailable():
-    """`TDLibUnavailableError` is downgraded to warning and yields []."""
+    """`TDLibUnavailableError` remains distinguishable from empty history."""
     svc = _make_service()
 
     fake_sync_module = types.ModuleType("services.monitored_chat_sync")
-    captured_results = []
+    captured_errors = []
 
     async def fake_sync_all(*, fetch_callable):
-        items = await fetch_callable(chat_id=7, from_message_id=0, limit=5)
-        captured_results.append(items)
+        try:
+            await fetch_callable(chat_id=7, from_message_id=0, limit=5)
+        except Exception as exc:  # noqa: BLE001
+            captured_errors.append(str(exc))
         return [{"chat_id": 7, "new_rows": 0}]
 
     fake_sync_module.sync_all_active_chats = fake_sync_all
@@ -184,7 +206,7 @@ def test_run_monitored_chat_sync_handles_tdlib_unavailable():
     ):
         asyncio.run(svc._run_monitored_chat_sync())
 
-    assert captured_results == [[]]
+    assert captured_errors == ["tdlib_unavailable:not loaded"]
 
 
 def test_run_monitored_chat_sync_handles_fetch_timeout(monkeypatch):
@@ -193,11 +215,13 @@ def test_run_monitored_chat_sync_handles_fetch_timeout(monkeypatch):
     svc = _make_service()
 
     fake_sync_module = types.ModuleType("services.monitored_chat_sync")
-    captured_results = []
+    captured_errors = []
 
     async def fake_sync_all(*, fetch_callable):
-        items = await fetch_callable(chat_id=99, from_message_id=0, limit=5)
-        captured_results.append(items)
+        try:
+            await fetch_callable(chat_id=99, from_message_id=0, limit=5)
+        except Exception as exc:  # noqa: BLE001
+            captured_errors.append(str(exc))
         return [{"chat_id": 99, "new_rows": 0}]
 
     fake_sync_module.sync_all_active_chats = fake_sync_all
@@ -234,7 +258,7 @@ def test_run_monitored_chat_sync_handles_fetch_timeout(monkeypatch):
     ), patch("services.ai_agent.scheduler_service.asyncio.wait_for", fast_wait_for):
         asyncio.run(svc._run_monitored_chat_sync())
 
-    assert captured_results == [[]]
+    assert captured_errors == ["tdlib_timeout:5.0s"]
 
 
 def test_scheduler_registers_async_monitored_sync_job():

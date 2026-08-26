@@ -1,9 +1,18 @@
 package uz.tbsparcer.sms.ui.screens
 
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
+import androidx.compose.material.icons.automirrored.filled.List
+import androidx.compose.material.icons.filled.BarChart
+import androidx.compose.material.icons.filled.Sync
 import androidx.compose.material3.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
@@ -25,7 +34,12 @@ import java.util.Locale
 private val syncFmt = SimpleDateFormat("dd.MM HH:mm", Locale.US)
 
 @Composable
-fun DashboardScreen(vm: DashboardViewModel = hiltViewModel()) {
+fun DashboardScreen(
+    onOpenFeed: () -> Unit = {},
+    onOpenStats: () -> Unit = {},
+    onOpenReconcile: () -> Unit = {},
+    vm: DashboardViewModel = hiltViewModel(),
+) {
     val p = LocalTbs.current
     val ui by vm.ui.collectAsStateWithLifecycle()
     val money by vm.money.collectAsStateWithLifecycle()
@@ -77,6 +91,16 @@ fun DashboardScreen(vm: DashboardViewModel = hiltViewModel()) {
             StatCard("Расход", money.debitVolume ?: "—", modifier = Modifier.weight(1f))
             StatCard("Доход", money.creditVolume ?: "—", accent = true, modifier = Modifier.weight(1f))
         }
+        if (money.error != null && money.totalVolume == null) {
+            Text("Не удалось получить суммы с сервера.", fontFamily = SansGrotesk, fontSize = 12.sp, color = p.inkSecondary)
+        }
+
+        Spacer(Modifier.height(4.dp))
+        Text("РАЗДЕЛЫ", fontFamily = MonoJetBrains, fontSize = 11.sp,
+            letterSpacing = 1.2.sp, color = p.inkSecondary)
+        NavRow("Лента", "Поток входящих SMS", Icons.AutoMirrored.Filled.List, onOpenFeed)
+        NavRow("Статистика", "Суммы и разрезы с сервера", Icons.Filled.BarChart, onOpenStats)
+        NavRow("Сверка", "Сопоставление локальных и серверных записей", Icons.Filled.Sync, onOpenReconcile)
 
         Spacer(Modifier.height(4.dp))
         Button(
@@ -88,5 +112,26 @@ fun DashboardScreen(vm: DashboardViewModel = hiltViewModel()) {
             Text("Синхронизировать", fontFamily = SansGrotesk, fontWeight = FontWeight.Medium,
                 fontSize = 15.sp, modifier = Modifier.padding(vertical = 6.dp))
         }
+    }
+}
+
+@Composable
+private fun NavRow(title: String, subtitle: String, icon: ImageVector, onClick: () -> Unit) {
+    val p = LocalTbs.current
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .border(1.dp, p.border, MaterialTheme.shapes.medium)
+            .clickable(onClick = onClick)
+            .padding(horizontal = 14.dp, vertical = 14.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        Icon(icon, null, tint = p.ink)
+        Column(Modifier.weight(1f)) {
+            Text(title, fontFamily = SansGrotesk, fontWeight = FontWeight.Medium, fontSize = 15.sp, color = p.ink)
+            Text(subtitle, fontFamily = SansGrotesk, fontSize = 12.sp, color = p.inkSecondary)
+        }
+        Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, null, tint = p.inkSecondary)
     }
 }

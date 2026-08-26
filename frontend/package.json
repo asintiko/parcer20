@@ -1,6 +1,6 @@
 {
     "name": "tbsparcer",
-    "version": "1.4.17",
+    "version": "1.4.25",
     "description": "TBSparcer Desktop Application",
     "main": "electron/main.cjs",
     "author": "TBSparcer Team",
@@ -11,14 +11,16 @@
         "preview": "vite preview",
         "lint": "eslint . --ext ts,tsx --report-unused-disable-directives --max-warnings 0",
         "electron:dev": "npm run build && electron .",
-        "electron:build": "npm run build && electron-builder --win",
-        "electron:build:portable": "npm run build && electron-builder --win portable",
+        "electron:build": "npm run build && electron-builder --config electron/release-config.cjs --win",
+        "electron:build:portable": "npm run build && electron-builder --config electron/release-config.cjs --win portable",
         "electron:build:mac": "npm run build && electron-builder --mac",
         "electron:build:linux": "npm run build && electron-builder --linux",
-        "electron:publish": "npm run build && electron-builder --win --publish always",
-        "electron:publish:latest": "npm run electron:publish && node ./scripts/cleanup-github-releases.mjs"
+        "electron:publish": "npm run build && electron-builder --config electron/release-config.cjs --win --publish always",
+        "electron:publish:latest": "npm run electron:publish && node ./scripts/cleanup-github-releases.mjs",
+        "test:electron-security": "node --test electron/tests/*.test.cjs"
     },
     "build": {
+        "forceCodeSigning": false,
         "appId": "com.tbsparcer.app",
         "productName": "TBSparcer",
         "directories": {
@@ -43,8 +45,9 @@
             }
         ],
         "win": {
+            "verifyUpdateCodeSignature": false,
             "requestedExecutionLevel": "requireAdministrator",
-            "icon": "build/icons/app.ico",
+            "icon": "electron/assets/app.ico",
             "target": [
                 {
                     "target": "nsis",
@@ -65,11 +68,10 @@
             "perMachine": true,
             "allowToChangeInstallationDirectory": true,
             "allowElevation": true,
-            "installerIcon": "build/icons/app.ico",
-            "uninstallerIcon": "build/icons/app.ico",
-            "installerHeaderIcon": "build/icons/app.ico",
-            "artifactName": "${productName}-Setup-${version}.${ext}",
-            "include": "build/installer.nsh"
+            "installerIcon": "electron/assets/app.ico",
+            "uninstallerIcon": "electron/assets/app.ico",
+            "installerHeaderIcon": "electron/assets/app.ico",
+            "artifactName": "${productName}-Setup-${version}.${ext}"
         },
         "portable": {
             "artifactName": "${productName}-Portable-${version}.${ext}"
@@ -89,11 +91,13 @@
         "@emotion/styled": "^11.14.1",
         "@mui/material": "^7.3.7",
         "@mui/x-date-pickers": "^8.26.0",
+        "@tanstack/query-sync-storage-persister": "^5.101.0",
         "@tanstack/react-query": "^5.17.19",
+        "@tanstack/react-query-persist-client": "^5.101.0",
         "@tanstack/react-table": "^8.11.6",
         "@tanstack/react-virtual": "^3.13.18",
         "@types/react-window": "^1.8.8",
-        "axios": "^1.6.5",
+        "axios": "^1.18.1",
         "date-fns": "^3.1.0",
         "dayjs": "^1.11.19",
         "dexie": "^4.0.8",
@@ -105,12 +109,11 @@
         "react": "^18.2.0",
         "react-dom": "^18.2.0",
         "react-markdown": "^9.1.0",
-        "react-router-dom": "^7.10.1",
+        "react-router-dom": "^7.18.1",
         "react-window": "^2.2.5",
         "rehype-raw": "^7.0.0",
         "rehype-sanitize": "^6.0.0",
-        "remark-gfm": "^4.0.1",
-        "xlsx": "^0.18.5"
+        "remark-gfm": "^4.0.1"
     },
     "devDependencies": {
         "@types/react": "^18.2.48",

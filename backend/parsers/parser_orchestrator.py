@@ -1,6 +1,8 @@
 """Parser orchestrator - coordinates regex parsing and AI parsing with operator mapping."""
+import os
 import re
 import logging
+from datetime import datetime
 from typing import Dict, Any, Optional
 from sqlalchemy.orm import Session
 
@@ -33,12 +35,19 @@ class ParserOrchestrator:
             logger.warning("AI parser unavailable at init: %s", e)
             self.ai_parser = None
         self.operator_mapper = OperatorMapper(db_session) if db_session is not None else None
+        self.ai_application_mapping_enabled = str(
+            os.getenv("AI_APPLICATION_MAPPING_ENABLED", "false")
+        ).strip().lower() in {"1", "true", "yes", "on"}
         
         # Confidence threshold for accepting regex results
         self.confidence_threshold = 0.8
         self.last_rejection_reason: Optional[str] = None
     
-    def process(self, raw_text: str) -> Optional[Dict[str, Any]]:
+    def process(
+        self,
+        raw_text: str,
+        fallback_datetime: Optional[datetime] = None,
+    ) -> Optional[Dict[str, Any]]:
         """
         Process raw receipt text through parsing cascade
         
@@ -92,12 +101,23 @@ class ParserOrchestrator:
 
             if self.ai_parser and self.ai_parser.enabled:
                 try:
-                    parsed_data = self.ai_parser.parse(raw_text)
+                    if fallback_datetime is None:
+                        parsed_data = self.ai_parser.parse(raw_text)
+                    else:
+                        parsed_data = self.ai_parser.parse(
+                            raw_text,
+                            fallback_datetime=fallback_datetime,
+                        )
                     if parsed_data:
                         logger.info("AI parsing successful")
                     else:
                         logger.info("AI parsing returned no data")
-                        rejection_reasons.append("ai: returned None")
+                        ai_error_kind = getattr(self.ai_parser, "last_error_kind", None)
+                        rejection_reasons.append(
+                            "ai_transient: provider unavailable"
+                            if ai_error_kind == "transient"
+                            else f"ai: returned None ({ai_error_kind or 'unclassified'})"
+                        )
                 except Exception as e:
                     logger.warning("AI parsing error: %s", e)
                     rejection_reasons.append(f"ai_error: {e}")
@@ -137,7 +157,11 @@ class ParserOrchestrator:
                     )
                 else:
                     # No dictionary hit; try AI resolution if available
-                    if self.ai_parser and self.ai_parser.enabled:
+                    if (
+                        self.ai_application_mapping_enabled
+                        and self.ai_parser
+                        and self.ai_parser.enabled
+                    ):
                         known_apps = self.operator_mapper.get_existing_applications()
                         hints = self.operator_mapper.get_candidate_examples(operator_raw, limit=10)
                         ai = self.ai_parser.resolve_application(operator_raw, raw_text, known_apps, hints)
@@ -171,7 +195,7 @@ class ParserOrchestrator:
                     else:
                         parsed_data["application_mapped"] = None
                         parsed_data["app_resolution"] = {"method": "HEURISTIC"}
-                        logger.info("No operator mapping found and AI disabled: %s", operator_raw)
+                        logger.info("No deterministic operator mapping found: %s", operator_raw)
             except Exception as e:
                 logger.warning("Operator mapping error: %s", e)
                 if 'application_mapped' not in parsed_data:
@@ -187,12 +211,16 @@ class ParserOrchestrator:
 
         return parsed_data
 
-    def parse_text(self, text: str) -> Optional[Dict[str, Any]]:
+    def parse_text(
+        self,
+        text: str,
+        fallback_datetime: Optional[datetime] = None,
+    ) -> Optional[Dict[str, Any]]:
         """
         Thin wrapper for text-only ingestion paths (e.g. mobile SMS ingest).
         Keeps backward compatibility for existing process(...) callers.
         """
-        return self.process(text)
+        return self.process(text, fallback_datetime=fallback_datetime)
 
     def _post_validate_and_enrich(self, data: Dict[str, Any], raw_text: str) -> Dict[str, Any]:
         """Ensure required fields and normalize values."""
@@ -270,23 +298,31 @@ class ParserOrchestrator:
     def _extract_receiver_name(self, text: str) -> Optional[str]:
         """Extract receiver name from receipt text"""
         patterns = [
-            r'(?:Receiver\s+name|Имя\s+получателя|Получатель)\s*:?\s*([А-ЯЁA-Z][а-яёa-zA-Z\s\-\']+)',
-            r'(?:Receiver|RECEIVER)\s*:?\s*([А-ЯЁA-Z][а-яёa-zA-Z\s\-\']+)',
-            r'(?:На\s+имя|Кому)\s*:?\s*([А-ЯЁA-Z][а-яёa-zA-Z\s\-\']+)',
+            r'(?:Receiver\s+name|Имя\s+получателя)\s*:?\s*([^\r\n]+)',
+            r'(?:Получатель|Receiver)\s*:?\s*([^\r\n]+)',
+            r'(?:На\s+имя|Кому)\s*:?\s*([^\r\n]+)',
         ]
         for pattern in patterns:
             match = re.search(pattern, text, re.IGNORECASE | re.MULTILINE)
             if match:
-                name = match.group(1).strip()
-                # Filter out common false positives
-                if len(name) > 3 and not name.upper() in ['CARD', 'КАРТА', 'NUMBER', 'НОМЕР']:
+                name = re.sub(r"\s+", " ", match.group(1)).strip(" ,:;-")
+                # Card-only lines and numeric garbage are not person names.
+                letters = re.findall(r"[A-Za-zА-Яа-яЁё]", name)
+                digits = re.findall(r"\d", name)
+                if (
+                    len(name) > 3
+                    and len(letters) >= 2
+                    and len(digits) < 4
+                    and name.upper() not in {'CARD', 'КАРТА', 'NUMBER', 'НОМЕР'}
+                ):
                     return name[:255]  # Limit to DB column size
         return None
 
     def _extract_receiver_card(self, text: str) -> Optional[str]:
         """Extract receiver card last 4 digits from receipt text"""
         patterns = [
-            r'(?:Receiver\s+card|Receiver|Получатель|Карта\s+получателя)\s*:?\s*([^\n\r]+)',
+            r'(?:Receiver\s+card|Карта\s+получателя)\s*:?\s*([^\n\r]+)',
+            r'(?:Receiver|Получатель)\s*:?\s*([^\n\r]+)',
             r'(?:на\s+карту|to\s+card)\s*:?\s*([^\n\r]+)',
         ]
         for pattern in patterns:
@@ -294,8 +330,6 @@ class ParserOrchestrator:
             if match:
                 raw_value = match.group(1).strip()
                 digits = re.sub(r'\D', '', raw_value)
-                if digits:
+                if len(digits) >= 4:
                     return digits[-4:]
-                if raw_value:
-                    return raw_value[:4]
         return None

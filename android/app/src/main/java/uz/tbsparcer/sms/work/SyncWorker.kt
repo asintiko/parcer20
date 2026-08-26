@@ -18,6 +18,7 @@ class SyncWorker @AssistedInject constructor(
     private val settings: SettingsStore,
 ) : CoroutineWorker(ctx, params) {
     override suspend fun doWork(): Result {
+        if (!settings.monitoringEnabled) return Result.success()
         val result = when (repo.syncPending()) {
             is SyncOutcome.AuthError -> {
                 // Known-bad key won't self-heal; don't hammer the server. Surface it in the UI.

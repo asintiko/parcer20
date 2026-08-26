@@ -19,13 +19,12 @@ import '../styles/login.css';
 const routeByTab: Record<string, string> = {
     dashboard: '/',
     reference: '/reference',
-    automation: '/automation',
     userbot: '/userbot',
     logs: '/logs',
     admin: '/settings',
 };
 
-const orderedTabs = ['dashboard', 'reference', 'automation', 'userbot', 'logs', 'admin'];
+const orderedTabs = ['dashboard', 'reference', 'userbot', 'logs', 'admin'];
 
 const resolveFirstRoute = (tabs: string[], role: string): string => {
     if (role === 'admin') return '/';
@@ -42,8 +41,8 @@ export const LoginPage: React.FC = () => {
     const navigate = useNavigate();
     const { login, login2fa } = useAuth();
 
-    const [username, setUsername] = useState('admin');
-    const [password, setPassword] = useState('admin');
+    const [username, setUsername] = useState('');
+    const [password, setPassword] = useState('');
     const [showPassword, setShowPassword] = useState(false);
     const [remember, setRemember] = useState(true);
     const [twoFactorCode, setTwoFactorCode] = useState('');

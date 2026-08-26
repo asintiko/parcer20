@@ -1,4 +1,1 @@
 sdk.dir=/path/to/Android/sdk
-# Mobile ingest key for POST /api/sms/ingest. Get it from the backend operator.
-# This file (local.properties) is gitignored; never commit the real key.
-MOBILE_INGEST_KEY=put-key-here

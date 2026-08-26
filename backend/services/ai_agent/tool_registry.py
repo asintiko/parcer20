@@ -6,7 +6,15 @@ from sqlalchemy.orm import Session
 
 from config.ai_models import AI_AGENT_MUTATION_TOOLS_ENABLED
 from services.ai_agent.tools.analytics_tools import transaction_analytics
-from services.ai_agent.tools.automation_tools import app_mapping, bot_reconciliation, data_verification
+from services.ai_agent.tools.automation_tools import (
+    app_mapping,
+    apply_mapping_suggestions_tool,
+    apply_verification_suggestions_tool,
+    auto_parse_reconciliation_tool,
+    bot_reconciliation,
+    data_verification,
+    rollback_automation_tool,
+)
 from services.ai_agent.tools.cache_tools import (
     duplicate_merge_preview,
     failed_receipt_investigator,
@@ -39,9 +47,13 @@ ToolCallable = Callable[[Session, Dict[str, Any], Optional[dict], Dict[str, Any]
 
 TOOL_DESCRIPTIONS: Dict[str, str] = {
     "transaction_analytics": "Считает суммы расходов, поступлений и оборота за период с учетом текущих прав доступа.",
-    "app_mapping": "Запускает AI-анализ неразмеченных транзакций и создает mapping suggestions.",
-    "data_verification": "Запускает AI-проверку уже распарсенных транзакций и создает field-level corrections.",
-    "bot_reconciliation": "Сравнивает Telegram history из локальной БД с транзакциями и ищет пропуски/ошибки.",
+    "app_mapping": "AI-сопоставление неразмеченных операций с приложениями. Результат и автоприменённые уверенные предложения отдаёт прямо в чат (без перехода в раздел). Параметры: limit, currency, only_unmapped, min_confidence.",
+    "data_verification": "AI-проверка распарсенных транзакций на ошибки полей. Уверенные исправления применяет автоматически и отчитывается в чат. Параметры: limit, date_from, date_to, min_confidence.",
+    "bot_reconciliation": "Сверяет Telegram-историю из локальной БД с транзакциями, ищет пропуски/ошибки, отдаёт сводку в чат. Параметры: period_days или date_from/date_to, chat_ids, source, auto_parse.",
+    "apply_mapping_suggestions": "Применяет уверенные mapping-предложения задачи (порог min_confidence). Можно указать конкретные ids. Записывает прежнее значение для отката.",
+    "apply_verification_suggestions": "Применяет уверенные field-level исправления задачи (порог min_confidence). Можно указать ids. Хранит old-значение для отката.",
+    "auto_parse_reconciliation": "Ставит на повторный разбор пропущенные/ошибочные сообщения из завершённой сверки (MISSING_IN_DB/FAILED_PARSE).",
+    "rollback_automation": "Откатывает применённые агентом изменения: маппинг → в прежнее значение, верификацию → в old. Параметры: task_id (опц.), scope=all|mapping|verification.",
     "table_search_and_navigate": "Находит транзакцию и возвращает navigation target для UI таблицы.",
     "db_inspector": "Дает агрегированный быстрый срез по БД и проблемным очередям.",
     "duplicate_detector": "Возвращает текущие pending duplicate suggestions.",
@@ -69,6 +81,10 @@ TOOLS: Dict[str, ToolCallable] = {
     "app_mapping": app_mapping,
     "data_verification": data_verification,
     "bot_reconciliation": bot_reconciliation,
+    "apply_mapping_suggestions": apply_mapping_suggestions_tool,
+    "apply_verification_suggestions": apply_verification_suggestions_tool,
+    "auto_parse_reconciliation": auto_parse_reconciliation_tool,
+    "rollback_automation": rollback_automation_tool,
     "table_search_and_navigate": table_search_and_navigate,
     "db_inspector": db_inspector,
     "duplicate_detector": duplicate_detector,
@@ -118,12 +134,19 @@ try:
         chat_vs_db_reconcile,
         find_duplicate_transactions,
         find_orphan_transactions,
+        verify_receipt_parse,
         weekly_health_check,
         weekly_report_autofix,
     )
     from services.ai_agent.tools.routine_tools import (
         create_routine_tool,
         list_routines_tool,
+    )
+    from services.ai_agent.tools.description_tools import (
+        auto_describe_operators,
+        list_operator_descriptions,
+        rollback_operator_descriptions,
+        set_operator_description,
     )
 
     TOOLS.update(
@@ -142,11 +165,16 @@ try:
             "group_by_dimension": group_by_dimension,
             "find_duplicate_transactions": find_duplicate_transactions,
             "find_orphan_transactions": find_orphan_transactions,
+            "verify_receipt_parse": verify_receipt_parse,
             "chat_vs_db_reconcile": chat_vs_db_reconcile,
             "weekly_health_check": weekly_health_check,
             "weekly_report_autofix": weekly_report_autofix,
             "create_routine": create_routine_tool,
             "list_routines": list_routines_tool,
+            "auto_describe_operators": auto_describe_operators,
+            "set_operator_description": set_operator_description,
+            "list_operator_descriptions": list_operator_descriptions,
+            "rollback_operator_descriptions": rollback_operator_descriptions,
         }
     )
     TOOL_DESCRIPTIONS.update(
@@ -165,11 +193,16 @@ try:
             "group_by_dimension": "Группировка",
             "find_duplicate_transactions": "Найти дубликаты",
             "find_orphan_transactions": "Без маппинга",
+            "verify_receipt_parse": "Сверить распознавание чека",
             "chat_vs_db_reconcile": "Сверка чата с БД",
             "weekly_health_check": "Недельный health-check",
             "weekly_report_autofix": "Авто-исправление",
             "create_routine": "Создать рутину (плановую задачу): извлеки название, расписание (cron 'мин час день месяц день_недели' в Asia/Tashkent), тип (reconcile=сверка/summary=сводка/custom) и текст задачи из фразы пользователя. Пример: 'каждый понедельник в 12 делай сверку' → cron '0 12 * * 1', kind 'reconcile'.",
             "list_routines": "Показать список настроенных рутин.",
+            "auto_describe_operators": "Просмотреть операторов транзакций, найти каждого в интернете и автоматически вписать короткое описание (5-8 слов). Запись без подтверждения. Используй на фразы 'добавь описания операторам / найди что за продавцы / опиши операции'.",
+            "set_operator_description": "Вписать описание конкретному оператору напрямую (operator_raw + text). Запись без подтверждения.",
+            "list_operator_descriptions": "Показать сохранённые описания операторов (оператор → текст + источник).",
+            "rollback_operator_descriptions": "Откатить агентские описания: все (all_agent=true или пусто) либо по списку operators. Удаляет только source=agent.",
         }
     )
 except Exception as _exc:  # noqa: BLE001

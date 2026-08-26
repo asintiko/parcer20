@@ -322,6 +322,30 @@ async def post_agent_message(
     }
 
 
+def _read_stream_snapshot(
+    thread_id: UUID,
+) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Synchronous DB read for the SSE loop, run via asyncio.to_thread.
+
+    Opening a session and issuing the per-tick queries blocks the event loop
+    if done inline; on a single uvicorn worker several listeners would stall
+    the whole process. Keep all blocking ORM work here.
+    """
+    with SessionLocal() as session:
+        messages = list_messages(session, thread_id=thread_id, limit=500)
+        runs = (
+            session.query(AgentRun)
+            .filter(AgentRun.thread_id == thread_id)
+            .order_by(AgentRun.updated_at.desc())
+            .limit(20)
+            .all()
+        )
+        runs_serialized = [serialize_run(row) for row in runs]
+        run_ids = [row.id for row in runs]
+        run_events = list(list_run_events(session, run_ids=run_ids))
+    return messages, runs_serialized, run_events
+
+
 @router.get("/stream/{thread_id}")
 async def stream_agent_thread(
     thread_id: UUID,
@@ -338,38 +362,36 @@ async def stream_agent_thread(
         seen_message_ids: set[str] = set()
         seen_run_keys: set[str] = set()
         seen_run_event_ids: set[str] = set()
+        idle_sleep = 1.0
         while True:
             if await request.is_disconnected():
                 break
-            with SessionLocal() as session:
-                messages = list_messages(session, thread_id=thread_id, limit=500)
-                for message in messages:
-                    if message["id"] in seen_message_ids:
-                        continue
-                    seen_message_ids.add(message["id"])
-                    yield f"event: message\ndata: {json.dumps(message, ensure_ascii=False)}\n\n"
-                runs = (
-                    session.query(AgentRun)
-                    .filter(AgentRun.thread_id == thread_id)
-                    .order_by(AgentRun.updated_at.desc())
-                    .limit(20)
-                    .all()
-                )
-                for row in runs:
-                    serialized = serialize_run(row)
-                    cache_key = f"{serialized['id']}:{serialized['status']}:{serialized['updated_at']}"
-                    if cache_key in seen_run_keys:
-                        continue
-                    seen_run_keys.add(cache_key)
-                    yield f"event: run\ndata: {json.dumps(serialized, ensure_ascii=False)}\n\n"
-                run_ids = [row.id for row in runs]
-                for event in list_run_events(session, run_ids=run_ids):
-                    if event["id"] in seen_run_event_ids:
-                        continue
-                    seen_run_event_ids.add(event["id"])
-                    yield f"event: run_event\ndata: {json.dumps(event, ensure_ascii=False)}\n\n"
+            messages, runs_serialized, run_events = await asyncio.to_thread(
+                _read_stream_snapshot, thread_id
+            )
+            had_new = False
+            for message in messages:
+                if message["id"] in seen_message_ids:
+                    continue
+                seen_message_ids.add(message["id"])
+                had_new = True
+                yield f"event: message\ndata: {json.dumps(message, ensure_ascii=False)}\n\n"
+            for serialized in runs_serialized:
+                cache_key = f"{serialized['id']}:{serialized['status']}:{serialized['updated_at']}"
+                if cache_key in seen_run_keys:
+                    continue
+                seen_run_keys.add(cache_key)
+                had_new = True
+                yield f"event: run\ndata: {json.dumps(serialized, ensure_ascii=False)}\n\n"
+            for event in run_events:
+                if event["id"] in seen_run_event_ids:
+                    continue
+                seen_run_event_ids.add(event["id"])
+                had_new = True
+                yield f"event: run_event\ndata: {json.dumps(event, ensure_ascii=False)}\n\n"
             yield "event: heartbeat\ndata: {}\n\n"
-            await asyncio.sleep(1.0)
+            idle_sleep = 1.0 if had_new else min(2.0, idle_sleep + 0.5)
+            await asyncio.sleep(idle_sleep)
 
     return StreamingResponse(
         event_generator(),

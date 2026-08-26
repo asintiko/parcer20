@@ -8,14 +8,17 @@ import dagger.assisted.Assisted
 import dagger.assisted.AssistedInject
 import uz.tbsparcer.sms.data.repo.SmsRepository
 import uz.tbsparcer.sms.data.repo.SyncOutcome
+import uz.tbsparcer.sms.data.local.SettingsStore
 
 @HiltWorker
 class ReconcileWorker @AssistedInject constructor(
     @Assisted ctx: Context,
     @Assisted params: WorkerParameters,
     private val repo: SmsRepository,
+    private val settings: SettingsStore,
 ) : CoroutineWorker(ctx, params) {
     override suspend fun doWork(): Result {
+        if (!settings.monitoringEnabled) return Result.success()
         val from = inputData.getLong(KEY_FROM, 0L)
         val to = inputData.getLong(KEY_TO, Long.MAX_VALUE)
         return when (repo.reconcile(from, to)) {

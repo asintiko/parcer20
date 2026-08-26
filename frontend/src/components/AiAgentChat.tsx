@@ -1,10 +1,18 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { motion, AnimatePresence, type Variants } from 'motion/react';
-import { ChevronRight, Send, SlashSquare } from 'lucide-react';
+import { ChevronRight, Globe, Send, SlashSquare } from 'lucide-react';
 import type { AgentLocateResult, AgentMessage, AgentRun, AgentRunEvent } from '../services/api';
 import { AiAgentMessage } from './AiAgentMessage';
 import { AiAgentCommandPalette } from './AiAgentCommandPalette';
-import { formatRunEventLabel, formatRunStatus, formatRunStep, formatToolLabel } from '../utils/aiAgentDisplay';
+import {
+    formatRunEventLabel,
+    formatRunStatus,
+    formatRunStep,
+    formatToolLabel,
+    formatToolPurpose,
+    formatWebSearchLabel,
+    isWebSearchPayload,
+} from '../utils/aiAgentDisplay';
 
 const emptyContainerVariants: Variants = {
     hidden: { opacity: 0 },
@@ -123,6 +131,7 @@ export const AiAgentChat: React.FC<AiAgentChatProps> = ({
     const [draft, setDraft] = useState('');
     const [timelineOpen, setTimelineOpen] = useState(false);
     const [paletteOpen, setPaletteOpen] = useState(false);
+    const [, setElapsedTick] = useState(0);
     const scrollContainerRef = useRef<HTMLDivElement | null>(null);
     const textareaRef = useRef<HTMLTextAreaElement | null>(null);
 
@@ -144,16 +153,33 @@ export const AiAgentChat: React.FC<AiAgentChatProps> = ({
     const isAwaiting = latestRun?.status === 'awaiting_confirmation';
     const showTimeline = isRunning || isAwaiting;
 
+    useEffect(() => {
+        if (!isRunning) return;
+        const id = window.setInterval(() => setElapsedTick((tick) => tick + 1), 1000);
+        return () => window.clearInterval(id);
+    }, [isRunning]);
+
+    const activeToolName = latestRun?.progress?.tool_name || latestRun?.tool_name || null;
+
     const progressLabel = useMemo(() => {
         if (sendPending) return 'Отправляю запрос…';
         if (!latestRun) return '';
         if (isAwaiting) return 'Ждёт подтверждения';
-        return formatRunStep(String(latestRun?.progress?.step || ''), latestRun?.tool_name);
-    }, [isAwaiting, latestRun, sendPending]);
+        return formatRunStep(String(latestRun?.progress?.step || ''), activeToolName);
+    }, [activeToolName, isAwaiting, latestRun, sendPending]);
+
+    const toolLabel = activeToolName ? formatToolLabel(activeToolName) : '';
+    const toolPurpose = formatToolPurpose(activeToolName);
 
     const totalSteps = Number(latestRun?.progress?.total ?? 0);
     const currentStep = Number(latestRun?.progress?.current ?? 0);
-    const progressPct = totalSteps > 0 ? Math.min(100, Math.round((currentStep / totalSteps) * 100)) : isRunning ? 35 : 100;
+    const isFinished =
+        latestRun?.status === 'completed' || latestRun?.status === 'failed' || latestRun?.status === 'cancelled';
+    const hasStepCounts = totalSteps > 0;
+    // Real percent when backend reports step counts; otherwise the bar runs indeterminate
+    // while the run is in flight, and snaps to full once it finishes.
+    const progressPct = hasStepCounts ? Math.min(100, Math.round((currentStep / totalSteps) * 100)) : isFinished ? 100 : 0;
+    const indeterminate = !hasStepCounts && !isFinished && (isRunning || isAwaiting);
 
     useEffect(() => {
         const node = scrollContainerRef.current;
@@ -312,22 +338,33 @@ export const AiAgentChat: React.FC<AiAgentChatProps> = ({
                             <ChevronRight size={14} className="agent-timeline-chevron" />
                             <span className="agent-timeline-eyebrow">Выполнение</span>
                             <span className="agent-timeline-step">
-                                {progressLabel ||
-                                    formatRunStatus(latestRun?.status) ||
-                                    formatToolLabel(latestRun?.tool_name)}
+                                <span className="agent-timeline-step-main">
+                                    {progressLabel ||
+                                        formatRunStatus(latestRun?.status) ||
+                                        formatToolLabel(latestRun?.tool_name)}
+                                </span>
+                                {activeToolName && (toolPurpose || toolLabel) ? (
+                                    <span className="agent-timeline-step-sub">
+                                        {toolLabel}
+                                        {toolPurpose ? ` — ${toolPurpose}` : ''}
+                                    </span>
+                                ) : null}
                             </span>
-                            {totalSteps > 0 ? (
+                            {hasStepCounts ? (
                                 <span
                                     className="agent-timeline-elapsed"
                                     aria-label={`Шаг ${currentStep} из ${totalSteps}`}
                                 >
-                                    {currentStep}/{totalSteps}
+                                    Шаг {currentStep}/{totalSteps}
                                 </span>
                             ) : null}
-                            <div className="agent-timeline-progress" aria-hidden>
+                            <div
+                                className={`agent-timeline-progress${indeterminate ? ' is-indeterminate' : ''}`}
+                                aria-hidden
+                            >
                                 <div
                                     className="agent-timeline-progress-fill"
-                                    style={{ width: `${progressPct}%` }}
+                                    style={indeterminate ? undefined : { width: `${progressPct}%` }}
                                 />
                             </div>
                             <span className="agent-timeline-elapsed">
@@ -358,6 +395,62 @@ export const AiAgentChat: React.FC<AiAgentChatProps> = ({
                                                 : isLast && isRunning
                                                 ? 'is-active'
                                                 : 'is-done';
+                                        const time = evt.created_at
+                                            ? new Date(evt.created_at).toLocaleTimeString('ru-RU', {
+                                                  hour: '2-digit',
+                                                  minute: '2-digit',
+                                                  second: '2-digit',
+                                              })
+                                            : '';
+                                        if (isWebSearchPayload(evt.payload, evt.label)) {
+                                            const operator =
+                                                String(
+                                                    evt.payload?.operator ||
+                                                        evt.payload?.query ||
+                                                        evt.payload?.term ||
+                                                        '',
+                                                ).trim() ||
+                                                formatWebSearchLabel(evt.payload).replace(/^🌐\s*/, '');
+                                            const current = Number(evt.payload?.current ?? 0);
+                                            const total = Number(evt.payload?.total ?? 0);
+                                            const active = isLast && isRunning && status !== 'is-failed';
+                                            return (
+                                                <div
+                                                    key={evt.id || `${evt.event_type}-${i}`}
+                                                    className={`agent-timeline-event agent-web-read ${
+                                                        active ? 'is-active' : status
+                                                    }`}
+                                                >
+                                                    <span className="agent-timeline-event-time">{time}</span>
+                                                    <span className="agent-web-read-line">
+                                                        <Globe
+                                                            size={13}
+                                                            className="agent-web-read-icon"
+                                                            aria-hidden
+                                                        />
+                                                        <span className="agent-web-read-text">
+                                                            Читаю в интернете:{' '}
+                                                            <span className="agent-web-read-operator">
+                                                                {operator}
+                                                            </span>
+                                                        </span>
+                                                        {total > 0 ? (
+                                                            <span className="agent-web-read-count">
+                                                                {current}/{total}
+                                                            </span>
+                                                        ) : null}
+                                                        {active ? (
+                                                            <span
+                                                                className="agent-web-read-bar"
+                                                                aria-hidden
+                                                            >
+                                                                <span className="agent-web-read-bar-fill" />
+                                                            </span>
+                                                        ) : null}
+                                                    </span>
+                                                </div>
+                                            );
+                                        }
                                         return (
                                             <div
                                                 key={evt.id || `${evt.event_type}-${i}`}
@@ -366,23 +459,13 @@ export const AiAgentChat: React.FC<AiAgentChatProps> = ({
                                                 <span
                                                     className={`agent-timeline-event-dot ${status}`}
                                                 />
-                                                <span className="agent-timeline-event-time">
-                                                    {evt.created_at
-                                                        ? new Date(evt.created_at).toLocaleTimeString(
-                                                              'ru-RU',
-                                                              {
-                                                                  hour: '2-digit',
-                                                                  minute: '2-digit',
-                                                                  second: '2-digit',
-                                                              },
-                                                          )
-                                                        : ''}
-                                                </span>
+                                                <span className="agent-timeline-event-time">{time}</span>
                                                 <span className="agent-timeline-event-text">
                                                     {formatRunEventLabel(
                                                         evt.event_type,
                                                         evt.label,
                                                         latestRun?.tool_name,
+                                                        evt.payload,
                                                     )}
                                                 </span>
                                             </div>

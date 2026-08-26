@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from datetime import date, datetime
 from decimal import Decimal
-from typing import Any, Dict, Literal, Optional, Type
+from typing import Any, Dict, List, Literal, Optional, Type
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -147,6 +147,12 @@ class FindOrphanTransactionsArgs(BaseModel):
     limit: int = Field(default=100, ge=1, le=1000)
 
 
+class VerifyReceiptParseArgs(BaseModel):
+    transaction_id: int = Field(
+        ..., description="ID транзакции, у которой нужно сверить распознанные поля с исходным текстом чека."
+    )
+
+
 class ChatVsDbReconcileArgs(BaseModel):
     chat_id: int
     date_from: Optional[datetime] = None
@@ -161,6 +167,66 @@ class WeeklyHealthCheckArgs(BaseModel):
 class WeeklyReportAutofixArgs(BaseModel):
     date_from: Optional[datetime] = None
     date_to: Optional[datetime] = None
+
+
+# --------------------------------------------------------------------------- #
+# Automation tools (analyze + auto-apply + rollback)
+# --------------------------------------------------------------------------- #
+class AppMappingArgs(BaseModel):
+    limit: int = Field(default=100, ge=1, le=200, description="Сколько операций взять в анализ.")
+    currency: Optional[Literal["UZS", "USD", "EUR", "RUB"]] = Field(
+        default=None, description="Ограничить анализ одной валютой."
+    )
+    only_unmapped: bool = Field(default=True, description="Только операции без приложения.")
+    min_confidence: float = Field(
+        default=0.85, ge=0.0, le=1.0,
+        description="Порог авто-применения: предложения с уверенностью >= порога применяются сразу.",
+    )
+
+
+class DataVerificationArgs(BaseModel):
+    limit: int = Field(default=50, ge=1, le=200, description="Сколько транзакций проверить.")
+    date_from: Optional[datetime] = None
+    date_to: Optional[datetime] = None
+    min_confidence: float = Field(
+        default=0.85, ge=0.0, le=1.0,
+        description="Порог авто-применения уверенных исправлений.",
+    )
+
+
+class BotReconciliationArgs(BaseModel):
+    period_days: int = Field(default=7, ge=1, le=180, description="Период сверки в днях, если не заданы date_from/date_to.")
+    date_from: Optional[datetime] = None
+    date_to: Optional[datetime] = None
+    chat_ids: Optional[List[int]] = Field(default=None, description="Конкретные monitored chat id; пусто — все доступные.")
+    source: Literal["local", "tdlib"] = "local"
+    auto_parse: bool = Field(default=False, description="Сразу поставить пропущенные/ошибочные на повторный разбор.")
+
+
+class ApplyMappingSuggestionsArgs(BaseModel):
+    task_id: Optional[str] = Field(default=None, description="Задача сопоставления; пусто — все pending предложения.")
+    min_confidence: float = Field(default=0.85, ge=0.0, le=1.0)
+    ids: Optional[List[str]] = Field(default=None, description="Конкретные suggestion id (игнорируют порог).")
+
+
+class ApplyVerificationSuggestionsArgs(BaseModel):
+    task_id: Optional[str] = Field(default=None, description="Задача проверки; пусто — все pending исправления.")
+    min_confidence: float = Field(default=0.85, ge=0.0, le=1.0)
+    ids: Optional[List[str]] = Field(default=None, description="Конкретные suggestion id (игнорируют порог).")
+
+
+class AutoParseReconciliationArgs(BaseModel):
+    task_id: str = Field(..., description="ID завершённой задачи сверки.")
+    category: Optional[Literal["MISSING_IN_DB", "FAILED_PARSE"]] = Field(
+        default=None, description="Что разбирать; пусто — обе категории."
+    )
+
+
+class RollbackAutomationArgs(BaseModel):
+    task_id: Optional[str] = Field(default=None, description="Откатить только изменения этой задачи; пусто — все агентские.")
+    scope: Literal["all", "mapping", "verification"] = Field(
+        default="all", description="Область отката: всё / только маппинг / только верификация.",
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -184,7 +250,46 @@ class ListRoutinesArgs(BaseModel):
     pass
 
 
+class AutoDescribeOperatorsArgs(BaseModel):
+    limit: int = Field(
+        default=20, ge=1, le=50,
+        description="Сколько операторов описать за один проход (кап 50).",
+    )
+    only_missing: bool = Field(
+        default=True,
+        description="True — описывать только операторов без описания; False — переописать все.",
+    )
+
+
+class SetOperatorDescriptionArgs(BaseModel):
+    operator_raw: str = Field(..., max_length=500, description="Оператор, как в транзакции, напр. 'Korzinka Market'.")
+    text: str = Field(..., max_length=120, description="Короткое описание (5-8 слов), напр. 'Сеть продуктовых супермаркетов'.")
+
+
+class ListOperatorDescriptionsArgs(BaseModel):
+    limit: int = Field(default=50, ge=1, le=200, description="Сколько описаний показать (кап 200).")
+
+
+class RollbackOperatorDescriptionsArgs(BaseModel):
+    operators: Optional[List[str]] = Field(
+        default=None,
+        description="Список операторов для отката. Пусто + all_agent → удалить все агентские.",
+    )
+    all_agent: bool = Field(
+        default=False,
+        description="True — удалить ВСЕ описания, добавленные агентом.",
+    )
+
+
 ARGS_MODELS_V5: Dict[str, Type[BaseModel]] = {
+    # automation
+    "app_mapping": AppMappingArgs,
+    "data_verification": DataVerificationArgs,
+    "bot_reconciliation": BotReconciliationArgs,
+    "apply_mapping_suggestions": ApplyMappingSuggestionsArgs,
+    "apply_verification_suggestions": ApplyVerificationSuggestionsArgs,
+    "auto_parse_reconciliation": AutoParseReconciliationArgs,
+    "rollback_automation": RollbackAutomationArgs,
     # ui_action
     "apply_filters_with_cursor": ApplyFiltersWithCursorArgs,
     "mark_transaction_rows": MarkTransactionRowsArgs,
@@ -202,16 +307,56 @@ ARGS_MODELS_V5: Dict[str, Type[BaseModel]] = {
     # audit
     "find_duplicate_transactions": FindDuplicateTransactionsArgs,
     "find_orphan_transactions": FindOrphanTransactionsArgs,
+    "verify_receipt_parse": VerifyReceiptParseArgs,
     "chat_vs_db_reconcile": ChatVsDbReconcileArgs,
     "weekly_health_check": WeeklyHealthCheckArgs,
     "weekly_report_autofix": WeeklyReportAutofixArgs,
     # routines
     "create_routine": CreateRoutineArgs,
     "list_routines": ListRoutinesArgs,
+    # descriptions
+    "auto_describe_operators": AutoDescribeOperatorsArgs,
+    "set_operator_description": SetOperatorDescriptionArgs,
+    "list_operator_descriptions": ListOperatorDescriptionsArgs,
+    "rollback_operator_descriptions": RollbackOperatorDescriptionsArgs,
 }
 
 
 TOOL_DESCRIPTIONS_V5: Dict[str, str] = {
+    # automation
+    "app_mapping": (
+        "AI-сопоставление неразмеченных операций с приложениями. Прогресс идёт живыми шагами "
+        "в чат, по завершении уверенные предложения (>= min_confidence, по умолчанию 0.85) "
+        "применяются автоматически, слабые показываются списком. Параметры: limit, currency, "
+        "only_unmapped, min_confidence. Используй на 'сопоставь приложения / размечай операторов'."
+    ),
+    "data_verification": (
+        "AI-проверка распарсенных транзакций на ошибки полей (сумма, дата, оператор и т.д.). "
+        "Уверенные исправления применяет сразу, слабые — на проверку. Параметры: limit, "
+        "date_from, date_to, min_confidence. Используй на 'проверь данные / найди ошибки в полях'."
+    ),
+    "bot_reconciliation": (
+        "Сверяет Telegram-историю из локальной БД с транзакциями: совпадения, пропуски, ошибки "
+        "разбора. Результат сводкой в чат. Параметры: period_days или date_from/date_to, chat_ids, "
+        "source, auto_parse. Используй на 'сверь чеки / что не попало в базу'."
+    ),
+    "apply_mapping_suggestions": (
+        "Применяет уверенные mapping-предложения (порог min_confidence). task_id — конкретная задача "
+        "или пусто (все pending). ids — точечный список. Прежнее значение сохраняется для отката."
+    ),
+    "apply_verification_suggestions": (
+        "Применяет уверенные field-level исправления (порог min_confidence). task_id/ids опциональны. "
+        "Хранит old-значение для отката."
+    ),
+    "auto_parse_reconciliation": (
+        "Ставит пропущенные/ошибочные сообщения завершённой сверки (MISSING_IN_DB/FAILED_PARSE) на "
+        "повторный разбор. Нужен task_id завершённой сверки."
+    ),
+    "rollback_automation": (
+        "Откатывает применённые агентом изменения. scope=all|mapping|verification; task_id опционален. "
+        "Маппинг → прежнее значение, верификация → old. Где old не сохранён — честно сообщает, что "
+        "откатить нельзя. Используй на 'откати / верни как было'."
+    ),
     # ui_action
     "apply_filters_with_cursor": (
         "Применяет фильтры к таблице транзакций и инициирует анимацию агентского "
@@ -267,6 +412,13 @@ TOOL_DESCRIPTIONS_V5: Dict[str, str] = {
     "find_orphan_transactions": (
         "Находит транзакции без оператора или без application mapping."
     ),
+    "verify_receipt_parse": (
+        "Сверяет распознанные поля одной транзакции с исходным текстом чека. "
+        "Берёт сохранённый текст (raw_message или сообщение из кэша), повторно "
+        "разбирает его regex-каскадом (без AI/OCR) и сравнивает amount, дату, "
+        "оператора, application, карту и тип. Используй когда просят 'проверь что "
+        "транзакцию N разобрали верно / вдруг что не так с чеком N'. Только чтение."
+    ),
     "chat_vs_db_reconcile": (
         "Сверяет один monitored chat с БД: cached vs receipt_processing_tasks vs "
         "transactions. Возвращает список проблем."
@@ -287,4 +439,26 @@ TOOL_DESCRIPTIONS_V5: Dict[str, str] = {
         "транзакций' → name='Еженедельная сверка', cron='0 12 * * 1', kind='reconcile'."
     ),
     "list_routines": "Показывает список настроенных рутин.",
+    # descriptions
+    "auto_describe_operators": (
+        "Просматривает операторов транзакций, по каждому ищет в интернете, что это за "
+        "продавец/сервис, и АВТОМАТИЧЕСКИ (без подтверждения) вписывает короткое описание "
+        "в 5-8 слов. По умолчанию берёт только операторов без описания. Используй на фразы "
+        "'добавь описания операциям / найди что за продавцы / опиши операторов'. Параметры: "
+        "limit (по умолчанию 20, максимум 50), only_missing (по умолчанию true). "
+        "Пример: 'опиши 30 операторов' → limit=30."
+    ),
+    "set_operator_description": (
+        "Вписывает описание одному оператору напрямую (operator_raw + text), без подтверждения. "
+        "Пример: operator_raw='Korzinka Market', text='Сеть продуктовых супермаркетов'."
+    ),
+    "list_operator_descriptions": (
+        "Показывает сохранённые описания операторов (оператор → текст + источник manual/agent). "
+        "Параметр limit (по умолчанию 50, максимум 200)."
+    ),
+    "rollback_operator_descriptions": (
+        "Откатывает описания, добавленные агентом. all_agent=true (или пустой список) — удалить "
+        "все агентские; operators=[...] — удалить только перечисленных. Manual-описания не трогает. "
+        "Пример: 'удали все описания что ты добавил' → all_agent=true."
+    ),
 }

@@ -1,11 +1,11 @@
-import React, { memo } from 'react';
+import React, { memo, useEffect, useState } from 'react';
 import {
     Loader2,
     AlertCircle,
     CheckCircle2,
     XCircle,
 } from 'lucide-react';
-import { TelegramChatMessage, TelegramProcessResult, API_BASE_URL } from '../services/api';
+import { telegramClientApi, TelegramChatMessage, TelegramProcessResult } from '../services/api';
 
 interface MessageItemProps {
     message: TelegramChatMessage;
@@ -46,11 +46,29 @@ export const MessageItem = memo<MessageItemProps>(({
     const msgId = message.id as number;
     const doc = message.document;
     const isPdf = doc?.mime_type?.toLowerCase().includes('pdf');
-    const downloadUrl = doc?.download_url
-        ? `${API_BASE_URL}${doc.download_url}`
-        : doc?.file_id
-            ? `${API_BASE_URL}/api/tg/files/${doc.file_id}`
-            : null;
+    const ownerChatId = currentChatId ?? message.chat_id ?? null;
+    const [downloadUrl, setDownloadUrl] = useState<string | null>(null);
+    useEffect(() => {
+        if (!ownerChatId || !msgId || !doc?.file_id) {
+            setDownloadUrl(null);
+            return;
+        }
+        let disposed = false;
+        let objectUrl: string | null = null;
+        void telegramClientApi.downloadOwnedFile(ownerChatId, msgId, doc.file_id, doc.file_name)
+            .then((blob) => {
+                if (disposed) return;
+                objectUrl = URL.createObjectURL(blob);
+                setDownloadUrl(objectUrl);
+            })
+            .catch(() => {
+                if (!disposed) setDownloadUrl(null);
+            });
+        return () => {
+            disposed = true;
+            if (objectUrl) URL.revokeObjectURL(objectUrl);
+        };
+    }, [doc?.file_id, doc?.file_name, msgId, ownerChatId]);
     const sizeLabel = (() => {
         if (doc?.size === undefined) return '';
         const kb = doc.size / 1024;

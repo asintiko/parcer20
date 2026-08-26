@@ -8,7 +8,6 @@ import logging
 from telethon import TelegramClient, events
 from telethon.errors import FloodWaitError, SessionPasswordNeededError
 from dotenv import load_dotenv
-import json
 from datetime import datetime
 from workers.celery_worker import queue_receipt_task
 from core.logging_config import setup_logging
@@ -82,7 +81,11 @@ async def start_userbot():
                 'source_chat_id': chat_id,
                 'source_message_id': msg_id,
                 'sender_id': sender_id,
-                'timestamp': datetime.now().isoformat(),
+                'source_received_at': (
+                    event.message.date.isoformat()
+                    if event.message.date
+                    else datetime.now().isoformat()
+                ),
                 'added_via': 'userbot'
             }
             

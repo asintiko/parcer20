@@ -2,9 +2,10 @@ import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import { ChevronDown, MessageSquare } from 'lucide-react';
 import { MessageBubble } from './MessageBubble';
-import type { TelegramChatMessage } from '../../services/api';
+import type { TelegramChatMessage, TgKeyboardButton } from '../../services/api';
 
 interface MessageStreamProps {
+    chatId: number;
     messages: TelegramChatMessage[];
     isLoading?: boolean;
     selectionMode?: boolean;
@@ -12,6 +13,8 @@ interface MessageStreamProps {
     onToggleSelect?: (id: number) => void;
     onProcess?: (message: TelegramChatMessage) => void;
     onMessageContextMenu?: (e: React.MouseEvent, message: TelegramChatMessage) => void;
+    onOpenWebApp?: (message: TelegramChatMessage, btn: TgKeyboardButton) => void;
+    onOpenLink?: (url: string) => void;
     processingIds?: Set<number>;
     processedIds?: Set<number>;
     failedIds?: Set<number>;
@@ -48,6 +51,7 @@ const sameDay = (a?: string | null, b?: string | null): boolean => {
 };
 
 export const MessageStream: React.FC<MessageStreamProps> = ({
+    chatId,
     messages,
     isLoading,
     selectionMode,
@@ -55,6 +59,8 @@ export const MessageStream: React.FC<MessageStreamProps> = ({
     onToggleSelect,
     onProcess,
     onMessageContextMenu,
+    onOpenWebApp,
+    onOpenLink,
     processingIds,
     processedIds,
     failedIds,
@@ -175,12 +181,15 @@ export const MessageStream: React.FC<MessageStreamProps> = ({
                                 <div className="tg-date-divider tg-date-divider-sticky">{dateLabel(m.date)}</div>
                             ) : null}
                             <MessageBubble
+                                chatId={chatId}
                                 message={m}
                                 selectionMode={selectionMode}
                                 selected={id ? selectedIds?.has(id) : false}
                                 onToggleSelect={onToggleSelect}
                                 onProcess={onProcess}
                                 onContextMenu={onMessageContextMenu}
+                                onOpenWebApp={onOpenWebApp}
+                                onOpenLink={onOpenLink}
                                 processing={id ? processingIds?.has(id) : false}
                                 processed={id ? processedIds?.has(id) : false}
                                 failed={id ? failedIds?.has(id) : false}

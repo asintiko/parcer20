@@ -43,11 +43,10 @@ const getLocalApiOverride = () => {
 
 type ElectronSystemAccessStatus = {
     ok: boolean;
-    path?: string;
     source?: string;
     error?: string | null;
-    token?: string | null;
     apiBaseUrl?: string | null;
+    token?: string | null;
 };
 
 const getElectronSystemAccessApi = () => {
@@ -74,7 +73,6 @@ export const loadElectronSystemAccessStatus = async (force = false): Promise<Ele
             .catch((err: any) => ({
                 ok: false,
                 error: err?.message || String(err),
-                token: null,
                 apiBaseUrl: null,
             }));
     }
@@ -138,9 +136,27 @@ const SCOPE_TOKEN_EXPIRES_KEY = 'access_scope_token_expires_at';
 const AUTH_TOKEN_KEY = 'auth_token';
 const LEGACY_AUTH_TOKEN_KEY = 'token';
 const REFRESH_TOKEN_KEY = 'auth_refresh_token';
+const LEGACY_REFRESH_TOKEN_KEYS = new Set([REFRESH_TOKEN_KEY, 'refresh_token']);
 const SYSTEM_ACCESS_TOKEN_KEY = 'system_access_token';
 const TELEGRAM_ACCESS_TOKEN_KEY = 'telegram_access_token';
 const SCOPE_TOKEN_CACHE_TTL_MS = 60 * 60 * 1000;
+const SECRET_STORAGE_KEYS = [
+    AUTH_TOKEN_KEY,
+    LEGACY_AUTH_TOKEN_KEY,
+    REFRESH_TOKEN_KEY,
+    'refresh_token',
+    SYSTEM_ACCESS_TOKEN_KEY,
+    SCOPE_TOKEN_KEY,
+    SCOPE_TOKEN_EXPIRES_KEY,
+    SCOPE_TOKEN_CACHE_KEY,
+    TELEGRAM_ACCESS_TOKEN_KEY,
+];
+const secretMemory = new Map<string, string>();
+const allowExplicitDevSecretStorage = Boolean(
+    !isElectronRuntime &&
+    (import.meta as any).env?.DEV &&
+    String((import.meta as any).env?.VITE_ALLOW_DEV_SECRET_STORAGE || '').toLowerCase() === 'true',
+);
 let launchSessionToken: string | null = null;
 const chatAccessTokens = new Map<number, string>();
 let onLaunchSessionRevoked: (() => void) | null = null;
@@ -150,6 +166,14 @@ let browserSystemAccessStatusPromise: Promise<ElectronSystemAccessStatus | null>
 const bootstrapTokenStorageMigration = () => {
     if (typeof window === 'undefined') return;
     try {
+        if (!allowExplicitDevSecretStorage) {
+            SECRET_STORAGE_KEYS.forEach((key) => {
+                if (isElectronRuntime && LEGACY_REFRESH_TOKEN_KEYS.has(key)) return;
+                window.localStorage.removeItem(key);
+                window.sessionStorage.removeItem(key);
+            });
+            return;
+        }
         const migrateToLocal = (key: string, legacyKeys: string[] = []) => {
             const localExisting = window.localStorage.getItem(key);
             if (localExisting) {
@@ -199,6 +223,9 @@ bootstrapTokenStorageMigration();
 
 const clearScopeTokenStorage = (): void => {
     if (typeof window === 'undefined') return;
+    secretMemory.delete(SCOPE_TOKEN_KEY);
+    secretMemory.delete(SCOPE_TOKEN_EXPIRES_KEY);
+    secretMemory.delete(SCOPE_TOKEN_CACHE_KEY);
     window.localStorage.removeItem(SCOPE_TOKEN_KEY);
     window.localStorage.removeItem(SCOPE_TOKEN_EXPIRES_KEY);
     window.localStorage.removeItem(SCOPE_TOKEN_CACHE_KEY);
@@ -209,6 +236,10 @@ const clearScopeTokenStorage = (): void => {
 
 const getFromLocalThenLegacySession = (key: string, legacyKeys: string[] = []): string | null => {
     if (typeof window === 'undefined') return null;
+
+    const memoryValue = secretMemory.get(key);
+    if (memoryValue) return memoryValue;
+    if (!allowExplicitDevSecretStorage) return null;
 
     const localValue = window.localStorage.getItem(key);
     if (localValue) {
@@ -227,6 +258,7 @@ const getFromLocalThenLegacySession = (key: string, legacyKeys: string[] = []): 
     }
 
     window.localStorage.setItem(key, fromLegacy);
+    secretMemory.set(key, fromLegacy);
     window.sessionStorage.removeItem(key);
     legacyKeys.forEach((legacy) => {
         window.sessionStorage.removeItem(legacy);
@@ -239,6 +271,20 @@ const getFromLocalThenLegacySession = (key: string, legacyKeys: string[] = []): 
 
 const setPersistentWithLegacyCleanup = (key: string, value: string | null, legacyKeys: string[] = []) => {
     if (typeof window === 'undefined') return;
+    if (value) {
+        secretMemory.set(key, value);
+    } else {
+        secretMemory.delete(key);
+    }
+    if (!allowExplicitDevSecretStorage) {
+        window.localStorage.removeItem(key);
+        window.sessionStorage.removeItem(key);
+        legacyKeys.forEach((legacy) => {
+            window.localStorage.removeItem(legacy);
+            window.sessionStorage.removeItem(legacy);
+        });
+        return;
+    }
     if (value) {
         window.localStorage.setItem(key, value);
         window.sessionStorage.removeItem(key);
@@ -257,7 +303,7 @@ const setPersistentWithLegacyCleanup = (key: string, value: string | null, legac
 };
 
 const loadBrowserSystemAccessStatus = async (force = false): Promise<ElectronSystemAccessStatus | null> => {
-    if (typeof window === 'undefined' || isElectronRuntime) {
+    if (typeof window === 'undefined' || isElectronRuntime || !allowExplicitDevSecretStorage) {
         return null;
     }
     if (force) {
@@ -391,7 +437,39 @@ export const getRefreshToken = (): string | null => getFromLocalThenLegacySessio
 
 export const setRefreshToken = (token: string | null): void => {
     setPersistentWithLegacyCleanup(REFRESH_TOKEN_KEY, token, ['refresh_token']);
+    if (isElectronRuntime) {
+        const storageApi = (window as any).electronAPI?.secureStorage;
+        const operation = token
+            ? storageApi?.set?.('refresh_token', token)
+            : storageApi?.remove?.('refresh_token');
+        Promise.resolve(operation).catch(() => undefined);
+    }
 };
+
+export const initializeElectronSecurityState = async (): Promise<void> => {
+    if (!isElectronRuntime) return;
+    const storageApi = (window as any).electronAPI?.secureStorage;
+    try {
+        if (!storageApi?.get || !storageApi?.migrateLegacyRefreshToken) {
+            throw new Error('Secure storage bridge is unavailable');
+        }
+        const migrationReady = await storageApi.migrateLegacyRefreshToken();
+        if (!migrationReady) {
+            throw new Error('Legacy refresh token migration failed');
+        }
+        const refreshToken = String((await storageApi.get('refresh_token')) || '').trim();
+        if (refreshToken) secretMemory.set(REFRESH_TOKEN_KEY, refreshToken);
+    } catch {
+        secretMemory.delete(REFRESH_TOKEN_KEY);
+    } finally {
+        for (const key of LEGACY_REFRESH_TOKEN_KEYS) {
+            window.localStorage.removeItem(key);
+            window.sessionStorage.removeItem(key);
+        }
+    }
+};
+
+export const getScopeToken = (): string | null => getValidScopeToken();
 
 export const getSystemAccessToken = (): string | null =>
     getFromLocalThenLegacySession(SYSTEM_ACCESS_TOKEN_KEY);
@@ -453,9 +531,6 @@ export const buildAuthorizedRequestHeaders = async (
                 'Доступ закрыт: отсутствует или поврежден client-access.json',
             );
         }
-        if (access.token) {
-            headers['X-System-Access'] = access.token;
-        }
     } else {
         let systemToken = getSystemAccessToken();
         if (!systemToken) {
@@ -498,11 +573,6 @@ apiClient.interceptors.request.use((config) => {
                 if (normalized) {
                     config.baseURL = normalized;
                 }
-            }
-            if (access.token) {
-                config.headers['X-System-Access'] = access.token;
-            } else {
-                throw new Error('Доступ закрыт: в client-access.json нет system_access_token');
             }
         } else {
             let systemToken = getSystemAccessToken();
@@ -657,6 +727,7 @@ export interface Transaction {
     card_last_4: string | null;
     operator_raw: string | null;
     application_mapped: string | null;
+    description?: string | null;
     transaction_type: 'DEBIT' | 'CREDIT' | 'CONVERSION' | 'REVERSAL';
     transaction_type_display: string;
     balance_after: string | null;
@@ -744,6 +815,7 @@ export interface TransactionUpdateRequest {
     transaction_date?: string;
     operator_raw?: string;
     application_mapped?: string;
+    description?: string;
     amount?: string;
     balance_after?: string;
     card_last_4?: string;
@@ -1126,6 +1198,238 @@ export const syncApi = {
     },
 };
 
+export interface AutomationProgress {
+    total?: number;
+    processed?: number;
+    percent?: number;
+    step?: string;
+}
+
+export interface AutomationStartResponse {
+    task_id: string;
+    status: string;
+    message: string;
+}
+
+export interface AutomationAnalyzeStatus {
+    task_id: string;
+    status: string;
+    progress: AutomationProgress;
+    results?: {
+        suggestions_count: number;
+        high_confidence: number;
+        low_confidence: number;
+    } | null;
+}
+
+export interface AutomationVerifyStatus {
+    task_id: string;
+    status: string;
+    progress: AutomationProgress;
+    results?: {
+        total_verified: number;
+        transactions_with_errors: number;
+        total_corrections: number;
+    } | null;
+}
+
+export interface AutomationSuggestion {
+    id: string;
+    task_id: string;
+    transaction_id: number;
+    operator_raw: string;
+    current_application?: string | null;
+    suggested_application: string;
+    confidence: number;
+    reasoning?: string | null;
+    is_new_application: boolean;
+    is_p2p: boolean;
+    status: string;
+    created_at: string;
+}
+
+export interface VerificationSuggestion {
+    id: string;
+    task_id: string;
+    transaction_id: number;
+    field_name: string;
+    field_label: string;
+    current_value?: string | null;
+    suggested_value?: string | null;
+    confidence: number;
+    reasoning?: string | null;
+    status: string;
+    created_at: string;
+}
+
+export interface ReconciliationItem {
+    message_id: number;
+    chat_id: number;
+    message_date?: string | null;
+    text_preview?: string | null;
+    category: 'MATCHED' | 'MISSING_IN_DB' | 'FAILED_PARSE' | 'ORPHANED_IN_DB' | string;
+    transaction_id?: number | null;
+    can_auto_parse: boolean;
+}
+
+export interface ReconciliationSummary {
+    total_receipt_candidates: number;
+    matched: number;
+    missing_in_db: number;
+    failed_parse: number;
+    orphaned_in_db: number;
+}
+
+export interface ChatSyncStatusItem {
+    chat_id: number;
+    status: 'completed' | 'loading' | 'idle' | 'error' | 'not_started' | string;
+    loaded_count: number;
+    error?: string | null;
+    started_at?: string | null;
+    finished_at?: string | null;
+}
+
+export interface ReconcileStartResponse extends AutomationStartResponse {
+    sync_warnings?: Array<{
+        chat_id: number;
+        warning: string;
+        message: string;
+    }> | null;
+}
+
+export interface ReconcileStatusResponse {
+    task_id: string;
+    status: string;
+    progress?: AutomationProgress | null;
+}
+
+export interface ReconcileResultsResponse {
+    task_id: string;
+    status: string;
+    summary?: ReconciliationSummary | null;
+    items: ReconciliationItem[];
+    total_items: number;
+    sync_warnings?: Array<Record<string, unknown>> | null;
+}
+
+interface AutomationSuggestionQuery {
+    status?: string;
+    confidence_min?: number;
+    task_id?: string;
+    limit?: number;
+    offset?: number;
+}
+
+export const automationApi = {
+    analyzeTransactions: async (payload: {
+        limit?: number;
+        only_unmapped?: boolean;
+        currency_filter?: string;
+    }): Promise<AutomationStartResponse> => {
+        const response = await apiClient.post<AutomationStartResponse>('/api/automation/analyze-transactions', payload);
+        return response.data;
+    },
+
+    getAnalyzeStatus: async (taskId: string): Promise<AutomationAnalyzeStatus> => {
+        const response = await apiClient.get<AutomationAnalyzeStatus>(`/api/automation/analyze-status/${taskId}`);
+        return response.data;
+    },
+
+    getSuggestions: async (params: AutomationSuggestionQuery): Promise<AutomationSuggestion[]> => {
+        const response = await apiClient.get<AutomationSuggestion[]>('/api/automation/suggestions', { params });
+        return response.data;
+    },
+
+    applySuggestion: async (suggestionId: string): Promise<{ success: boolean }> => {
+        const response = await apiClient.post<{ success: boolean }>(`/api/automation/suggestions/${suggestionId}/apply`);
+        return response.data;
+    },
+
+    rejectSuggestion: async (suggestionId: string): Promise<{ success: boolean }> => {
+        const response = await apiClient.post<{ success: boolean }>(`/api/automation/suggestions/${suggestionId}/reject`);
+        return response.data;
+    },
+
+    batchApplySuggestions: async (suggestionIds: string[]): Promise<{ applied: number; errors: unknown[] }> => {
+        const response = await apiClient.post<{ applied: number; errors: unknown[] }>('/api/automation/suggestions/batch-apply', suggestionIds);
+        return response.data;
+    },
+
+    verifyTransactions: async (payload: {
+        limit?: number;
+        date_from?: string;
+        date_to?: string;
+    }): Promise<AutomationStartResponse> => {
+        const response = await apiClient.post<AutomationStartResponse>('/api/automation/verify-transactions', payload);
+        return response.data;
+    },
+
+    getVerifyStatus: async (taskId: string): Promise<AutomationVerifyStatus> => {
+        const response = await apiClient.get<AutomationVerifyStatus>(`/api/automation/verify-status/${taskId}`);
+        return response.data;
+    },
+
+    getVerificationSuggestions: async (params: AutomationSuggestionQuery): Promise<VerificationSuggestion[]> => {
+        const response = await apiClient.get<VerificationSuggestion[]>('/api/automation/verification-suggestions', { params });
+        return response.data;
+    },
+
+    applyVerificationSuggestion: async (suggestionId: string): Promise<{ success: boolean }> => {
+        const response = await apiClient.post<{ success: boolean }>(`/api/automation/verification-suggestions/${suggestionId}/apply`);
+        return response.data;
+    },
+
+    rejectVerificationSuggestion: async (suggestionId: string): Promise<{ success: boolean }> => {
+        const response = await apiClient.post<{ success: boolean }>(`/api/automation/verification-suggestions/${suggestionId}/reject`);
+        return response.data;
+    },
+
+    batchApplyVerificationSuggestions: async (suggestionIds: string[]): Promise<{ applied: number; errors: unknown[] }> => {
+        const response = await apiClient.post<{ applied: number; errors: unknown[] }>('/api/automation/verification-suggestions/batch-apply', suggestionIds);
+        return response.data;
+    },
+
+    reconcileStart: async (payload: {
+        period_start: string;
+        period_end: string;
+        bot_chat_ids: number[];
+        auto_parse: boolean;
+        source: 'local' | 'tdlib';
+        sync_if_needed?: boolean;
+    }): Promise<ReconcileStartResponse> => {
+        const response = await apiClient.post<ReconcileStartResponse>('/api/automation/reconciliation/start', payload);
+        return response.data;
+    },
+
+    getReconcileStatus: async (taskId: string): Promise<ReconcileStatusResponse> => {
+        const response = await apiClient.get<ReconcileStatusResponse>(`/api/automation/reconciliation/status/${taskId}`);
+        return response.data;
+    },
+
+    getReconcileResults: async (
+        taskId: string,
+        params?: { category?: string; offset?: number; limit?: number },
+    ): Promise<ReconcileResultsResponse> => {
+        const response = await apiClient.get<ReconcileResultsResponse>(`/api/automation/reconciliation/results/${taskId}`, { params });
+        return response.data;
+    },
+
+    getChatSyncStatuses: async (chatIds: number[]): Promise<ChatSyncStatusItem[]> => {
+        if (chatIds.length === 0) return [];
+        const response = await apiClient.get<ChatSyncStatusItem[]>('/api/automation/reconciliation/chat-sync-status', {
+            params: { chat_ids: chatIds.join(',') },
+        });
+        return response.data;
+    },
+
+    autoParseReconciliation: async (taskId: string): Promise<{ queued: number; skipped: number; errors: number }> => {
+        const response = await apiClient.post<{ queued: number; skipped: number; errors: number }>(
+            `/api/automation/reconciliation/${taskId}/auto-parse`,
+        );
+        return response.data;
+    },
+};
+
 // Reference types
 export interface OperatorReference {
     id: number;
@@ -1209,303 +1513,75 @@ export const referenceApi = {
     },
 };
 
-// Verification types
-export interface VerifyRequest {
-    limit?: number;
-    date_from?: string;
-    date_to?: string;
+// Description reference types
+export interface DescriptionReference {
+    id: number;
+    text: string;
+    operator_keys: string[];
+    operator_count: number;
+    sources: string[];
 }
 
-export interface VerifyResponse {
-    task_id: string;
-    status: string;
+export interface DescriptionListResponse {
+    total: number;
+    page: number;
+    page_size: number;
+    items: DescriptionReference[];
+}
+
+export interface DescriptionCreate {
+    text: string;
+    operator_raws?: string[];
+    source?: string;
+}
+
+export interface DescriptionDeleteResponse {
     message: string;
+    deleted_id: number;
 }
 
-export interface VerifyStatusResponse {
-    task_id: string;
-    status: string;
-    progress: {
-        total: number;
-        processed: number;
-        percent: number;
-    };
-    results?: {
-        total_verified: number;
-        transactions_with_errors: number;
-        total_corrections: number;
-    };
-}
-
-export interface VerificationSuggestion {
-    id: string;
-    task_id: string;
-    transaction_id: number;
-    field_name: string;
-    field_label: string;
-    current_value: string | null;
-    suggested_value: string | null;
-    confidence: number;
-    reasoning: string | null;
-    status: string;
-    created_at: string;
-}
-
-// Automation types
-export interface AnalyzeRequest {
-    limit?: number;
-    only_unmapped?: boolean;
-    currency_filter?: string;
-}
-
-export interface AnalyzeResponse {
-    task_id: string;
-    status: string;
-    message: string;
-}
-
-export interface AnalyzeStatusResponse {
-    task_id: string;
-    status: string;
-    progress: {
-        total: number;
-        processed: number;
-        percent: number;
-    };
-    results?: {
-        suggestions_count: number;
-        high_confidence: number;
-        low_confidence: number;
-    };
-}
-
-export interface AISuggestion {
-    id: string;
-    transaction_id: string;
-    operator_raw: string;
-    current_application: string | null;
-    suggested_application: string;
-    confidence: number;
-    reasoning: string;
-    is_new_application: boolean;
-    is_p2p: boolean;
-    status: string;
-    created_at: string;
-}
-
-// Automation API methods
-export const automationApi = {
-    analyzeTransactions: async (request: AnalyzeRequest): Promise<AnalyzeResponse> => {
-        const response = await apiClient.post<AnalyzeResponse>('/api/automation/analyze-transactions', request);
+// Description reference API methods
+export const descriptionsApi = {
+    list: async (params?: {
+        page?: number;
+        page_size?: number;
+        search?: string;
+    }): Promise<DescriptionListResponse> => {
+        const response = await apiClient.get<DescriptionListResponse>('/api/descriptions', { params });
         return response.data;
     },
 
-    getAnalyzeStatus: async (taskId: string): Promise<AnalyzeStatusResponse> => {
-        try {
-            const response = await apiClient.get<AnalyzeStatusResponse>(`/api/automation/analyze-status/${taskId}`);
-            return response.data;
-        } catch (err: any) {
-            const status = err?.response?.status;
-            if (status === 404) {
-                // Gracefully handle missing/expired task ids
-                return {
-                    task_id: taskId,
-                    status: 'not_found',
-                    progress: { total: 0, processed: 0, percent: 0 },
-                    results: undefined,
-                };
-            }
-            throw err;
-        }
-    },
-
-    getSuggestions: async (params: {
-        status?: string;
-        confidence_min?: number;
-        task_id?: string;
-    }): Promise<AISuggestion[]> => {
-        const response = await apiClient.get<AISuggestion[]>('/api/automation/suggestions', { params });
+    create: async (payload: DescriptionCreate): Promise<DescriptionReference> => {
+        const response = await apiClient.post<DescriptionReference>('/api/descriptions', payload);
         return response.data;
     },
 
-    applySuggestion: async (suggestionId: string): Promise<{ success: boolean; transaction_id: string }> => {
-        const response = await apiClient.post(`/api/automation/suggestions/${suggestionId}/apply`);
+    update: async (id: number, text: string): Promise<DescriptionReference> => {
+        const response = await apiClient.patch<DescriptionReference>(`/api/descriptions/${id}`, { text });
         return response.data;
     },
 
-    rejectSuggestion: async (suggestionId: string): Promise<{ success: boolean }> => {
-        const response = await apiClient.post(`/api/automation/suggestions/${suggestionId}/reject`);
+    remove: async (id: number): Promise<DescriptionDeleteResponse> => {
+        const response = await apiClient.delete<DescriptionDeleteResponse>(`/api/descriptions/${id}`);
         return response.data;
     },
 
-    batchApplySuggestions: async (suggestionIds: string[]): Promise<{
-        success: boolean;
-        applied: number;
-        errors: Array<{ suggestion_id: string; error: string }>;
-    }> => {
-        const response = await apiClient.post('/api/automation/suggestions/batch-apply', suggestionIds);
-        return response.data;
-    },
-
-    // Verification methods
-    verifyTransactions: async (request: VerifyRequest): Promise<VerifyResponse> => {
-        const response = await apiClient.post<VerifyResponse>('/api/automation/verify-transactions', request);
-        return response.data;
-    },
-
-    getVerifyStatus: async (taskId: string): Promise<VerifyStatusResponse> => {
-        try {
-            const response = await apiClient.get<VerifyStatusResponse>(`/api/automation/verify-status/${taskId}`);
-            return response.data;
-        } catch (err: any) {
-            if (err?.response?.status === 404) {
-                return { task_id: taskId, status: 'not_found', progress: { total: 0, processed: 0, percent: 0 } };
-            }
-            throw err;
-        }
-    },
-
-    getVerificationSuggestions: async (params: {
-        status?: string;
-        task_id?: string;
-        confidence_min?: number;
-    }): Promise<VerificationSuggestion[]> => {
-        const response = await apiClient.get<VerificationSuggestion[]>('/api/automation/verification-suggestions', { params });
-        return response.data;
-    },
-
-    applyVerificationSuggestion: async (suggestionId: string): Promise<{ success: boolean }> => {
-        const response = await apiClient.post(`/api/automation/verification-suggestions/${suggestionId}/apply`);
-        return response.data;
-    },
-
-    rejectVerificationSuggestion: async (suggestionId: string): Promise<{ success: boolean }> => {
-        const response = await apiClient.post(`/api/automation/verification-suggestions/${suggestionId}/reject`);
-        return response.data;
-    },
-
-    batchApplyVerificationSuggestions: async (suggestionIds: string[]): Promise<{
-        success: boolean;
-        applied: number;
-        errors: Array<{ suggestion_id: string; error: string }>;
-    }> => {
-        const response = await apiClient.post('/api/automation/verification-suggestions/batch-apply', suggestionIds);
-        return response.data;
-    },
-
-    // ── Reconciliation methods ──────────────────────────────────────────────
-
-    reconcileStart: async (request: ReconcileRequest): Promise<ReconcileResponse> => {
-        const response = await apiClient.post<ReconcileResponse>('/api/automation/reconciliation/start', request);
-        return response.data;
-    },
-
-    getReconcileStatus: async (taskId: string): Promise<ReconcileStatusResponse> => {
-        try {
-            const response = await apiClient.get<ReconcileStatusResponse>(`/api/automation/reconciliation/status/${taskId}`);
-            return response.data;
-        } catch (err: any) {
-            if (err?.response?.status === 404) {
-                return { task_id: taskId, status: 'not_found', progress: null };
-            }
-            throw err;
-        }
-    },
-
-    getReconcileResults: async (taskId: string, params?: {
-        category?: string;
-        offset?: number;
-        limit?: number;
-    }): Promise<ReconcileResultsResponse> => {
-        const response = await apiClient.get<ReconcileResultsResponse>(
-            `/api/automation/reconciliation/results/${taskId}`,
-            { params },
+    linkOperators: async (id: number, operator_raws: string[]): Promise<DescriptionReference> => {
+        const response = await apiClient.post<DescriptionReference>(
+            `/api/descriptions/${id}/operators`,
+            { operator_raws },
         );
         return response.data;
     },
 
-    getChatSyncStatuses: async (chatIds: number[]): Promise<ChatSyncStatusItem[]> => {
-        const response = await apiClient.get<ChatSyncStatusItem[]>(
-            '/api/automation/reconciliation/chat-sync-status',
-            { params: { chat_ids: chatIds.join(',') } },
-        );
-        return response.data;
-    },
-
-    autoParseReconciliation: async (taskId: string, category?: string): Promise<AutoParseResponse> => {
-        const response = await apiClient.post<AutoParseResponse>(
-            `/api/automation/reconciliation/${taskId}/auto-parse`,
-            null,
-            { params: category ? { category } : undefined },
+    unlinkOperators: async (id: number, operator_raws: string[]): Promise<DescriptionReference> => {
+        const response = await apiClient.delete<DescriptionReference>(
+            `/api/descriptions/${id}/operators`,
+            { data: { operator_raws } },
         );
         return response.data;
     },
 };
-
-// Reconciliation types
-export interface ReconcileRequest {
-    period_start: string;
-    period_end: string;
-    bot_chat_ids: number[];
-    auto_parse?: boolean;
-    source?: 'local' | 'tdlib';
-    sync_if_needed?: boolean;
-}
-
-export interface ReconcileResponse {
-    task_id: string;
-    status: string;
-    message: string;
-    sync_warnings?: Array<{ chat_id: number; warning: string; message: string }> | null;
-}
-
-export interface ReconcileStatusResponse {
-    task_id: string;
-    status: string;
-    progress: { step?: string; percent?: number; [key: string]: any } | null;
-}
-
-export interface ReconciliationItem {
-    message_id: number;
-    chat_id: number;
-    message_date: string | null;
-    text_preview: string | null;
-    category: 'MATCHED' | 'MISSING_IN_DB' | 'FAILED_PARSE' | 'ORPHANED_IN_DB';
-    transaction_id: number | null;
-    can_auto_parse: boolean;
-}
-
-export interface ReconciliationSummary {
-    total_receipt_candidates: number;
-    matched: number;
-    missing_in_db: number;
-    failed_parse: number;
-    orphaned_in_db: number;
-}
-
-export interface ReconcileResultsResponse {
-    task_id: string;
-    status: string;
-    summary: ReconciliationSummary | null;
-    items: ReconciliationItem[];
-    total_items: number;
-    sync_warnings?: Array<{ chat_id: number; warning: string; message: string }> | null;
-}
-
-export interface ChatSyncStatusItem {
-    chat_id: number;
-    status: string;
-    loaded_count: number;
-    error: string | null;
-    started_at: string | null;
-    finished_at: string | null;
-}
-
-export interface AutoParseResponse {
-    queued: number;
-    skipped: number;
-    errors: number;
-}
 
 // Userbot types
 export interface UserbotConfig {
@@ -1603,12 +1679,10 @@ const readScopeTokenCache = (): ScopeTokenCache => {
 const writeScopeTokenCache = (cache: ScopeTokenCache): void => {
     if (typeof window === 'undefined') return;
     if (!Object.keys(cache).length) {
-        window.localStorage.removeItem(SCOPE_TOKEN_CACHE_KEY);
-        window.sessionStorage.removeItem(SCOPE_TOKEN_CACHE_KEY);
+        setPersistentWithLegacyCleanup(SCOPE_TOKEN_CACHE_KEY, null);
         return;
     }
-    window.localStorage.setItem(SCOPE_TOKEN_CACHE_KEY, JSON.stringify(cache));
-    window.sessionStorage.removeItem(SCOPE_TOKEN_CACHE_KEY);
+    setPersistentWithLegacyCleanup(SCOPE_TOKEN_CACHE_KEY, JSON.stringify(cache));
 };
 
 const pruneScopeTokenCache = (): ScopeTokenCache => {
@@ -2001,12 +2075,35 @@ export interface TelegramAuthStatus {
     user?: TelegramUserSummary;
 }
 
+export type TgButtonType =
+    | 'web_app'
+    | 'url'
+    | 'login_url'
+    | 'callback'
+    | 'switch_inline'
+    | 'buy'
+    | 'copy_text'
+    | 'other';
+
+export interface TgKeyboardButton {
+    text: string;
+    type: TgButtonType;
+    url?: string | null;
+}
+
+export interface TgReplyMarkup {
+    kind: 'inline' | 'keyboard';
+    rows: TgKeyboardButton[][];
+}
+
 export interface TelegramChatMessage {
+    chat_id?: number;
     id?: number;
     date?: string;
     is_outgoing?: boolean;
     sender_id?: any;
     text?: string | null;
+    reply_markup?: TgReplyMarkup | null;
     document?: {
         file_id: number;
         file_name?: string;
@@ -2387,6 +2484,71 @@ export const telegramClientApi = {
             message_id: messageId,
             force,
         });
+        return response.data;
+    },
+
+    // ── Telegram Mini Apps (Web Apps) ──
+    openWebApp: async (
+        chatId: number,
+        body: { url: string; bot_user_id?: number | null; button_kind: 'inline' | 'keyboard' | 'menu' },
+    ): Promise<{ url: string; launch_id: string | null }> => {
+        const response = await apiClient.post<{ url: string; launch_id: string | null }>(
+            `/api/tg/chats/${chatId}/webapp/open`,
+            body,
+            { headers: chatAccessHeaders(chatId) },
+        );
+        return response.data;
+    },
+
+    closeWebApp: async (chatId: number, launch_id: string): Promise<void> => {
+        await apiClient.post(
+            `/api/tg/chats/${chatId}/webapp/close`,
+            { launch_id },
+            { headers: chatAccessHeaders(chatId) },
+        );
+    },
+
+    sendWebAppData: async (
+        chatId: number,
+        body: { bot_user_id?: number | null; button_text: string; data: string },
+    ): Promise<void> => {
+        await apiClient.post(
+            `/api/tg/chats/${chatId}/webapp/data`,
+            body,
+            { headers: chatAccessHeaders(chatId) },
+        );
+    },
+
+    getChatMenuButton: async (
+        chatId: number,
+    ): Promise<{ available: boolean; text: string; url: string | null; is_main: boolean; bot_user_id: number | null }> => {
+        const response = await apiClient.get<{
+            available: boolean;
+            text: string;
+            url: string | null;
+            is_main: boolean;
+            bot_user_id: number | null;
+        }>(`/api/tg/chats/${chatId}/menu-button`, { headers: chatAccessHeaders(chatId) });
+        return response.data;
+    },
+
+    downloadOwnedFile: async (
+        chatId: number,
+        messageId: number,
+        fileId: number,
+        filename?: string,
+    ): Promise<Blob> => {
+        if (![chatId, messageId, fileId].every(Number.isSafeInteger)) {
+            throw new Error('Invalid Telegram file owner identifiers');
+        }
+        const response = await apiClient.get<Blob>(
+            `/api/tg/chats/${chatId}/messages/${messageId}/files/${fileId}`,
+            {
+                params: filename ? { filename } : undefined,
+                headers: chatAccessHeaders(chatId),
+                responseType: 'blob',
+            },
+        );
         return response.data;
     },
 };
@@ -2890,7 +3052,14 @@ export interface AgentRun {
     created_by_user_id: number;
     status: 'queued' | 'processing' | 'awaiting_confirmation' | 'completed' | 'failed' | 'cancelled';
     tool_name?: string | null;
-    progress: Record<string, any>;
+    progress: {
+        step?: string;
+        current?: number;
+        total?: number;
+        tool_name?: string | null;
+        percent?: number;
+        [key: string]: any;
+    };
     result?: Record<string, any> | null;
     confirmation_payload?: AgentConfirmationPayload | null;
     error_text?: string | null;

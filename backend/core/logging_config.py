@@ -50,6 +50,8 @@ _SECRET_PATTERNS = [
     re.compile(r"(x-system-access\s*[:=]\s*)([A-Za-z0-9\-_.+/=]{6,})", re.IGNORECASE),
     re.compile(r"(x-launch-session\s*[:=]\s*)([A-Za-z0-9\-_.+/=]{6,})", re.IGNORECASE),
     re.compile(r"(x-access-token\s*[:=]\s*)([A-Za-z0-9\-_.+/=]{6,})", re.IGNORECASE),
+    re.compile(r"(x-export-key\s*[:=]\s*)([A-Za-z0-9\-_.+/=]{6,})", re.IGNORECASE),
+    re.compile(r"(x-mobile-ingest-key\s*[:=]\s*)([A-Za-z0-9\-_.+/=]{6,})", re.IGNORECASE),
     # generic Bearer in any context
     re.compile(r"(bearer\s+)([A-Za-z0-9\-_.+/=]{20,})", re.IGNORECASE),
     # Telegram bot token in URL: api.telegram.org/bot<digits>:<token>
@@ -89,7 +91,14 @@ class _SecretRedactFilter(logging.Filter):
                 if isinstance(record.args, dict):
                     record.args = {k: _redact(str(v)) for k, v in record.args.items()}
                 elif isinstance(record.args, tuple):
-                    record.args = tuple(_redact(str(a)) if isinstance(a, str) else a for a in record.args)
+                    redacted_args = []
+                    for arg in record.args:
+                        rendered = str(arg)
+                        if isinstance(arg, str) or "api.telegram.org/bot" in rendered.lower():
+                            redacted_args.append(_redact(rendered))
+                        else:
+                            redacted_args.append(arg)
+                    record.args = tuple(redacted_args)
         except Exception:  # noqa: BLE001 — filter must never break logging
             pass
         return True

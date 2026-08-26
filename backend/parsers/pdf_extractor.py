@@ -9,6 +9,7 @@ Supports multiple extraction methods with fallback:
 import base64
 import logging
 import os
+import re
 import tempfile
 from typing import List, Optional
 
@@ -50,6 +51,11 @@ except ImportError:
     logger.warning("pdf2image not installed - PDF OCR disabled")
 
 MIN_TEXT_LENGTH = 80
+MAX_IMAGE_PIXELS = max(1_000_000, int(os.getenv("RECEIPT_MAX_IMAGE_PIXELS", "40000000")))
+MAX_PDF_PAGE_AREA_POINTS = max(
+    1_000_000,
+    int(os.getenv("RECEIPT_MAX_PDF_PAGE_AREA_POINTS", "20000000")),
+)
 
 
 def extract_text_from_pdf(path: str, max_pages: int = 2, use_ocr: bool = True) -> str:
@@ -62,6 +68,7 @@ def extract_text_from_pdf(path: str, max_pages: int = 2, use_ocr: bool = True) -
     3. OCR via Tesseract if text is sparse or missing
     """
     text = ""
+    _validate_pdf_geometry(path, max_pages)
 
     if PDFPLUMBER_AVAILABLE:
         text = _extract_with_pdfplumber(path, max_pages)
@@ -104,6 +111,23 @@ def _extract_with_pymupdf(path: str, max_pages: int) -> str:
     except Exception as err:
         logger.debug("PyMuPDF extraction failed: %s", err)
         return ""
+
+
+def _validate_pdf_geometry(path: str, max_pages: int) -> None:
+    """Reject pathological page dimensions before rasterization allocates memory."""
+    try:
+        doc = fitz.open(path)
+        try:
+            for page_index in range(min(max_pages, doc.page_count)):
+                rect = doc.load_page(page_index).rect
+                if float(rect.width) * float(rect.height) > MAX_PDF_PAGE_AREA_POINTS:
+                    raise ValueError(f"PDF page {page_index + 1} dimensions exceed safety limit")
+        finally:
+            doc.close()
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError(f"Invalid PDF: {exc}") from exc
 
 
 def _extract_with_pdfplumber(path: str, max_pages: int) -> str:
@@ -178,9 +202,13 @@ _OCR_TIMEOUT_SECONDS = int(os.getenv("OCR_TIMEOUT_SECONDS", "20"))
 def _preprocess_for_ocr(image):
     if not PIL_AVAILABLE:
         return image
+    if int(image.width) * int(image.height) > MAX_IMAGE_PIXELS:
+        raise ValueError("Image dimensions exceed OCR safety limit")
     img = ImageOps.grayscale(image)
     if img.width < _OCR_MIN_WIDTH:
         scale = max(2, (_OCR_MIN_WIDTH + img.width - 1) // img.width)
+        if int(img.width * scale) * int(img.height * scale) > MAX_IMAGE_PIXELS:
+            scale = max(1, int((MAX_IMAGE_PIXELS / max(1, img.width * img.height)) ** 0.5))
         img = img.resize((img.width * scale, img.height * scale), Image.LANCZOS)
     img = ImageOps.autocontrast(img, cutoff=2)
     img = img.filter(ImageFilter.UnsharpMask(radius=1.2, percent=140, threshold=2))
@@ -216,7 +244,20 @@ def extract_text_from_image_path(path: str, lang: Optional[str] = None) -> str:
             continue
         if len(text.strip()) > len(best_text.strip()):
             best_text = text
+        if _is_sufficient_ocr_text(text):
+            break
     return _strip_ocr_noise(best_text.strip())
+
+
+def _is_sufficient_ocr_text(text: str) -> bool:
+    cleaned = text.strip()
+    if len(cleaned) < MIN_TEXT_LENGTH:
+        return False
+    has_amount = bool(re.search(r"\d[\d\s.,]{2,}", cleaned))
+    has_receipt_marker = bool(
+        re.search(r"(?i)(uzs|сум|so['’]?m|карта|karta|перевод|o'tkaz|payment|оплата)", cleaned)
+    )
+    return has_amount and has_receipt_marker
 
 
 def _strip_ocr_noise(text: str) -> str:

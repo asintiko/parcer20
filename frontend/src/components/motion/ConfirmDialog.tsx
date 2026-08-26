@@ -75,6 +75,7 @@ export const ConfirmDialog: React.FC<ConfirmDialogProps> = ({
                         className="sp-btn"
                         onClick={onClose}
                         disabled={busy}
+                        autoFocus
                     >
                         {cancelLabel}
                     </button>
@@ -87,7 +88,6 @@ export const ConfirmDialog: React.FC<ConfirmDialogProps> = ({
                         }
                         onClick={handleConfirm}
                         disabled={busy}
-                        autoFocus
                     >
                         {busy ? (
                             <>

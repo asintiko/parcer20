@@ -7,7 +7,7 @@ from uuid import UUID, uuid4
 
 from sqlalchemy import and_, func, or_
 from sqlalchemy import literal
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, defer
 
 from config.ai_models import AI_AGENT_RECEIPT_GRACE_MINUTES
 from database.models import (
@@ -25,9 +25,26 @@ from services.telegram_cache_service import TelegramCacheService
 
 JsonDict = Dict[str, Any]
 
+_MAX_PAYLOAD_BYTES = 65536
+
 
 def _dump_json(payload: Optional[JsonDict]) -> str:
     return json.dumps(payload or {}, ensure_ascii=False)
+
+
+def _dump_capped_payload(payload: Optional[JsonDict]) -> str:
+    """Serialize the report payload, dropping it if it exceeds the size cap.
+
+    The client renders only summary/items, never `payload`, but the raw
+    audit_summary/groupings blob can balloon to multiple MB and accumulate in
+    the DB. Above _MAX_PAYLOAD_BYTES we persist an empty object instead so new
+    reports stay lean. `payload_json` is NOT NULL, so we never return None.
+    summary_json and items are unaffected.
+    """
+    dumped = _dump_json(payload)
+    if len(dumped.encode("utf-8")) > _MAX_PAYLOAD_BYTES:
+        return _dump_json(None)
+    return dumped
 
 
 def _load_json(value: Optional[str]) -> JsonDict:
@@ -62,7 +79,15 @@ def serialize_report_item(row: AgentReportItem) -> JsonDict:
     }
 
 
-def serialize_report(row: AgentReport, items: Optional[List[AgentReportItem]] = None) -> JsonDict:
+def serialize_report(
+    row: AgentReport,
+    items: Optional[List[AgentReportItem]] = None,
+    *,
+    light: bool = False,
+) -> JsonDict:
+    # `light` skips the (potentially multi-MB) payload blob — used by list
+    # endpoints that only render summary/items, so the list response stays small
+    # and the heavy column is never loaded/parsed/serialized per poll.
     return {
         "id": str(row.id),
         "created_by_user_id": int(row.created_by_user_id),
@@ -73,7 +98,7 @@ def serialize_report(row: AgentReport, items: Optional[List[AgentReportItem]] = 
         "period_end": row.period_end.isoformat() if row.period_end else None,
         "status": row.status,
         "summary": _load_json(row.summary_json),
-        "payload": _load_json(row.payload_json),
+        "payload": None if light else _load_json(row.payload_json),
         "items": [serialize_report_item(item) for item in (items or [])],
         "created_at": row.created_at.isoformat() if row.created_at else None,
         "updated_at": row.updated_at.isoformat() if row.updated_at else None,
@@ -423,7 +448,7 @@ def generate_report(
         period_end=period_end,
         status="published" if should_publish else "ready",
         summary_json=_dump_json(summary),
-        payload_json=_dump_json(payload),
+        payload_json=_dump_capped_payload(payload),
     )
     db.add(report)
     db.flush()
@@ -489,13 +514,16 @@ def publish_report(db: Session, *, report_id: UUID, actor_user_id: int) -> JsonD
 
 
 def list_reports(db: Session, *, user_id: int, include_team: bool = True, limit: int = 50) -> List[JsonDict]:
-    query = db.query(AgentReport)
+    # Defer payload_json so the multi-MB blob is never SELECTed for the list view
+    # (the list only renders summary/items); avoids the slow, heavy response that
+    # cascaded under the agent drawer's repeated polling on a single worker.
+    query = db.query(AgentReport).options(defer(AgentReport.payload_json))
     if include_team:
         query = query.filter(or_(AgentReport.created_by_user_id == int(user_id), AgentReport.scope == "team"))
     else:
         query = query.filter(AgentReport.created_by_user_id == int(user_id))
     rows = query.order_by(AgentReport.created_at.desc()).limit(max(1, min(int(limit), 200))).all()
-    return [serialize_report(row) for row in rows]
+    return [serialize_report(row, light=True) for row in rows]
 
 
 def get_report(db: Session, *, report_id: UUID, user_id: int) -> JsonDict | None:

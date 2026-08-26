@@ -1,0 +1,19 @@
+# Package application code on top of a TDLib image that was built and verified
+# locally for linux/amd64. Never point BASE_RUNTIME_IMAGE at a server-built image.
+ARG BASE_RUNTIME_IMAGE
+ARG BASE_RUNTIME_DIGEST
+FROM ${BASE_RUNTIME_IMAGE}@${BASE_RUNTIME_DIGEST}
+
+WORKDIR /app
+COPY requirements.txt /tmp/parcer-requirements.txt
+RUN python -m pip install --no-cache-dir --upgrade -r /tmp/parcer-requirements.txt \
+    && python -m pip check \
+    && test -n "$(find /usr/local/lib -maxdepth 1 -name 'libtdjson.so*' -print -quit)"
+COPY . .
+
+ARG TDLIB_REF=a17f87c4cff7b90b278d12b91ba0614383aaee82
+LABEL io.parcer.tdlib-ref=${TDLIB_REF}
+LABEL io.parcer.release-kind="local-prebuilt-tdlib"
+
+ENV PYTHONPATH=/app
+CMD ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers", "--forwarded-allow-ips=*"]

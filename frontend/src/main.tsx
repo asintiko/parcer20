@@ -1,6 +1,8 @@
 import React from 'react'
 import ReactDOM from 'react-dom/client'
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { QueryClient } from '@tanstack/react-query'
+import { PersistQueryClientProvider } from '@tanstack/react-query-persist-client'
+import { createSyncStoragePersister } from '@tanstack/query-sync-storage-persister'
 import { ThemeProvider as AppThemeProvider } from './contexts/ThemeContext'
 import { AuthProvider } from './contexts/AuthContext'
 import { AiAgentProvider } from './contexts/AiAgentContext'
@@ -9,6 +11,7 @@ import { CssBaseline, ThemeProvider as MuiThemeProvider } from '@mui/material'
 import App from './App.tsx'
 import './index.css'
 import { muiTheme } from './styles/muiTheme'
+import { initializeElectronSecurityState } from './services/api'
 
 const queryClient = new QueryClient({
     defaultOptions: {
@@ -20,13 +23,48 @@ const queryClient = new QueryClient({
     },
 })
 
+/**
+ * Cross-session cache only for light reference/meta queries. Transactions live
+ * in Dexie (see syncManager) and MUST NOT be persisted here — they are heavy,
+ * scope-sensitive and already incrementally mirrored. Server-paginated list
+ * queries are excluded so a restart never replays a full /api/transactions load.
+ */
+const PERSISTED_QUERY_KEYS = new Set<string>([
+    'security-status',
+    'security-scopes',
+    'security-locked-periods',
+    'transactions-init',
+    'reference-operators-for-autocomplete',
+])
+
+const queryPersister = createSyncStoragePersister({
+    storage: typeof window !== 'undefined' ? window.localStorage : undefined,
+    key: 'tbsparcer-query-cache',
+    throttleTime: 2000,
+})
+
 const renderApp = () => {
     ReactDOM.createRoot(document.getElementById('root')!).render(
         <React.StrictMode>
             <AppThemeProvider>
                 <MuiThemeProvider theme={muiTheme}>
                     <CssBaseline />
-                    <QueryClientProvider client={queryClient}>
+                    <PersistQueryClientProvider
+                        client={queryClient}
+                        persistOptions={{
+                            persister: queryPersister,
+                            // Bump cache identity on every app version so a schema/shape
+                            // change after auto-update silently discards the old cache.
+                            buster: __APP_VERSION__,
+                            maxAge: 24 * 60 * 60 * 1000,
+                            dehydrateOptions: {
+                                shouldDehydrateQuery: (query) => {
+                                    const rootKey = String(query.queryKey?.[0] ?? '')
+                                    return query.state.status === 'success' && PERSISTED_QUERY_KEYS.has(rootKey)
+                                },
+                            },
+                        }}
+                    >
                         <AuthProvider>
                             <AiAgentProvider>
                                 <ToastProvider>
@@ -34,37 +72,11 @@ const renderApp = () => {
                                 </ToastProvider>
                             </AiAgentProvider>
                         </AuthProvider>
-                    </QueryClientProvider>
+                    </PersistQueryClientProvider>
                 </MuiThemeProvider>
             </AppThemeProvider>
         </React.StrictMode>,
     )
 }
 
-const bootstrapSystemAccess = async () => {
-    if (typeof window === 'undefined') return
-    if ((window as any).electronAPI?.isElectron) return
-    try {
-        const response = await fetch('/client-access.json', {
-            method: 'GET',
-            cache: 'no-store',
-        })
-        if (!response.ok) return
-        const contentType = response.headers.get('content-type') || ''
-        const raw = await response.text()
-        if (!raw.trim()) return
-        const looksJson =
-            contentType.toLowerCase().includes('application/json') ||
-            raw.trim().startsWith('{')
-        if (!looksJson) return
-        const parsed = JSON.parse(raw) as { system_access_token?: string }
-        const token = String(parsed.system_access_token || '').trim()
-        if (!token) return
-        window.localStorage.setItem('system_access_token', token)
-        window.sessionStorage.removeItem('system_access_token')
-    } catch {
-        // ignore browser bootstrap failures; the API layer has a fallback loader
-    }
-}
-
-void bootstrapSystemAccess().finally(renderApp)
+void initializeElectronSecurityState().finally(renderApp)

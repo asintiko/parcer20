@@ -3,13 +3,14 @@ Transaction API routes
 Server-side pagination, sorting, and filtering for financial transactions
 """
 import os
+import csv
 import json
 import logging
 import re
 from contextlib import suppress
 from datetime import date, datetime
 from decimal import Decimal
-from io import BytesIO
+from io import BytesIO, StringIO
 from typing import Any, Callable, Dict, List, Optional
 
 import pytz
@@ -18,7 +19,7 @@ from fastapi.responses import StreamingResponse
 from openpyxl import Workbook
 from openpyxl.cell import WriteOnlyCell
 from openpyxl.utils import get_column_letter
-from sqlalchemy import and_, asc, desc, extract, func, or_
+from sqlalchemy import and_, asc, desc, extract, false, func, or_
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, Field
 
@@ -40,6 +41,7 @@ from api.dependencies import (
     get_effective_folder_scope_for_user,
     is_date_allowed_for_user,
     merge_scope_payloads,
+    require_export_key,
     require_sources_scope,
     require_tab_access,
     require_transactions_scope,
@@ -54,6 +56,7 @@ from services.access_control_service import has_active_scopes, years_from_json
 from services.root_access_config_service import get_config_scopes
 from services.period_lock_service import period_lock_service
 from services.auth_bot_service import publish_auth_event
+from services import description_service
 
 # Normalization helpers
 EMOJI_PATTERN = re.compile(r"[\U0001F300-\U0001FAFF\U00002600-\U000027BF]")
@@ -277,6 +280,7 @@ class TransactionResponse(BaseModel):
     parsing_method: Optional[str]
     parsing_confidence: Optional[float]
     is_p2p: Optional[bool] = None  # Not stored on Transaction yet
+    description: Optional[str] = None  # Resolved from merchant description registry
     created_at: datetime
     updated_at: Optional[datetime] = None
     raw_message: Optional[str] = None
@@ -321,7 +325,7 @@ class ProcessReceiptResponse(BaseModel):
 
 class ProcessReceiptBatchRequest(BaseModel):
     chat_id: int
-    message_ids: List[int]
+    message_ids: List[int] = Field(..., min_length=1, max_length=100)
     force: bool = False
 
 
@@ -486,6 +490,7 @@ def _resolve_transaction_source_fields(
 def build_transaction_response(
     c: Transaction,
     source_meta_map: Optional[Dict[int, Dict[str, Any]]] = None,
+    description: Optional[str] = None,
 ) -> TransactionResponse:
     parsing_method = getattr(c, "parsing_method", None)
     parsing_confidence = getattr(c, "parsing_confidence", None)
@@ -537,6 +542,7 @@ def build_transaction_response(
         parsing_method=parsing_method,
         parsing_confidence=parsing_confidence,
         is_p2p=getattr(c, "is_p2p", None),
+        description=description,
         created_at=getattr(c, "created_at", None),
         updated_at=getattr(c, "updated_at", None),
         raw_message=raw_message
@@ -570,32 +576,37 @@ def _apply_allowed_sources_to_query(query, current_user: Optional[Dict[str, Any]
     """Restrict a Transaction query to the operator's allowed source chats.
 
     get_allowed_sources_for_user returns None for admin (no restriction) and a
-    set of chat_ids for an operator. Semantics match live behavior so an operator
-    with no configured sources is not locked out: an EMPTY set means "no source
-    restriction configured" and applies no filter; a NON-empty set restricts to
-    those chats. Runs unconditionally on every read so a missing source_chat_ids
-    query param cannot widen an operator's real access.
+    set of chat_ids for an operator. An empty operator set means no source
+    access; only admins receive ``None`` and bypass this filter.
     """
     allowed = get_allowed_sources_for_user(current_user)
-    if not allowed:  # None (admin) or empty set (no restriction configured)
+    if allowed is None:
         return query
+    if not allowed:
+        return query.filter(false())
     return query.filter(Transaction.source_chat_id.in_(allowed))
 
 
 def _ensure_source_allowed(tx, current_user: Optional[Dict[str, Any]]) -> None:
     """Raise 404 if a single transaction is outside the operator's allowed sources.
 
-    Only enforced when allowed_sources is NON-empty (see
-    _apply_allowed_sources_to_query for the empty-set rationale). 404 (not 403)
-    so existence of out-of-scope rows is not disclosed.
+    404 (not 403) prevents disclosure of out-of-scope row existence.
     """
     if tx is None:
         return
     allowed = get_allowed_sources_for_user(current_user)
-    if not allowed:
+    if allowed is None:
         return
-    if tx.source_chat_id not in allowed:
+    if not allowed or tx.source_chat_id not in allowed:
         raise HTTPException(status_code=404, detail="Transaction not found")
+
+
+def _ensure_chat_source_allowed(chat_id: int, current_user: Optional[Dict[str, Any]]) -> None:
+    allowed = get_allowed_sources_for_user(current_user)
+    if allowed is None:
+        return
+    if not allowed or int(chat_id) not in allowed:
+        raise HTTPException(status_code=404, detail="Telegram source not found")
 
 
 def _user_forbidden_ranges(current_user: Optional[Dict[str, Any]]) -> List[tuple[date, date]]:
@@ -817,22 +828,14 @@ async def get_transactions_init(
             years_items.append(TransactionYearsItem(year=scope_year, count=0))
     years_items.sort(key=lambda x: x.year)
 
-    operators = [
-        str(row[0])
-        for row in db.query(OperatorReference.operator_name)
+    operator_rows = (
+        db.query(OperatorReference.operator_name, OperatorReference.application_name)
         .filter(OperatorReference.is_active.is_(True))
         .distinct()
         .all()
-        if row and row[0]
-    ]
-    applications = [
-        str(row[0])
-        for row in db.query(OperatorReference.application_name)
-        .filter(OperatorReference.is_active.is_(True))
-        .distinct()
-        .all()
-        if row and row[0]
-    ]
+    )
+    operators = sorted({str(row[0]) for row in operator_rows if row and row[0]})
+    applications = sorted({str(row[1]) for row in operator_rows if row and row[1]})
 
     allowed_sources = get_allowed_sources_for_user(current_user)
     source_query = db.query(
@@ -909,14 +912,19 @@ async def get_duplicate_events(
     query = db.query(DuplicateMergeLog)
     if merged is not None:
         query = query.filter(DuplicateMergeLog.merged.is_(merged))
-    if effective_scope:
-        scoped_tx_query = db.query(Transaction.id)
-        scoped_tx_query = _apply_scope_to_query(scoped_tx_query, effective_scope)
-        scoped_tx_query = _apply_user_forbidden_ranges_to_query(scoped_tx_query, forbidden_ranges)
-        scoped_tx_query = _apply_locked_periods_to_query(scoped_tx_query, db)
-        query = query.filter(
-            DuplicateMergeLog.existing_transaction_id.in_(scoped_tx_query.subquery())
-        )
+    allowed_sources = get_allowed_sources_for_user(current_user)
+    if allowed_sources is not None:
+        if not allowed_sources:
+            return []
+        query = query.filter(DuplicateMergeLog.source_chat_id.in_(allowed_sources))
+    scoped_tx_query = db.query(Transaction.id)
+    scoped_tx_query = _apply_scope_to_query(scoped_tx_query, effective_scope)
+    scoped_tx_query = _apply_user_forbidden_ranges_to_query(scoped_tx_query, forbidden_ranges)
+    scoped_tx_query = _apply_locked_periods_to_query(scoped_tx_query, db)
+    scoped_tx_query = _apply_allowed_sources_to_query(scoped_tx_query, current_user)
+    query = query.filter(
+        DuplicateMergeLog.existing_transaction_id.in_(scoped_tx_query.subquery())
+    )
     rows = (
         query.order_by(DuplicateMergeLog.created_at.desc(), DuplicateMergeLog.id.desc())
         .limit(limit)
@@ -953,6 +961,55 @@ async def get_duplicate_events(
     return result
 
 
+def _authorize_processed_transaction(
+    db: Session,
+    tx: Transaction,
+    current_user: Dict[str, Any],
+    effective_scope: Optional[Dict[str, Any]],
+) -> None:
+    _ensure_source_allowed(tx, current_user)
+    _assert_tx_in_scope(effective_scope, tx)
+    _assert_user_date_allowed(current_user, tx.transaction_date)
+    _assert_not_in_locked_period(db, tx.transaction_date, current_user)
+
+
+async def _process_authorized_receipt(
+    *,
+    chat_id: int,
+    message_id: int,
+    force: bool,
+    db: Session,
+    manager: TelegramTDLibManager,
+    current_user: Dict[str, Any],
+    effective_scope: Optional[Dict[str, Any]],
+):
+    _ensure_chat_source_allowed(chat_id, current_user)
+    existing = (
+        db.query(Transaction)
+        .filter(
+            Transaction.source_chat_id == int(chat_id),
+            Transaction.source_message_id == int(message_id),
+        )
+        .first()
+    )
+    if existing is not None:
+        _authorize_processed_transaction(db, existing, current_user, effective_scope)
+
+    def authorize_result(values: Dict[str, Any]) -> None:
+        candidate = Transaction(**values)
+        _authorize_processed_transaction(db, candidate, current_user, effective_scope)
+
+    result = await process_tdlib_message(
+        chat_id=chat_id,
+        message_id=message_id,
+        force=force,
+        db=db,
+        manager=manager,
+        authorize_result=authorize_result,
+    )
+    return result
+
+
 
 @router.post("/process-receipt", response_model=ProcessReceiptResponse)
 async def process_receipt_from_telegram(
@@ -961,16 +1018,20 @@ async def process_receipt_from_telegram(
     manager: TelegramTDLibManager = Depends(get_tdlib_manager),
     current_user: dict = Depends(require_tab_access("dashboard")),
     source_scope: Optional[Dict[str, Any]] = Depends(require_sources_scope),
+    transaction_scope: Optional[Dict[str, Any]] = Depends(require_transactions_scope),
 ):
     """
     Process a Telegram message (chat_id, message_id) into a transaction.
     """
-    return await process_tdlib_message(
+    effective_scope = _effective_scope(db, transaction_scope, current_user)
+    return await _process_authorized_receipt(
         chat_id=payload.chat_id,
         message_id=payload.message_id,
         force=payload.force,
         db=db,
         manager=manager,
+        current_user=current_user,
+        effective_scope=effective_scope,
     )
 
 
@@ -981,16 +1042,21 @@ async def process_receipt_batch(
     manager: TelegramTDLibManager = Depends(get_tdlib_manager),
     current_user: dict = Depends(require_tab_access("dashboard")),
     source_scope: Optional[Dict[str, Any]] = Depends(require_sources_scope),
+    transaction_scope: Optional[Dict[str, Any]] = Depends(require_transactions_scope),
 ):
+    effective_scope = _effective_scope(db, transaction_scope, current_user)
+    _ensure_chat_source_allowed(payload.chat_id, current_user)
     results: List[ProcessReceiptBatchItem] = []
     for msg_id in payload.message_ids:
         try:
-            res = await process_tdlib_message(
+            res = await _process_authorized_receipt(
                 chat_id=payload.chat_id,
                 message_id=msg_id,
                 force=payload.force,
                 db=db,
                 manager=manager,
+                current_user=current_user,
+                effective_scope=effective_scope,
             )
             results.append(
                 ProcessReceiptBatchItem(
@@ -1028,7 +1094,9 @@ async def get_processed_status(
     db: Session = Depends(get_db_session),
     current_user: dict = Depends(require_tab_access("dashboard")),
     source_scope: Optional[Dict[str, Any]] = Depends(require_sources_scope),
+    transaction_scope: Optional[Dict[str, Any]] = Depends(require_transactions_scope),
 ):
+    _ensure_chat_source_allowed(chat_id, current_user)
     try:
         ids = [int(x) for x in message_ids.split(",") if x.strip().isdigit()]
     except Exception:
@@ -1036,12 +1104,18 @@ async def get_processed_status(
     if not ids:
         return ProcessedStatusResponse(statuses={})
 
+    effective_scope = _effective_scope(db, transaction_scope, current_user)
+    query = db.query(Transaction.source_message_id)
+    query = query.filter(
+        Transaction.source_chat_id == int(chat_id),
+        Transaction.source_message_id.in_([int(i) for i in ids]),
+    )
+    query = _apply_scope_to_query(query, effective_scope)
+    query = _apply_user_forbidden_ranges_to_query(query, _user_forbidden_ranges(current_user))
+    query = _apply_locked_periods_to_query(query, db)
+    query = _apply_allowed_sources_to_query(query, current_user)
     rows = (
-        db.query(Transaction.source_message_id)
-        .filter(
-            Transaction.source_chat_id == int(chat_id),
-            Transaction.source_message_id.in_([int(i) for i in ids]),
-        )
+        query
         .all()
     )
     found_ids = {int(r[0]) for r in rows}
@@ -1067,6 +1141,9 @@ class TransactionUpdateRequest(BaseModel):
     parsing_confidence: Optional[float] = Field(None, ge=0.0, le=1.0)
     # Kept for backward compatibility with UI but ignored server-side
     is_p2p: Optional[bool] = None
+    # Merchant description (bound to normalized operator_raw, applied retroactively).
+    # Empty string clears it for the operator.
+    description: Optional[str] = Field(None, max_length=1000)
 
     class Config:
         json_schema_extra = {
@@ -1854,7 +1931,17 @@ async def get_transactions(
         if getattr(row, "source_chat_id", None) not in (None, 0) and normalize_source_type(getattr(row, "source_type", None)) == "AUTO"
     })
     source_meta_map = _load_source_meta_map(db, source_ids)
-    items: List[TransactionResponse] = [build_transaction_response(c, source_meta_map) for c in rows]
+    description_map = description_service.resolve_batch(
+        db, [getattr(c, "operator_raw", None) for c in rows]
+    )
+    items: List[TransactionResponse] = [
+        build_transaction_response(
+            c,
+            source_meta_map,
+            description=description_map.get(getattr(c, "operator_raw", None)),
+        )
+        for c in rows
+    ]
 
     return TransactionListResponse(
         total=total,
@@ -1974,6 +2061,80 @@ async def export_transactions(
     )
 
 
+def _iter_transactions_export_csv(
+    ordered_query,
+    export_columns: List[str],
+    total_rows: int,
+    source_meta_map: Optional[Dict[int, Dict[str, Any]]] = None,
+):
+    """
+    Stream the full transactions table as CSV for the Excel Power Query live sheet.
+
+    The first column is the immutable transaction ``id`` — it is the stable key the
+    workbook sorts and (optionally) joins operator notes on. Rows are emitted in the
+    caller's ``id ASC`` order so the sheet stays append-only: existing rows never move,
+    new receipts land at the bottom, and address-anchored cell formatting stays aligned.
+    """
+    buffer = StringIO()
+    writer = csv.writer(buffer, lineterminator="\r\n")
+
+    def _flush() -> str:
+        data = buffer.getvalue()
+        buffer.seek(0)
+        buffer.truncate(0)
+        return data
+
+    writer.writerow(["id"] + [EXPORT_COLUMN_HEADERS[col] for col in export_columns])
+    # UTF-8 BOM so Excel/Power Query detect Cyrillic headers without a manual encoding pick.
+    yield "﻿" + _flush()
+
+    for index, tx in enumerate(ordered_query, start=1):
+        values_map = _build_export_row_values(index, total_rows, False, tx, source_meta_map)
+        writer.writerow([tx.id] + [values_map.get(col, "") for col in export_columns])
+        yield _flush()
+
+
+@router.get("/export.csv")
+async def export_transactions_csv(
+    db: Session = Depends(get_db_session),
+    _auth: None = Depends(require_export_key),
+):
+    """
+    Machine-pullable full-table CSV for the Excel live sheet (Power Query).
+
+    Guarded only by ``X-Export-Key`` (no user identity), so it returns every
+    transaction, ordered by ``id ASC`` for append-only stability. Not for the UI —
+    the interactive, RBAC/scope-filtered download stays at ``GET /export``.
+    """
+    max_rows = _transactions_export_max_rows()
+    base_query = db.query(Transaction)
+    total_rows = int(base_query.count())
+    if total_rows > max_rows:
+        raise HTTPException(
+            status_code=413,
+            detail={"error": "export_limit_exceeded", "limit": max_rows, "total": total_rows},
+        )
+
+    ordered_query = base_query.order_by(asc(Transaction.id)).yield_per(1000)
+    source_meta_map = _load_source_meta_map(db)
+    generator = _iter_transactions_export_csv(
+        ordered_query,
+        list(EXPORT_DEFAULT_COLUMN_KEYS),
+        total_rows,
+        source_meta_map,
+    )
+
+    return StreamingResponse(
+        generator,
+        media_type="text/csv; charset=utf-8",
+        headers={
+            "Content-Disposition": 'attachment; filename="transactions_live.csv"',
+            "X-Export-Total": str(total_rows),
+            "Cache-Control": "no-store",
+        },
+    )
+
+
 @router.post("/", response_model=TransactionResponse)
 async def create_transaction(
     payload: TransactionCreateRequest,
@@ -2077,7 +2238,11 @@ async def get_transaction(
     _assert_not_in_locked_period(db, tx.transaction_date)
 
     source_meta_map = _load_source_meta_map(db, [int(tx.source_chat_id)] if getattr(tx, "source_chat_id", None) else None)
-    return build_transaction_response(tx, source_meta_map)
+    return build_transaction_response(
+        tx,
+        source_meta_map,
+        description=description_service.resolve(db, getattr(tx, "operator_raw", None)),
+    )
 
 
 @router.put("/{transaction_id}", response_model=TransactionUpdateResponse)
@@ -2160,6 +2325,16 @@ async def update_transaction(
 
         db.commit()
         db.refresh(c)
+
+        if "description" in update_dict:
+            description_service.set_for_operator(
+                db,
+                operator_raw=getattr(c, "operator_raw", None),
+                text=update_dict["description"],
+                source="manual",
+                user_id=(current_user or {}).get("user_id") if isinstance(current_user, dict) else None,
+            )
+
         _audit_transaction_action(
             db,
             request,
@@ -2179,6 +2354,7 @@ async def update_transaction(
             transaction=build_transaction_response(
                 c,
                 _load_source_meta_map(db, [int(c.source_chat_id)] if getattr(c, "source_chat_id", None) else None),
+                description=description_service.resolve(db, getattr(c, "operator_raw", None)),
             )
         )
 

@@ -6,6 +6,7 @@ __pycache__/
 .Python
 env/
 venv/
+.venv/
 ENV/
 build/
 develop-eggs/
@@ -54,6 +55,7 @@ yarn-error.log*
 frontend/dist/
 frontend/build/
 frontend/release/
+/deploy/excel-feed/*.xlsx
 
 # Database
 *.db
@@ -83,6 +85,11 @@ backend/alembic/versions/*.pyc
 # MCP / tooling artifacts
 .playwright-mcp/
 .serena/
+.codex_artifacts/
+
+# Local desktop bootstrap credentials (never commit or serve publicly)
+/frontend/client-access.json
+/frontend/public/client-access.json
 
 # Backups
 *.bak
@@ -106,3 +113,5 @@ agentcontinue.md
 *.exe
 *.msi
 *.dmg
+*.p12
+*.pfx

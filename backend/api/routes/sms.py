@@ -1,21 +1,26 @@
 """Mobile SMS ingestion API."""
 from __future__ import annotations
 
+import asyncio
+import json
 import os
+import re
+import secrets
 import time
+from functools import lru_cache
 from datetime import datetime
 from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
 import pytz
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from pydantic import BaseModel, Field
 from sqlalchemy import case, func, text
 from sqlalchemy.orm import Session
 
-from api.dependencies import require_mobile_ingest_key
+from database import connection as database_connection
 from database.connection import get_db_session
-from database.models import MonitoredBotChat, Transaction
+from database.models import DuplicateSuggestion, Transaction
 from parsers.parser_orchestrator import ParserOrchestrator
 from services import receipt_logger
 from services.access_control_service import write_audit_log
@@ -25,13 +30,85 @@ from services.fingerprint import compute_fingerprint_candidates
 router = APIRouter(
     prefix="/api/sms",
     tags=["sms"],
-    dependencies=[Depends(require_mobile_ingest_key)],
 )
 
 # In-process fallback rate-limit state, used only when Redis is unavailable so
 # the endpoint never fails fully open. Keyed by "actor:minute_slot". Bounded by
 # opportunistic cleanup of stale slots.
 _FALLBACK_RATE: Dict[str, int] = {}
+_DEVICE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+
+
+def _normalize_device_id(value: str) -> str:
+    candidate = str(value or "")
+    if candidate != candidate.strip() or not _DEVICE_ID_RE.fullmatch(candidate):
+        raise ValueError("Invalid mobile device id")
+    return candidate
+
+
+@lru_cache(maxsize=4)
+def _parse_mobile_device_keys(raw_config: str) -> Dict[str, tuple[str, ...]]:
+    """Parse fail-closed per-device current/previous keys from environment JSON."""
+    if not raw_config.strip():
+        raise ValueError("MOBILE_DEVICE_KEYS_JSON is not configured")
+    try:
+        payload = json.loads(raw_config)
+    except json.JSONDecodeError as exc:
+        raise ValueError("MOBILE_DEVICE_KEYS_JSON is invalid JSON") from exc
+    if not isinstance(payload, dict) or not payload:
+        raise ValueError("MOBILE_DEVICE_KEYS_JSON must be a non-empty object")
+
+    parsed: Dict[str, tuple[str, ...]] = {}
+    for raw_device_id, entry in payload.items():
+        device_id = _normalize_device_id(raw_device_id)
+        if device_id != raw_device_id:
+            raise ValueError("MOBILE_DEVICE_KEYS_JSON contains a non-canonical device id")
+
+        if isinstance(entry, str):
+            current = entry
+            previous: List[str] = []
+        elif isinstance(entry, dict) and set(entry).issubset({"current", "previous"}):
+            current = entry.get("current")
+            raw_previous = entry.get("previous", [])
+            if isinstance(raw_previous, str):
+                previous = [raw_previous]
+            elif isinstance(raw_previous, list) and all(isinstance(item, str) for item in raw_previous):
+                previous = raw_previous
+            else:
+                raise ValueError("Mobile previous keys must be a string or list of strings")
+        else:
+            raise ValueError("Each mobile device must define current and optional previous keys")
+
+        keys = [current, *previous]
+        if not all(isinstance(key, str) and len(key) >= 32 and key == key.strip() for key in keys):
+            raise ValueError("Mobile device keys must be canonical strings of at least 32 characters")
+        unique_keys = tuple(dict.fromkeys(keys))
+        parsed[device_id] = unique_keys
+    return parsed
+
+
+async def _require_mobile_device(
+    device_id: Optional[str] = Header(default=None, alias="X-Mobile-Device-Id"),
+    ingest_key: Optional[str] = Header(default=None, alias="X-Mobile-Ingest-Key"),
+) -> str:
+    try:
+        canonical_device_id = _normalize_device_id(device_id or "")
+        device_keys = _parse_mobile_device_keys(os.getenv("MOBILE_DEVICE_KEYS_JSON", ""))
+    except ValueError as exc:
+        if not os.getenv("MOBILE_DEVICE_KEYS_JSON", "").strip():
+            raise HTTPException(status_code=503, detail="Mobile device authentication is not configured") from exc
+        if not device_id or not _DEVICE_ID_RE.fullmatch(str(device_id)):
+            raise HTTPException(status_code=403, detail="Invalid mobile device credentials") from exc
+        raise HTTPException(status_code=503, detail="Mobile device authentication configuration is invalid") from exc
+
+    supplied_key = ingest_key or ""
+    candidates = device_keys.get(canonical_device_id, ("0" * 32,))
+    matched = False
+    for candidate in candidates:
+        matched = secrets.compare_digest(supplied_key, candidate) or matched
+    if not matched:
+        raise HTTPException(status_code=403, detail="Invalid mobile device credentials")
+    return canonical_device_id
 
 
 def _fallback_rate_check(key: str, limit: int) -> bool:
@@ -58,7 +135,7 @@ class SmsMessage(BaseModel):
 
 
 class SmsIngestRequest(BaseModel):
-    device_id: Optional[str] = Field(default="", max_length=128)
+    device_id: str = Field(..., min_length=1, max_length=128)
     messages: List[SmsMessage] = Field(..., min_length=1, max_length=50)
 
 
@@ -246,11 +323,17 @@ def _normalize_confidence(value: Any) -> float:
     return max(0.0, min(1.0, num))
 
 
+def _parse_sms_in_worker(text_value: str, received_at: datetime) -> Optional[Dict[str, Any]]:
+    """Keep parser/AI work off the API event loop and DB sessions thread-local."""
+    with database_connection.SessionLocal() as parser_db:
+        return ParserOrchestrator(parser_db).parse_text(
+            text_value,
+            fallback_datetime=received_at,
+        )
+
+
 async def _enforce_sms_ingest_rate_limit(request: Request, db: Session, device_id: str) -> None:
-    # Throttle by source IP, not by the client-supplied device_id: a caller can
-    # mint unlimited device_ids to dodge the limit. device_id stays in the audit
-    # trail for forensics only.
-    actor = _request_ip(request)
+    actor = f"{device_id}:{_request_ip(request)}"
     minute_slot = int(time.time() // 60)
     key = f"sms_ingest:rate:{actor}:{minute_slot}"
 
@@ -289,7 +372,10 @@ async def _enforce_sms_ingest_rate_limit(request: Request, db: Session, device_i
 
 
 @router.get("/health", response_model=SmsHealthResponse)
-async def sms_health(db: Session = Depends(get_db_session)) -> SmsHealthResponse:
+async def sms_health(
+    _authenticated_device_id: str = Depends(_require_mobile_device),
+    db: Session = Depends(get_db_session),
+) -> SmsHealthResponse:
     db_status = "ok"
     try:
         db.execute(text("SELECT 1"))
@@ -300,7 +386,7 @@ async def sms_health(db: Session = Depends(get_db_session)) -> SmsHealthResponse
     return SmsHealthResponse(
         status="ok" if db_status == "ok" else "degraded",
         db=db_status,
-        version=os.getenv("APP_VERSION", "1.2.0"),
+        version=os.getenv("APP_VERSION", "1.4.24"),
         server_time=now_local.replace(tzinfo=None).isoformat() + "Z",
     )
 
@@ -309,18 +395,19 @@ async def sms_health(db: Session = Depends(get_db_session)) -> SmsHealthResponse
 async def ingest_sms(
     payload: SmsIngestRequest,
     request: Request,
+    authenticated_device_id: str = Depends(_require_mobile_device),
     db: Session = Depends(get_db_session),
 ) -> SmsIngestResponse:
+    if payload.device_id != authenticated_device_id:
+        raise HTTPException(status_code=403, detail="Body device_id does not match authenticated device")
     max_batch = _ingest_max_batch()
     if len(payload.messages) > max_batch:
         raise HTTPException(status_code=422, detail=f"Maximum {max_batch} messages per request")
 
-    await _enforce_sms_ingest_rate_limit(request, db, payload.device_id)
-    orchestrator = ParserOrchestrator(db)
-
+    await _enforce_sms_ingest_rate_limit(request, db, authenticated_device_id)
     results: List[SmsIngestResultItem] = []
     log_events: List[Dict[str, Any]] = []
-    src_device_id = (payload.device_id or "").strip() or None
+    src_device_id = authenticated_device_id
 
     for msg in payload.messages:
         # Idempotency by (device_id, device_sms_id): a re-sent batch (network
@@ -350,7 +437,7 @@ async def ingest_sms(
                 continue
 
         try:
-            parsed = orchestrator.parse_text(msg.text)
+            parsed = await asyncio.to_thread(_parse_sms_in_worker, msg.text, msg.received_at)
         except Exception as exc:  # noqa: BLE001
             results.append(
                 SmsIngestResultItem(
@@ -396,20 +483,13 @@ async def ingest_sms(
                     transaction_type=txn_type,
                 )
                 fp = fp_candidates[0]
-                existing = db.query(Transaction).filter(Transaction.fingerprint.in_(fp_candidates)).first()
-                if existing:
-                    results.append(
-                        SmsIngestResultItem(
-                            device_sms_id=msg.device_sms_id,
-                            status="duplicate",
-                            transaction_id=int(existing.id),
-                            fingerprint=fp,
-                            parsed=_summary_from_txn(existing),
-                        )
-                    )
-                    log_events.append({"kind": "duplicate", "txn": existing})
-                    continue
-
+                fingerprint_candidate = (
+                    db.query(Transaction)
+                    .filter(Transaction.fingerprint.in_(fp_candidates))
+                    .filter(func.upper(func.coalesce(Transaction.source_type, "")) != "SMS")
+                    .order_by(Transaction.id.asc())
+                    .first()
+                )
                 store_amount = -abs(amount) if txn_type == "DEBIT" else abs(amount)
                 txn = Transaction(
                     raw_message=msg.text,
@@ -435,6 +515,20 @@ async def ingest_sms(
                 )
                 db.add(txn)
                 db.flush()
+                if fingerprint_candidate is not None:
+                    db.add(
+                        DuplicateSuggestion(
+                            task_id=None,
+                            primary_transaction_id=int(fingerprint_candidate.id),
+                            duplicate_transaction_id=int(txn.id),
+                            confidence=0.6,
+                            reasoning="fuzzy_fingerprint_match_requires_review",
+                            payload_json=json.dumps(
+                                {"fingerprint": fp, "candidates": fp_candidates},
+                                ensure_ascii=False,
+                            ),
+                        )
+                    )
 
                 results.append(
                     SmsIngestResultItem(
@@ -576,6 +670,7 @@ def _source_label(source_type: Optional[str]) -> str:
 
 @router.get("/stats", response_model=SmsStatsResponse)
 async def sms_stats(
+    authenticated_device_id: str = Depends(_require_mobile_device),
     db: Session = Depends(get_db_session),
     date_from: Optional[datetime] = None,
     date_to: Optional[datetime] = None,
@@ -585,7 +680,11 @@ async def sms_stats(
     currency: str = "UZS",
 ) -> SmsStatsResponse:
     currency = (currency or "UZS").upper()[:3]
-    base = db.query(Transaction).filter(Transaction.currency == currency)
+    base = db.query(Transaction).filter(
+        Transaction.currency == currency,
+        Transaction.source_type == "SMS",
+        Transaction.source_device_id == authenticated_device_id,
+    )
 
     nd_from = _normalize_datetime(date_from) if date_from is not None else None
     nd_to = _normalize_datetime(date_to) if date_to is not None else None
@@ -595,12 +694,8 @@ async def sms_stats(
         base = base.filter(Transaction.transaction_date <= nd_to)
 
     src = (source or "all").lower()
-    if src == "sms":
-        base = base.filter(Transaction.source_type == "SMS")
-    elif src == "telegram":
-        base = base.filter(Transaction.source_type == "AUTO")
-        if source_chat_id is not None:
-            base = base.filter(Transaction.source_chat_id == source_chat_id)
+    if src not in {"all", "sms"} or source_chat_id is not None:
+        raise HTTPException(status_code=422, detail="Mobile stats are limited to the authenticated SMS device")
 
     card_norm = _normalize_card_last4(card) if card else None
     if card_norm:
@@ -665,38 +760,8 @@ async def sms_stats(
     )
 
 
-class SmsSourceItem(BaseModel):
-    chat_id: int
-    title: Optional[str] = None
-    count: int
-
-
-class SmsSourcesResponse(BaseModel):
-    items: List[SmsSourceItem]
-
-
 @router.get("/sources", response_model=SmsSourcesResponse)
-async def sms_sources(db: Session = Depends(get_db_session)) -> SmsSourcesResponse:
-    rows = (
-        db.query(Transaction.source_chat_id, func.count(Transaction.id))
-        .filter(Transaction.source_type == "AUTO", Transaction.source_chat_id != 0)
-        .group_by(Transaction.source_chat_id)
-        .order_by(func.count(Transaction.id).desc())
-        .all()
-    )
-    title_map: Dict[int, str] = {}
-    try:
-        meta = db.query(MonitoredBotChat.chat_id, MonitoredBotChat.chat_title).filter(
-            MonitoredBotChat.chat_title.isnot(None)
-        ).all()
-        for chat_id, title in meta:
-            if title:
-                title_map[int(chat_id)] = str(title)
-    except Exception:
-        pass
-
-    items = [
-        SmsSourceItem(chat_id=int(cid), title=title_map.get(int(cid)), count=int(cnt))
-        for cid, cnt in rows
-    ]
-    return SmsSourcesResponse(items=items)
+async def sms_sources(
+    _authenticated_device_id: str = Depends(_require_mobile_device),
+) -> SmsSourcesResponse:
+    return SmsSourcesResponse(items=[])

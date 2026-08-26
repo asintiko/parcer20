@@ -4,6 +4,7 @@ import { Search, Plus, Download, Upload, Rows3, Rows2, X } from 'lucide-react';
 import { AnimatePresence, motion } from 'motion/react';
 import { referenceApi, type OperatorReference, type OperatorReferenceCreate } from '../services/api';
 import { ReferenceTable } from '../components/ReferenceTable';
+import { DescriptionsPanel } from '../components/DescriptionsPanel';
 import { useToast } from '../components/Toast';
 import { Sheet } from '../components/motion/Sheet';
 import { ConfirmDialog } from '../components/motion/ConfirmDialog';
@@ -13,6 +14,7 @@ type PageSizeOption = number | 'all';
 const PAGE_SIZE_DEFAULT: PageSizeOption = 100;
 type StatusFilter = 'all' | 'active' | 'inactive' | 'p2p';
 type Density = 'standard' | 'compact';
+type Section = 'operators' | 'descriptions';
 
 const STATUS_FILTERS: { key: StatusFilter; label: string }[] = [
     { key: 'all', label: 'Все' },
@@ -25,6 +27,7 @@ export function ReferencePage() {
     const queryClient = useQueryClient();
     const { showToast } = useToast();
 
+    const [section, setSection] = useState<Section>('operators');
     const [page, setPage] = useState(1);
     const [pageSize, setPageSize] = useState<PageSizeOption>(PAGE_SIZE_DEFAULT);
     const [search, setSearch] = useState('');
@@ -202,7 +205,7 @@ export function ReferencePage() {
                 e.preventDefault();
                 searchRef.current?.focus();
             }
-            if (mod && e.key.toLowerCase() === 'n') {
+            if (mod && e.key.toLowerCase() === 'n' && section === 'operators') {
                 e.preventDefault();
                 setIsAddOpen(true);
             }
@@ -212,7 +215,7 @@ export function ReferencePage() {
         };
         window.addEventListener('keydown', onKey);
         return () => window.removeEventListener('keydown', onKey);
-    }, []);
+    }, [section]);
 
     const total = (listQuery.data as any)?.total || 0;
     const items: OperatorReference[] = (listQuery.data as any)?.items || [];
@@ -238,44 +241,87 @@ export function ReferencePage() {
             <header className="rf-head">
                 <div className="rf-eyebrow">
                     <span className="rf-eyebrow-dot" />
-                    Справочник · operator → application
+                    {section === 'operators'
+                        ? 'Справочник · operator → application'
+                        : 'Справочник · описания → operator'}
                 </div>
                 <div className="rf-head-row">
                     <div className="rf-head-text">
-                        <h1 className="rf-title">
-                            Справочник <em>операторов</em>
-                        </h1>
-                        <p className="rf-subtitle">
-                            Единый источник маппинга: имя продавца на чеке → нормализованное приложение.
-                            Используется в каскаде распознавания.
-                        </p>
+                        {section === 'operators' ? (
+                            <>
+                                <h1 className="rf-title">
+                                    Справочник <em>операторов</em>
+                                </h1>
+                                <p className="rf-subtitle">
+                                    Единый источник маппинга: имя продавца на чеке → нормализованное приложение.
+                                    Используется в каскаде распознавания.
+                                </p>
+                            </>
+                        ) : (
+                            <>
+                                <h1 className="rf-title">
+                                    Справочник <em>описаний</em>
+                                </h1>
+                                <p className="rf-subtitle">
+                                    Человекочитаемые описания мерчантов. Описание привязывается к операторам и
+                                    подставляется в каждый чек с тем же продавцом.
+                                </p>
+                            </>
+                        )}
                     </div>
-                    <div className="rf-head-actions">
-                        <button
-                            type="button"
-                            className="rf-btn"
-                            onClick={() => fileInputRef.current?.click()}
-                            disabled={importMutation.isPending}
-                        >
-                            <Upload size={14} />
-                            {importMutation.isPending ? 'Импорт…' : 'Импорт'}
-                        </button>
-                        <button type="button" className="rf-btn" onClick={handleExport}>
-                            <Download size={14} />
-                            Экспорт
-                        </button>
-                        <button
-                            type="button"
-                            className="rf-btn rf-btn-primary"
-                            onClick={() => setIsAddOpen(true)}
-                            title="⌘N · добавить запись"
-                        >
-                            <Plus size={14} />
-                            Добавить
-                        </button>
-                    </div>
+                    {section === 'operators' ? (
+                        <div className="rf-head-actions">
+                            <button
+                                type="button"
+                                className="rf-btn"
+                                onClick={() => fileInputRef.current?.click()}
+                                disabled={importMutation.isPending}
+                            >
+                                <Upload size={14} />
+                                {importMutation.isPending ? 'Импорт…' : 'Импорт'}
+                            </button>
+                            <button type="button" className="rf-btn" onClick={handleExport}>
+                                <Download size={14} />
+                                Экспорт
+                            </button>
+                            <button
+                                type="button"
+                                className="rf-btn rf-btn-primary"
+                                onClick={() => setIsAddOpen(true)}
+                                title="⌘N · добавить запись"
+                            >
+                                <Plus size={14} />
+                                Добавить
+                            </button>
+                        </div>
+                    ) : null}
+                </div>
+                <div className="rf-chips rf-tabs" role="tablist" aria-label="Раздел справочника">
+                    <button
+                        type="button"
+                        role="tab"
+                        aria-selected={section === 'operators'}
+                        className={`rf-chip${section === 'operators' ? ' is-active' : ''}`}
+                        onClick={() => setSection('operators')}
+                    >
+                        Операторы
+                        <span className="rf-chip-count">{stats.total}</span>
+                    </button>
+                    <button
+                        type="button"
+                        role="tab"
+                        aria-selected={section === 'descriptions'}
+                        className={`rf-chip${section === 'descriptions' ? ' is-active' : ''}`}
+                        onClick={() => setSection('descriptions')}
+                    >
+                        Описания
+                    </button>
                 </div>
             </header>
+
+            {section === 'descriptions' ? <DescriptionsPanel /> : (
+            <>
+
 
             <div className="rf-stats" role="region" aria-label="Сводка справочника">
                 <div className="rf-stat">
@@ -557,6 +603,8 @@ export function ReferencePage() {
                 onConfirm={handleConfirmDelete}
                 onClose={() => setConfirmDelete(null)}
             />
+            </>
+            )}
         </div>
     );
 }

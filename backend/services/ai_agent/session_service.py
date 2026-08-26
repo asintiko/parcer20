@@ -9,7 +9,13 @@ from uuid import UUID, uuid4
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
-from database.models import AgentMessage, AgentRun, AgentRunEvent, AgentThread
+from database.models import (
+    AGENT_RUN_EVENT_TYPES,
+    AgentMessage,
+    AgentRun,
+    AgentRunEvent,
+    AgentThread,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -21,18 +27,7 @@ THREAD_RETENTION_DAYS = 30
 # Any value outside this set raises IntegrityError on commit, which previously
 # poisoned the whole run transaction (run stuck in `processing`). We normalize
 # unknown values to `failed` so a telemetry write can never break a run.
-_ALLOWED_RUN_EVENT_TYPES = frozenset(
-    {
-        "planning_started",
-        "tool_selected",
-        "tool_started",
-        "tool_progress",
-        "tool_finished",
-        "awaiting_confirmation",
-        "completed",
-        "failed",
-    }
-)
+_ALLOWED_RUN_EVENT_TYPES = frozenset(AGENT_RUN_EVENT_TYPES)
 
 
 def _dump_json(payload: Optional[JsonDict]) -> str:

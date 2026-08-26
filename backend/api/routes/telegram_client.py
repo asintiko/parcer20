@@ -13,11 +13,12 @@ import tempfile
 import shutil
 from contextlib import suppress
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Literal, Optional
 
 import mimetypes
+import httpx
 
-from fastapi import APIRouter, Depends, HTTPException, Header, Query, WebSocket, WebSocketDisconnect, UploadFile, File, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect, UploadFile, File, Request
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
@@ -29,6 +30,7 @@ from database.models import (
     ReceiptProcessingTask,
     TgChatMessage,
     Transaction,
+    User,
 )
 from services.telegram_tdlib_manager import (
     TDLibUnavailableError,
@@ -38,19 +40,26 @@ from services.telegram_tdlib_manager import (
 from services.history_loader import get_history_loader_service, init_history_loader_service
 from services.tg_auto_monitor_service import get_auto_monitor_service, init_auto_monitor_service
 from services.message_utils import (
-    RECEIPT_KEYWORDS_LOWER,
-    MIN_RECEIPT_TEXT_LEN,
     looks_like_receipt,
     format_tdlib_message,
     build_task_data_from_message,
+    is_metadata_only_chat,
+    is_receipt_datetime_allowed,
 )
 from workers.celery_worker import queue_receipt_task
-from api.dependencies import get_allowed_sources_for_user, get_current_user, get_current_user_optional, require_sources_scope, require_tab_access
+from api.dependencies import (
+    get_allowed_sources_for_user,
+    get_current_user,
+    require_session_active,
+    require_sources_scope,
+    require_tab_access,
+)
 from services.auth_service import verify_jwt_token
 from services.access_control_service import hash_password, verify_password
 from services.auth_bot_service import create_chat_access_token, verify_chat_access_token
-from services.auth_bot_service import register_active_session, get_redis, AUTH_EVENT_CHANNEL, is_session_revoked
-from services.internal_api_key_service import is_valid_internal_api_key
+from services.auth_bot_service import register_active_session, get_redis, AUTH_EVENT_CHANNEL
+from services.internal_api_key_service import is_internal_request
+from services.user_service import build_permissions_snapshot
 
 logger = logging.getLogger(__name__)
 
@@ -71,20 +80,88 @@ CHAT_PASSWORD_LOCKOUT_MINUTES = int(os.getenv("CHAT_PASSWORD_LOCKOUT_MINUTES", "
 CHAT_PASSWORD_MAX_ATTEMPTS = int(os.getenv("CHAT_PASSWORD_MAX_ATTEMPTS", "5"))
 WS_HEARTBEAT_SECONDS = max(3, int(os.getenv("TG_WS_HEARTBEAT_SECONDS", "10")))
 
-_tg_ws_clients: Set[WebSocket] = set()
+_tg_ws_clients: Dict[WebSocket, Dict[str, Any]] = {}
 _tg_ws_lock = asyncio.Lock()
+_web_app_launch_owners: Dict[str, tuple[int, int]] = {}
 
 
 async def _broadcast_tg_event(payload: Dict[str, Any]) -> None:
     stale: List[WebSocket] = []
     async with _tg_ws_lock:
-        for ws in list(_tg_ws_clients):
+        for ws, access in list(_tg_ws_clients.items()):
             try:
-                await ws.send_json(payload)
+                filtered = _filter_ws_event_for_access(payload, access)
+                if filtered is not None:
+                    await ws.send_json(filtered)
             except Exception:
                 stale.append(ws)
         for ws in stale:
-            _tg_ws_clients.discard(ws)
+            _tg_ws_clients.pop(ws, None)
+
+
+def _event_chat_id(payload: Dict[str, Any]) -> Optional[int]:
+    candidates = [payload, payload.get("payload")]
+    for item in candidates:
+        if not isinstance(item, dict):
+            continue
+        for key in ("chat_id", "source_chat_id"):
+            try:
+                value = int(item.get(key) or 0)
+            except (TypeError, ValueError):
+                value = 0
+            if value:
+                return value
+    return None
+
+
+def _chat_is_password_protected(chat_id: int) -> bool:
+    db = SessionLocal()
+    try:
+        return db.get(ChatPassword, int(chat_id)) is not None
+    finally:
+        db.close()
+
+
+def _filter_ws_event_for_access(
+    payload: Dict[str, Any],
+    access: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    allowed_sources = access.get("allowed_sources")
+    chat_id = _event_chat_id(payload)
+    if chat_id is not None:
+        if allowed_sources is not None and chat_id not in allowed_sources:
+            return None
+        # The WS protocol has no per-chat proof channel. Protected-chat events
+        # are therefore denied rather than broadcast without X-Chat-Access.
+        if _chat_is_password_protected(chat_id):
+            return None
+
+    event_payload = payload.get("payload")
+    if (
+        payload.get("type") == "sync-update"
+        and isinstance(event_payload, dict)
+        and event_payload.get("table") == "transactions"
+        and allowed_sources is not None
+    ):
+        ids = [int(value) for value in event_payload.get("ids") or [] if str(value).isdigit()]
+        if not ids or not allowed_sources:
+            return None
+        db = SessionLocal()
+        try:
+            visible_ids = [
+                int(row[0])
+                for row in db.query(Transaction.id)
+                .filter(Transaction.id.in_(ids), Transaction.source_chat_id.in_(allowed_sources))
+                .all()
+            ]
+        finally:
+            db.close()
+        if not visible_ids:
+            return None
+        filtered = dict(payload)
+        filtered["payload"] = {**event_payload, "ids": visible_ids, "count": len(visible_ids)}
+        return filtered
+    return payload
 
 
 _settings_listener_task: Optional[asyncio.Task] = None
@@ -167,6 +244,17 @@ class PasswordRequest(BaseModel):
     password: str = Field(..., description="2FA password if enabled")
 
 
+class TgKeyboardButton(BaseModel):
+    text: Optional[str] = None
+    type: str = "other"
+    url: Optional[str] = None
+
+
+class TgReplyMarkup(BaseModel):
+    kind: str  # 'inline' | 'keyboard'
+    rows: List[List[TgKeyboardButton]] = Field(default_factory=list)
+
+
 class ChatMessage(BaseModel):
     id: Optional[int] = None
     date: Optional[str] = None
@@ -175,6 +263,7 @@ class ChatMessage(BaseModel):
     text: Optional[str] = None
     document: Optional[Dict[str, Any]] = None
     photo: Optional[Dict[str, Any]] = None
+    reply_markup: Optional[TgReplyMarkup] = None
     # Receipt processing status (enriched server-side)
     processed: Optional[bool] = None
     processed_status: Optional[str] = None  # 'done' | 'queued' | 'processing' | 'failed' | 'not_processed'
@@ -275,6 +364,35 @@ class SendMessageRequest(BaseModel):
     text: str
 
 
+class OpenWebAppRequest(BaseModel):
+    url: str
+    bot_user_id: Optional[int] = None
+    button_kind: Literal["inline", "keyboard", "menu"]
+
+
+class OpenWebAppResponse(BaseModel):
+    url: str
+    launch_id: Optional[str] = None
+
+
+class CloseWebAppRequest(BaseModel):
+    launch_id: str
+
+
+class SendWebAppDataRequest(BaseModel):
+    bot_user_id: Optional[int] = None
+    button_text: str
+    data: str
+
+
+class ChatMenuButtonResponse(BaseModel):
+    available: bool
+    text: Optional[str] = None
+    url: Optional[str] = None
+    is_main: bool = False
+    bot_user_id: Optional[int] = None
+
+
 class ProcessResult(BaseModel):
     chat_id: int
     message_id: int
@@ -356,6 +474,7 @@ async def require_chat_access(
     payload = verify_chat_access_token(token)
     if not payload or int(payload.get("chat_id") or 0) != int(chat_id):
         raise HTTPException(status_code=403, detail={"error": "chat_locked", "chat_id": chat_id})
+    await require_session_active(payload)
 
 
 def _ensure_chat_allowed(chat_id: int, current_user: Optional[dict]) -> None:
@@ -1118,13 +1237,14 @@ async def verify_chat_password(
         db.commit()
         token = create_chat_access_token(chat_id=chat_id, user_id=current_user.get("user_id"))
         decoded = verify_chat_access_token(token) or {}
-        if decoded:
-            await register_active_session(
-                token_payload=decoded,
-                token_kind="chat_access",
-                user_id=current_user.get("user_id"),
-                subject=f"chat:{chat_id}",
-            )
+        registered_sid = await register_active_session(
+            token_payload=decoded,
+            token_kind="chat_access",
+            user_id=current_user.get("user_id"),
+            subject=f"chat:{chat_id}",
+        )
+        if registered_sid != str(decoded.get("sid") or ""):
+            raise HTTPException(status_code=503, detail="session_registration_failed")
         return ChatPasswordVerifyResponse(verified=True, session_token=token, expires_in=3600)
 
     row.failed_attempts = int(row.failed_attempts or 0) + 1
@@ -1431,6 +1551,7 @@ async def process_history_receipts(
             continue
 
         task_data = _build_task_data_from_message(int(chat_id), msg_id, {
+            "date": formatted.date,
             "text": formatted.text or "",
             "document": formatted.document,
             "photo": formatted.photo,
@@ -1607,6 +1728,203 @@ async def send_document(
             pass
 
 
+async def _resolve_bot_user_id(
+    manager: TelegramTDLibManager,
+    chat_id: int,
+    bot_user_id: Optional[int],
+) -> Optional[int]:
+    try:
+        resolved_bot_user_id = await manager.resolve_bot_user_id(chat_id)
+    except TDLibUnavailableError:
+        raise
+    except Exception:  # noqa: BLE001
+        return None
+    if resolved_bot_user_id is None:
+        return None
+    if bot_user_id is not None and int(bot_user_id) != int(resolved_bot_user_id):
+        raise HTTPException(status_code=403, detail="bot_forbidden")
+    return int(resolved_bot_user_id)
+
+
+def _web_app_launch_owner(chat_id: int, current_user: dict) -> tuple[int, int]:
+    user_id = current_user.get("user_id")
+    if user_id is None:
+        raise HTTPException(status_code=403, detail="invalid_user_identity")
+    return int(chat_id), int(user_id)
+
+
+def _extract_webapp_url(value: Any) -> str:
+    """webAppInfo.url / mainWebApp.url / httpUrl differ across TDLib builds: a plain
+    string (older) or a webAppUrl/{url:...} object (newer). Normalise to the string."""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, dict):
+        inner = value.get("url")
+        if isinstance(inner, str):
+            return inner.strip()
+        if isinstance(inner, dict):
+            return (inner.get("url") or "").strip()
+    return ""
+
+
+def _strip_menu_scheme(url: str) -> str:
+    """TDLib prefixes a menu-button web app URL with the internal ``menu://`` scheme."""
+    url = (url or "").strip()
+    return url[len("menu://"):] if url.startswith("menu://") else url
+
+
+@router.post("/chats/{chat_id}/webapp/open", response_model=OpenWebAppResponse)
+async def open_web_app(
+    chat_id: int,
+    payload: OpenWebAppRequest,
+    manager: TelegramTDLibManager = Depends(tdlib_manager_dep),
+    current_user: dict = Depends(get_current_user),
+    _chat_access: None = Depends(require_chat_access),
+) -> OpenWebAppResponse:
+    _ensure_chat_allowed(chat_id, current_user)
+    try:
+        bot_user_id = await _resolve_bot_user_id(manager, chat_id, payload.bot_user_id)
+        if bot_user_id is None:
+            raise HTTPException(status_code=400, detail="Unable to resolve bot for this chat")
+
+        req_url = _strip_menu_scheme(payload.url or "")
+
+        if payload.button_kind == "keyboard":
+            web_app_url = await manager.get_web_app_url(bot_user_id=bot_user_id, url=req_url)
+            resolved = _extract_webapp_url(web_app_url)
+            if not resolved:
+                raise HTTPException(status_code=400, detail="Bot did not return a web app URL")
+            return OpenWebAppResponse(url=resolved, launch_id=None)
+
+        web_app_info = await manager.open_web_app(chat_id=chat_id, bot_user_id=bot_user_id, url=req_url)
+        if not web_app_info:
+            raise HTTPException(status_code=400, detail="Bot did not return web app info")
+        resolved = _extract_webapp_url(web_app_info.get("url"))
+        if not resolved:
+            raise HTTPException(status_code=400, detail="Bot did not return a web app URL")
+        launch_id = str(web_app_info.get("launch_id") or "").strip()
+        if launch_id:
+            _web_app_launch_owners[launch_id] = _web_app_launch_owner(chat_id, current_user)
+        return OpenWebAppResponse(url=resolved, launch_id=launch_id)
+    except HTTPException:
+        raise
+    except TDLibUnavailableError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=f"Failed to open mini app: {exc}")
+
+
+@router.post("/chats/{chat_id}/webapp/close")
+async def close_web_app(
+    chat_id: int,
+    payload: CloseWebAppRequest,
+    manager: TelegramTDLibManager = Depends(tdlib_manager_dep),
+    current_user: dict = Depends(get_current_user),
+    _chat_access: None = Depends(require_chat_access),
+) -> Dict[str, bool]:
+    _ensure_chat_allowed(chat_id, current_user)
+    launch_id = (payload.launch_id or "").strip()
+    if not launch_id:
+        return {"ok": True}
+    owner = _web_app_launch_owner(chat_id, current_user)
+    if _web_app_launch_owners.get(launch_id) != owner:
+        raise HTTPException(status_code=403, detail="web_app_launch_forbidden")
+    _web_app_launch_owners.pop(launch_id, None)
+    try:
+        await manager.close_web_app(int(launch_id))
+    except TDLibUnavailableError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=f"Failed to close mini app: {exc}")
+    return {"ok": True}
+
+
+@router.post("/chats/{chat_id}/webapp/data")
+async def send_web_app_data(
+    chat_id: int,
+    payload: SendWebAppDataRequest,
+    manager: TelegramTDLibManager = Depends(tdlib_manager_dep),
+    current_user: dict = Depends(get_current_user),
+    _chat_access: None = Depends(require_chat_access),
+) -> Dict[str, bool]:
+    _ensure_chat_allowed(chat_id, current_user)
+    try:
+        bot_user_id = await _resolve_bot_user_id(manager, chat_id, payload.bot_user_id)
+        if bot_user_id is None:
+            raise HTTPException(status_code=400, detail="Unable to resolve bot for this chat")
+        await manager.send_web_app_data(
+            bot_user_id=bot_user_id,
+            button_text=payload.button_text,
+            data=payload.data,
+        )
+    except HTTPException:
+        raise
+    except TDLibUnavailableError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=f"Failed to send mini app data: {exc}")
+    return {"ok": True}
+
+
+@router.get("/chats/{chat_id}/menu-button", response_model=ChatMenuButtonResponse)
+async def get_chat_menu_button(
+    chat_id: int,
+    manager: TelegramTDLibManager = Depends(tdlib_manager_dep),
+    current_user: dict = Depends(get_current_user),
+    _chat_access: None = Depends(require_chat_access),
+) -> ChatMenuButtonResponse:
+    _ensure_chat_allowed(chat_id, current_user)
+    try:
+        bot_user_id = await _resolve_bot_user_id(manager, chat_id, None)
+    except Exception:  # noqa: BLE001 — contract: tolerate TDLib errors, degrade to unavailable
+        bot_user_id = None
+    if bot_user_id is None:
+        return ChatMenuButtonResponse(available=False, is_main=False, bot_user_id=None)
+
+    # A user account reads a bot's menu button via getUserFullInfo().bot_info.menu_button.
+    # getMenuButton is a bots-only API and returns an empty button for user accounts,
+    # so it never surfaces a bot's Mini App menu button to a userbot.
+    try:
+        menu_button: dict = {}
+        full_info = await manager.get_user_full_info(bot_user_id)
+        bot_info = (full_info or {}).get("bot_info") or {}
+        if isinstance(bot_info.get("menu_button"), dict):
+            menu_button = bot_info["menu_button"]
+        menu_url = (menu_button or {}).get("url") or ""
+        if not menu_url:
+            # Fallback: getMenuButton (covers the case where we are the bot).
+            mb = await manager.get_menu_button(bot_user_id)
+            if isinstance(mb, dict) and (mb.get("url") or ""):
+                menu_button = mb
+                menu_url = mb.get("url") or ""
+        if menu_url:
+            return ChatMenuButtonResponse(
+                available=True,
+                text=(menu_button or {}).get("text") or "Открыть приложение",
+                url=_strip_menu_scheme(menu_url),
+                is_main=False,
+                bot_user_id=bot_user_id,
+            )
+    except Exception:  # noqa: BLE001
+        pass
+
+    try:
+        main_web_app = await manager.get_main_web_app(chat_id=chat_id, bot_user_id=bot_user_id, start_parameter="")
+        main_url = _strip_menu_scheme(_extract_webapp_url((main_web_app or {}).get("url")))
+        if main_url:
+            return ChatMenuButtonResponse(
+                available=True,
+                text="Открыть приложение",
+                url=main_url,
+                is_main=True,
+                bot_user_id=bot_user_id,
+            )
+    except Exception:  # noqa: BLE001
+        pass
+
+    return ChatMenuButtonResponse(available=False, is_main=False, bot_user_id=bot_user_id)
+
+
 @router.post("/chats/{chat_id}/messages/{message_id}/process", response_model=ProcessResult)
 async def process_message(
     chat_id: int,
@@ -1660,9 +1978,9 @@ async def process_message(
 @reprocess_router.post("/receipt/reprocess")
 async def internal_reprocess_receipt(
     payload: Dict[str, Any],
+    request: Request,
     db: Session = Depends(get_db_session),
     manager: TelegramTDLibManager = Depends(tdlib_manager_dep),
-    x_internal_api_key: Optional[str] = Header(None, alias="X-Internal-Api-Key"),
 ) -> Dict[str, Any]:
     """Reprocess a single message synchronously via TDLib (force=True).
 
@@ -1670,8 +1988,8 @@ async def internal_reprocess_receipt(
     it delegates here. Emits a fresh receipt-log event reflecting the outcome.
     Returns a compact status the bot uses to edit the original failure message.
     """
-    if not is_valid_internal_api_key(x_internal_api_key):
-        raise HTTPException(status_code=403, detail="invalid_internal_api_key")
+    if not is_internal_request(request):
+        raise HTTPException(status_code=403, detail="invalid_internal_request")
 
     from services.receipt_processor import process_tdlib_message
     from services import receipt_logger
@@ -1684,8 +2002,22 @@ async def internal_reprocess_receipt(
 
     chat_title = None
     row = db.get(MonitoredBotChat, chat_id)
-    if row is not None:
-        chat_title = getattr(row, "chat_title", None)
+    if row is None or not bool(row.enabled):
+        raise HTTPException(status_code=403, detail="source_not_enabled")
+    if is_metadata_only_chat(chat_id):
+        raise HTTPException(status_code=403, detail="metadata_only_source")
+    chat_title = getattr(row, "chat_title", None)
+    message = await manager.get_message(chat_id=chat_id, message_id=message_id)
+    if not message:
+        raise HTTPException(status_code=404, detail="message_not_found")
+    if not is_receipt_datetime_allowed(message.get("date")):
+        raise HTTPException(status_code=403, detail="receipt_date_not_allowed")
+
+    def authorize_result(values: Dict[str, Any]) -> None:
+        if int(values.get("source_chat_id") or 0) != int(chat_id):
+            raise HTTPException(status_code=403, detail="source_not_allowed")
+        if not is_receipt_datetime_allowed(values.get("transaction_date")):
+            raise HTTPException(status_code=403, detail="receipt_date_not_allowed")
 
     try:
         result = await process_tdlib_message(
@@ -1694,6 +2026,7 @@ async def internal_reprocess_receipt(
             force=True,
             db=db,
             manager=manager,
+            authorize_result=authorize_result,
         )
         db.commit()
     except HTTPException as exc:
@@ -1767,6 +2100,163 @@ async def internal_reprocess_receipt(
         "ok": True,
         "status": "duplicate" if getattr(result, "duplicate", False) else "processed",
         "transaction_id": getattr(tx, "id", None) if tx is not None else None,
+    }
+
+
+@reprocess_router.post("/receipt-log/cleanup")
+async def internal_cleanup_receipt_log(
+    payload: Dict[str, Any],
+    request: Request,
+    manager: TelegramTDLibManager = Depends(tdlib_manager_dep),
+) -> Dict[str, Any]:
+    """Delete receipt-pipeline log spam from the configured Telegram log chat."""
+    if not is_internal_request(request):
+        raise HTTPException(status_code=403, detail="invalid_internal_request")
+
+    token = os.getenv("AUTH_BOT_TOKEN", "").strip()
+    raw_chat_id = os.getenv("RECEIPT_LOG_CHAT_ID", "").strip()
+    if not token or not raw_chat_id:
+        raise HTTPException(status_code=409, detail="receipt_log_not_configured")
+    try:
+        chat_id = int(raw_chat_id)
+        topic_id = int(os.getenv("RECEIPT_LOG_TOPIC_ID", "0") or 0)
+        from_timestamp = int(payload.get("from_timestamp"))
+        to_timestamp = int(payload.get("to_timestamp") or datetime.now().timestamp())
+        max_messages = min(max(int(payload.get("max_messages") or 20000), 1), 50000)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="invalid_cleanup_window")
+    if from_timestamp <= 0 or to_timestamp < from_timestamp:
+        raise HTTPException(status_code=400, detail="invalid_cleanup_window")
+
+    headlines = (
+        "Принят в обработку",
+        "Чек обработан",
+        "Чек не обработан",
+        "Дубликат пропущен",
+        "Не удалось скачать файл",
+    )
+    message_ids: List[int] = []
+    reached_window_start = False
+    scanned = 0
+    oldest_timestamp: Optional[int] = None
+    newest_timestamp: Optional[int] = None
+
+    async def _iter_log_history():
+        if not topic_id:
+            async for history_chunk in manager.iter_chat_history(
+                chat_id=chat_id,
+                batch_size=100,
+                max_messages=max_messages,
+            ):
+                yield history_chunk
+            return
+
+        current_from = 0
+        loaded = 0
+        while loaded < max_messages:
+            response = await manager._send_request(  # noqa: SLF001
+                {
+                    "@type": "getMessageThreadHistory",
+                    "chat_id": chat_id,
+                    "message_id": topic_id,
+                    "from_message_id": current_from,
+                    "offset": 0 if current_from <= 0 else -1,
+                    "limit": min(100, max_messages - loaded),
+                }
+            )
+            messages = response.get("messages") or []
+            if not messages:
+                break
+            loaded += len(messages)
+            yield messages
+            oldest_id = int(messages[-1].get("id") or 0)
+            if not oldest_id or oldest_id == current_from:
+                break
+            current_from = oldest_id
+
+    async for chunk in _iter_log_history():
+        for message in chunk:
+            message_timestamp = int(message.get("date") or 0)
+            scanned += 1
+            if message_timestamp:
+                oldest_timestamp = (
+                    message_timestamp
+                    if oldest_timestamp is None
+                    else min(oldest_timestamp, message_timestamp)
+                )
+                newest_timestamp = (
+                    message_timestamp
+                    if newest_timestamp is None
+                    else max(newest_timestamp, message_timestamp)
+                )
+            if message_timestamp < from_timestamp:
+                reached_window_start = True
+                break
+            if message_timestamp > to_timestamp:
+                continue
+            content = message.get("content") or {}
+            formatted_text = content.get("text") or {}
+            text = (
+                formatted_text.get("text", "")
+                if isinstance(formatted_text, dict)
+                else str(formatted_text or "")
+            )
+            if any(headline in text for headline in headlines):
+                message_id = int(message.get("id") or 0)
+                if message_id:
+                    message_ids.append(message_id)
+        if reached_window_start:
+            break
+
+    dry_run = bool(payload.get("dry_run", True))
+    if dry_run or not message_ids:
+        return {
+            "dry_run": dry_run,
+            "matched": len(message_ids),
+            "deleted": 0,
+            "history_limit_reached": not reached_window_start,
+            "scanned": scanned,
+            "oldest_timestamp": oldest_timestamp,
+            "newest_timestamp": newest_timestamp,
+        }
+
+    deleted = 0
+    async with httpx.AsyncClient(timeout=httpx.Timeout(20.0, connect=5.0)) as client:
+        for offset in range(0, len(message_ids), 100):
+            tdlib_batch = message_ids[offset : offset + 100]
+            try:
+                await manager._send_request(  # noqa: SLF001
+                    {
+                        "@type": "deleteMessages",
+                        "chat_id": chat_id,
+                        "message_ids": tdlib_batch,
+                        "revoke": True,
+                    }
+                )
+            except Exception:
+                # Fallback for installations where the TDLib account can read
+                # the log topic but lacks deletion rights. TDLib stores server
+                # IDs shifted left by 20 bits; Bot API expects 32-bit IDs.
+                batch = [message_id >> 20 for message_id in tdlib_batch]
+                response = await client.post(
+                    f"https://api.telegram.org/bot{token}/deleteMessages",
+                    json={"chat_id": chat_id, "message_ids": batch},
+                )
+                data = response.json()
+                if response.status_code >= 400 or not data.get("ok"):
+                    raise HTTPException(
+                        status_code=502,
+                        detail=f"telegram_delete_failed_at_batch_{offset // 100 + 1}",
+                    )
+            deleted += len(tdlib_batch)
+    return {
+        "dry_run": False,
+        "matched": len(message_ids),
+        "deleted": deleted,
+        "history_limit_reached": not reached_window_start,
+        "scanned": scanned,
+        "oldest_timestamp": oldest_timestamp,
+        "newest_timestamp": newest_timestamp,
     }
 
 
@@ -1940,21 +2430,26 @@ async def receipt_status(
     return {"results": statuses}
 
 
-@files_router.get("/files/{file_id}")
-async def download_file(
-    file_id: int,
-    filename: Optional[str] = Query(None, description="Override filename in Content-Disposition"),
-    manager: TelegramTDLibManager = Depends(tdlib_manager_dep),
-    x_internal_api_key: Optional[str] = Header(None, alias="X-Internal-Api-Key"),
-    current_user: Optional[dict] = Depends(get_current_user_optional),
-):
-    if not is_valid_internal_api_key(x_internal_api_key) and not current_user:
-        raise HTTPException(
-            status_code=401,
-            detail="Authentication required",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
+def _message_contains_file_id(value: Any, file_id: int) -> bool:
+    if isinstance(value, dict):
+        if value.get("@type") == "file":
+            with suppress(TypeError, ValueError):
+                if int(value.get("id")) == int(file_id):
+                    return True
+        with suppress(TypeError, ValueError):
+            if "file_id" in value and int(value.get("file_id")) == int(file_id):
+                return True
+        return any(_message_contains_file_id(item, file_id) for item in value.values())
+    if isinstance(value, list):
+        return any(_message_contains_file_id(item, file_id) for item in value)
+    return False
 
+
+async def _serve_tdlib_file(
+    file_id: int,
+    filename: Optional[str],
+    manager: TelegramTDLibManager,
+):
     try:
         auth_state = await manager.get_auth_state()
     except TDLibUnavailableError as exc:
@@ -1983,9 +2478,43 @@ async def download_file(
 
     safe_filename = os.path.basename(filename or "") or os.path.basename(file_path) or "document.bin"
     media_type = mimetypes.guess_type(file_path)[0] or "application/octet-stream"
-    response = FileResponse(file_path, media_type=media_type, filename=safe_filename)
-    response.headers["Content-Disposition"] = f'inline; filename="{safe_filename}"'
-    return response
+    return FileResponse(
+        file_path,
+        media_type=media_type,
+        filename=safe_filename,
+        content_disposition_type="inline",
+    )
+
+
+@router.get("/chats/{chat_id}/messages/{message_id}/files/{file_id}")
+async def download_owned_file(
+    chat_id: int,
+    message_id: int,
+    file_id: int,
+    filename: Optional[str] = Query(None, description="Override filename in Content-Disposition"),
+    manager: TelegramTDLibManager = Depends(tdlib_manager_dep),
+    current_user: dict = Depends(get_current_user),
+    _chat_access: None = Depends(require_chat_access),
+):
+    _ensure_chat_allowed(chat_id, current_user)
+    message = await manager.get_message(chat_id=chat_id, message_id=message_id)
+    if not message:
+        raise HTTPException(status_code=404, detail="Message not found")
+    if not _message_contains_file_id(message, file_id):
+        raise HTTPException(status_code=404, detail="File not found in message")
+    return await _serve_tdlib_file(file_id, filename, manager)
+
+
+@files_router.get("/files/{file_id}")
+async def download_file(
+    file_id: int,
+    request: Request,
+    filename: Optional[str] = Query(None, description="Override filename in Content-Disposition"),
+    manager: TelegramTDLibManager = Depends(tdlib_manager_dep),
+):
+    if not is_internal_request(request):
+        raise HTTPException(status_code=403, detail="owner_bound_file_route_required")
+    return await _serve_tdlib_file(file_id, filename, manager)
 
 
 @ws_router.websocket("/ws/tg")
@@ -1993,6 +2522,7 @@ async def websocket_updates(
     websocket: WebSocket,
     token: Optional[str] = Query(None),
     manager: TelegramTDLibManager = Depends(tdlib_manager_dep),
+    db: Session = Depends(get_db_session),
 ) -> None:
     await websocket.accept()
     ws_token = token
@@ -2007,28 +2537,59 @@ async def websocket_updates(
         await websocket.close(code=4401, reason="Authentication required")
         return
 
-    user = verify_jwt_token(ws_token)
-    if not user:
+    token_payload = verify_jwt_token(ws_token)
+    if not token_payload or str(token_payload.get("kind") or "") != "app_user":
         with suppress(Exception):
             await websocket.send_json({"type": "error", "message": "Invalid or expired token"})
         await websocket.close(code=4401, reason="Invalid or expired token")
         return
 
-    # Reject revoked sessions (admin "kill session" / logout must drop live sockets too).
-    if is_session_revoked(str(user.get("sid") or "")):
+    try:
+        await require_session_active(token_payload)
+    except HTTPException:
         with suppress(Exception):
-            await websocket.send_json({"type": "error", "message": "Session revoked"})
-        await websocket.close(code=4401, reason="Session revoked")
+            await websocket.send_json({"type": "error", "message": "Session unavailable"})
+        await websocket.close(code=4401, reason="Session unavailable")
         return
+
+    try:
+        user_id = int(token_payload.get("user_id") or token_payload.get("sub") or 0)
+    except (TypeError, ValueError):
+        user_id = 0
+    user_row = db.get(User, user_id)
+    if (
+        user_row is None
+        or not user_row.is_active
+        or int(token_payload.get("permissions_version") or 0) != int(user_row.permissions_version or 1)
+    ):
+        await websocket.close(code=4403, reason="User access changed")
+        return
+    snapshot = build_permissions_snapshot(user_row)
+    if str(snapshot.get("role") or "").lower() != "admin" and "userbot" not in {
+        str(tab).strip().lower() for tab in snapshot.get("allowed_tabs") or []
+    }:
+        await websocket.close(code=4403, reason="Userbot access denied")
+        return
+    ws_access = {
+        "user_id": user_id,
+        "allowed_sources": get_allowed_sources_for_user(snapshot),
+        "permissions_version": int(user_row.permissions_version or 1),
+    }
 
     await _ensure_realtime_hooks(manager)
     _ensure_settings_listener()
     async with _tg_ws_lock:
-        _tg_ws_clients.add(websocket)
+        _tg_ws_clients[websocket] = ws_access
     previous_auth: Optional[Dict[str, Any]] = None
     previous_monitor: Optional[Dict[str, Any]] = None
     try:
         while True:
+            await require_session_active(token_payload)
+            db.expire(user_row)
+            db.refresh(user_row)
+            if not user_row.is_active or int(user_row.permissions_version or 1) != ws_access["permissions_version"]:
+                await websocket.close(code=4403, reason="User access changed")
+                return
             state = await manager.get_auth_state()
             auth_payload = {
                 "type": "auth-state",
@@ -2069,4 +2630,4 @@ async def websocket_updates(
             await websocket.close()
     finally:
         async with _tg_ws_lock:
-            _tg_ws_clients.discard(websocket)
+            _tg_ws_clients.pop(websocket, None)

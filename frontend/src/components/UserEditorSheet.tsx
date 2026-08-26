@@ -9,7 +9,6 @@ import { useShake } from '../hooks/useShake';
 const TAB_OPTIONS = [
     { key: 'dashboard', label: 'Дашборд' },
     { key: 'reference', label: 'Справочник' },
-    { key: 'automation', label: 'Автоматизация' },
     { key: 'userbot', label: 'Telegram Bots' },
     { key: 'logs', label: 'Логи' },
     { key: 'admin', label: 'Admin' },

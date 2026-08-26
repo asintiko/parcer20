@@ -100,13 +100,14 @@ class SmsQueueTest {
             record("in_synced", status = SyncStatus.SYNCED, retry = 3, receivedAt = 150),
             record("in_dup", status = SyncStatus.DUPLICATE, receivedAt = 160),
             record("in_failed", status = SyncStatus.FAILED, retry = 10, receivedAt = 170),
+            record("in_auth", status = SyncStatus.AUTH_ERROR, retry = 0, receivedAt = 175),
             record("in_pending", status = SyncStatus.PENDING, receivedAt = 180),
             record("out_synced", status = SyncStatus.SYNCED, receivedAt = 500),
         ))
         val flipped = dao.requeueRange(from = 100, to = 200)
-        assertEquals(3, flipped) // in_synced, in_dup, in_failed
+        assertEquals(4, flipped) // in_synced, in_dup, in_failed, in_auth
 
-        listOf("in_synced", "in_dup", "in_failed").forEach { id ->
+        listOf("in_synced", "in_dup", "in_failed", "in_auth").forEach { id ->
             val row = dao.byId(id)!!
             assertEquals(SyncStatus.PENDING, row.syncStatus)
             assertEquals(0, row.retryCount)
@@ -115,8 +116,24 @@ class SmsQueueTest {
         assertEquals(SyncStatus.PENDING, dao.byId("in_pending")!!.syncStatus)
         assertEquals(SyncStatus.SYNCED, dao.byId("out_synced")!!.syncStatus)
         // idempotent on the row set — nothing inserted or deleted
-        assertEquals(5, dao.allIds().size)
-        assertTrue(dao.pending(cap).map { it.deviceSmsId }.containsAll(listOf("in_synced", "in_dup", "in_failed")))
+        assertEquals(6, dao.allIds().size)
+        assertTrue(dao.pending(cap).map { it.deviceSmsId }
+            .containsAll(listOf("in_synced", "in_dup", "in_failed", "in_auth")))
+    }
+
+    @Test fun requeueAuthErrorsRecoversOnlyRowsRejectedByOldCredentials() = runTest {
+        dao.insertAll(listOf(
+            record("auth", status = SyncStatus.AUTH_ERROR, retry = 4),
+            record("failed", status = SyncStatus.FAILED, retry = cap),
+            record("pending", status = SyncStatus.PENDING, retry = 2),
+        ))
+
+        assertEquals(1, dao.requeueAuthErrors())
+        val recovered = dao.byId("auth")!!
+        assertEquals(SyncStatus.PENDING, recovered.syncStatus)
+        assertEquals(0, recovered.retryCount)
+        assertEquals(SyncStatus.FAILED, dao.byId("failed")!!.syncStatus)
+        assertEquals(2, dao.byId("pending")!!.retryCount)
     }
 
     @Test fun updateResultPersistsParsedFields() = runTest {

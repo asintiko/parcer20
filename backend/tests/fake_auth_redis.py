@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 
@@ -16,6 +17,23 @@ class FakeAsyncRedis:
     async def setex(self, key: str, ttl: int, value: Any) -> bool:
         self.values[key] = value
         self.ttls[key] = int(ttl)
+        return True
+
+    async def set(
+        self,
+        key: str,
+        value: Any,
+        *,
+        ex: int | None = None,
+        nx: bool = False,
+        xx: bool = False,
+    ) -> bool | None:
+        exists = self._has_key(key)
+        if (nx and exists) or (xx and not exists):
+            return None
+        self.values[key] = value
+        if ex is not None:
+            self.ttls[key] = int(ex)
         return True
 
     async def get(self, key: str) -> Any:
@@ -95,6 +113,12 @@ class FakeAsyncRedis:
     async def publish(self, _channel: str, _message: str) -> int:
         return 1
 
+    async def eval(self, _script: str, _numkeys: int, key: str, expected: Any) -> int:
+        if self.values.get(key) != expected:
+            return 0
+        await self.delete(key)
+        return 1
+
 
 class FakeSyncRedis:
     def __init__(self, async_redis: FakeAsyncRedis) -> None:
@@ -120,3 +144,71 @@ def install_fake_auth_redis(monkeypatch):
     monkeypatch.setattr("api.routes.auth.get_redis", fake_get_redis)
     monkeypatch.setattr("api.routes.two_factor.get_redis", fake_get_redis)
     return fake_async, fake_sync
+
+
+def issue_active_app_token(user) -> str:
+    from services.auth_bot_service import register_active_session
+    from services.auth_service import create_app_user_token, verify_jwt_token
+
+    token = create_app_user_token(
+        user_id=int(user.id),
+        username=user.username,
+        role=user.role,
+        permissions_version=int(user.permissions_version or 1),
+        display_name=user.display_name,
+    )
+    payload = verify_jwt_token(token)
+    assert payload and payload.get("sid")
+    registered_sid = asyncio.run(
+        register_active_session(
+            token_payload=payload,
+            token_kind="app_user",
+            user_id=int(user.id),
+            ip_address="127.0.0.1",
+            subject=user.username,
+        )
+    )
+    assert registered_sid == payload["sid"]
+    return token
+
+
+def seed_test_user(db_session, *, username: str, role: str = "admin"):
+    from database.models import User
+    from services.access_control_service import hash_password
+
+    password_hash, salt = hash_password("Strong!123")
+    user = User(
+        username=username,
+        password_hash=password_hash,
+        salt=salt,
+        role=role,
+        display_name=username,
+        allowed_tabs='["dashboard","reference","automation","userbot","logs","admin"]',
+        allowed_folders="[]",
+        forbidden_periods="[]",
+        allowed_sources="[]",
+        can_toggle_sources=role == "admin",
+        permissions_version=1,
+        is_active=True,
+    )
+    db_session.add(user)
+    db_session.commit()
+    db_session.refresh(user)
+    return user
+
+
+def register_launch_session(token: str) -> str:
+    from services.auth_bot_service import register_active_session, verify_launch_session_token
+
+    payload = verify_launch_session_token(token)
+    assert payload and payload.get("sid")
+    registered_sid = asyncio.run(
+        register_active_session(
+            token_payload=payload,
+            token_kind="launch_session",
+            ip_address=str(payload.get("ip") or "127.0.0.1"),
+            subject="test-launch",
+        )
+    )
+    assert registered_sid == payload["sid"]
+    return token

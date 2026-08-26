@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { agentApi } from '../services/api';
+import { agentApi, type AgentNotification, type AgentReport, type AgentReportItem } from '../services/api';
 
 export function useAiAgentNotifications() {
     const queryClient = useQueryClient();
@@ -18,31 +18,50 @@ export function useAiAgentNotifications() {
         staleTime: 10_000,
     });
 
-    const invalidateAll = async () => {
-        await Promise.all([
-            queryClient.invalidateQueries({ queryKey: ['agent-notifications'] }),
-            queryClient.invalidateQueries({ queryKey: ['agent-reports'] }),
-        ]);
+    const patchNotifications = (mutate: (item: AgentNotification) => AgentNotification) => {
+        queryClient.setQueryData<AgentNotification[]>(['agent-notifications'], (prev) =>
+            prev ? prev.map(mutate) : prev,
+        );
+    };
+
+    const patchReportItem = (updated: AgentReportItem) => {
+        queryClient.setQueryData<AgentReport[]>(['agent-reports'], (prev) =>
+            prev
+                ? prev.map((report) =>
+                      report.id === updated.report_id
+                          ? {
+                                ...report,
+                                items: report.items.map((item) =>
+                                    item.id === updated.id ? updated : item,
+                                ),
+                            }
+                          : report,
+                  )
+                : prev,
+        );
     };
 
     const readMutation = useMutation({
         mutationFn: (notificationId: string) => agentApi.readNotification(notificationId),
-        onSuccess: () => void invalidateAll(),
+        onSuccess: (updated) => patchNotifications((item) => (item.id === updated.id ? updated : item)),
     });
 
     const readAllMutation = useMutation({
         mutationFn: () => agentApi.readAllNotifications(),
-        onSuccess: () => void invalidateAll(),
+        onSuccess: () =>
+            patchNotifications((item) =>
+                item.is_read ? item : { ...item, is_read: true, read_at: new Date().toISOString() },
+            ),
     });
 
     const claimMutation = useMutation({
         mutationFn: (itemId: string) => agentApi.claimReportItem(itemId),
-        onSuccess: () => void invalidateAll(),
+        onSuccess: (updated) => patchReportItem(updated),
     });
 
     const releaseMutation = useMutation({
         mutationFn: (itemId: string) => agentApi.releaseReportItem(itemId),
-        onSuccess: () => void invalidateAll(),
+        onSuccess: (updated) => patchReportItem(updated),
     });
 
     return {

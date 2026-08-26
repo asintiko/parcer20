@@ -881,7 +881,88 @@ class TelegramTDLibManager:
             "text": text,
             "document": document_info,
             "photo": photo_info,
+            "reply_markup": self._format_reply_markup(message.get("reply_markup")),
         }
+
+    # Maps TDLib InlineKeyboardButtonType/KeyboardButtonType @type -> contract button type enum.
+    _INLINE_BUTTON_TYPE_MAP = {
+        "inlineKeyboardButtonTypeWebApp": "web_app",
+        "inlineKeyboardButtonTypeUrl": "url",
+        "inlineKeyboardButtonTypeLoginUrl": "login_url",
+        "inlineKeyboardButtonTypeCallback": "callback",
+        "inlineKeyboardButtonTypeCallbackWithPassword": "callback",
+        "inlineKeyboardButtonTypeCallbackGame": "callback",
+        "inlineKeyboardButtonTypeSwitchInline": "switch_inline",
+        "inlineKeyboardButtonTypeBuy": "buy",
+        "inlineKeyboardButtonTypeCopyText": "copy_text",
+        "inlineKeyboardButtonTypeUser": "other",
+        "inlineKeyboardButtonTypeUnsupported": "other",
+    }
+    _KEYBOARD_BUTTON_TYPE_MAP = {
+        "keyboardButtonTypeWebApp": "web_app",
+        "keyboardButtonTypeText": "other",
+        "keyboardButtonTypeRequestPhoneNumber": "other",
+        "keyboardButtonTypeRequestLocation": "other",
+        "keyboardButtonTypeRequestPoll": "other",
+        "keyboardButtonTypeRequestUsers": "other",
+        "keyboardButtonTypeRequestChat": "other",
+    }
+
+    def _format_reply_markup(self, reply_markup: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """Convert a TDLib ReplyMarkup into the contract's {kind, rows} shape.
+
+        Returns None when the message has no inline/show keyboard.
+        """
+        if not reply_markup or not isinstance(reply_markup, dict):
+            return None
+
+        markup_type = reply_markup.get("@type")
+
+        if markup_type == "replyMarkupInlineKeyboard":
+            rows_raw = reply_markup.get("rows") or []
+            rows: List[List[Dict[str, Any]]] = []
+            for row in rows_raw:
+                out_row: List[Dict[str, Any]] = []
+                for button in row or []:
+                    btn_type = (button.get("type") or {}) if isinstance(button, dict) else {}
+                    btn_type_name = btn_type.get("@type", "")
+                    mapped_type = self._INLINE_BUTTON_TYPE_MAP.get(btn_type_name, "other")
+                    url = btn_type.get("url") if mapped_type in ("web_app", "url", "login_url") else None
+                    out_row.append(
+                        {
+                            "text": button.get("text", ""),
+                            "type": mapped_type,
+                            "url": url,
+                        }
+                    )
+                rows.append(out_row)
+            if not rows:
+                return None
+            return {"kind": "inline", "rows": rows}
+
+        if markup_type == "replyMarkupShowKeyboard":
+            rows_raw = reply_markup.get("rows") or []
+            rows = []
+            for row in rows_raw:
+                out_row = []
+                for button in row or []:
+                    btn_type = (button.get("type") or {}) if isinstance(button, dict) else {}
+                    btn_type_name = btn_type.get("@type", "")
+                    mapped_type = self._KEYBOARD_BUTTON_TYPE_MAP.get(btn_type_name, "other")
+                    url = btn_type.get("url") if mapped_type == "web_app" else None
+                    out_row.append(
+                        {
+                            "text": button.get("text", ""),
+                            "type": mapped_type,
+                            "url": url,
+                        }
+                    )
+                rows.append(out_row)
+            if not rows:
+                return None
+            return {"kind": "keyboard", "rows": rows}
+
+        return None
 
     def add_new_message_handler(self, handler: Callable[[Dict[str, Any]], Awaitable[None]]) -> None:
         """Register async handler invoked on every updateNewMessage."""
@@ -1197,6 +1278,180 @@ class TelegramTDLibManager:
         if local.get("is_downloading_completed"):
             return local.get("path")
         return None
+
+    # ── Mini Apps (Telegram WebApp) ──────────────────────────────────────
+
+    @staticmethod
+    def _hex(value: int) -> int:
+        """Convert an 0xRRGGBB literal to the signed int32 TDLib expects for colors."""
+        value &= 0xFFFFFFFF
+        if value >= 0x80000000:
+            value -= 0x100000000
+        return value
+
+    def _default_webapp_open_parameters(self) -> Dict[str, Any]:
+        """Build the webAppOpenParameters payload (dark theme) sent with every
+        openWebApp/getWebAppUrl/getMainWebApp call.
+        """
+        theme = {
+            "@type": "themeParameters",
+            "background_color": self._hex(0x101010),
+            "secondary_background_color": self._hex(0x181818),
+            "header_background_color": self._hex(0x101010),
+            "bottom_bar_background_color": self._hex(0x101010),
+            "section_background_color": self._hex(0x181818),
+            "section_separator_color": self._hex(0x2A2A2A),
+            "text_color": self._hex(0xF2F2F2),
+            "accent_text_color": self._hex(0xF2F2F2),
+            "section_header_text_color": self._hex(0x8A8A8A),
+            "subtitle_text_color": self._hex(0x8A8A8A),
+            "destructive_text_color": self._hex(0xFF5A52),
+            "hint_color": self._hex(0x8A8A8A),
+            "link_color": self._hex(0xD0D0D0),
+            "button_color": self._hex(0xF2F2F2),
+            "button_text_color": self._hex(0x101010),
+        }
+        return {
+            "@type": "webAppOpenParameters",
+            "theme": theme,
+            "application_name": "tbsparcer",
+            "mode": {"@type": "webAppOpenModeFullSize"},
+        }
+
+    async def resolve_bot_user_id(self, chat_id: int) -> Optional[int]:
+        """Resolve the bot's user id from a private chat with that bot.
+
+        Returns None if the chat isn't a private chat with a bot (or cannot
+        be resolved) so callers can fall back gracefully.
+        """
+        try:
+            chat = await self._send_request({"@type": "getChat", "chat_id": chat_id}, timeout=10)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("resolve_bot_user_id: failed to fetch chat %s: %s", chat_id, exc)
+            return None
+
+        chat_type = chat.get("type", {}) if isinstance(chat, dict) else {}
+        if chat_type.get("@type") != "chatTypePrivate":
+            return None
+
+        user_id = chat_type.get("user_id")
+        if not user_id:
+            return None
+
+        user = await self._ensure_user(int(user_id))
+        if not user or user.get("type", {}).get("@type") != "userTypeBot":
+            return None
+
+        return int(user_id)
+
+    async def open_web_app(self, chat_id: int, bot_user_id: int, url: str) -> Optional[Dict[str, Any]]:
+        """Send openWebApp and return the raw webAppInfo dict (launch_id + url)."""
+        payload = {
+            "@type": "openWebApp",
+            "chat_id": chat_id,
+            "bot_user_id": bot_user_id,
+            "url": url,
+            "parameters": self._default_webapp_open_parameters(),
+        }
+        try:
+            response = await self._send_request(payload, timeout=30)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("openWebApp failed for chat %s bot %s: %s", chat_id, bot_user_id, exc)
+            raise
+        if not isinstance(response, dict) or response.get("@type") == "error":
+            logger.error("openWebApp returned error for chat %s bot %s: %s", chat_id, bot_user_id, response)
+            return None
+        return response
+
+    async def get_web_app_url(self, bot_user_id: int, url: str) -> Optional[Dict[str, Any]]:
+        """Send getWebAppUrl and return the raw webAppUrl dict."""
+        payload = {
+            "@type": "getWebAppUrl",
+            "bot_user_id": bot_user_id,
+            "url": url,
+            "parameters": self._default_webapp_open_parameters(),
+        }
+        try:
+            response = await self._send_request(payload, timeout=30)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("getWebAppUrl failed for bot %s: %s", bot_user_id, exc)
+            raise
+        if not isinstance(response, dict) or response.get("@type") == "error":
+            logger.error("getWebAppUrl returned error for bot %s: %s", bot_user_id, response)
+            return None
+        return response
+
+    async def close_web_app(self, launch_id: int) -> None:
+        """Send closeWebApp. Tolerant of errors (already closed) — logs, never raises."""
+        try:
+            await self._send_request(
+                {"@type": "closeWebApp", "web_app_launch_id": launch_id},
+                timeout=10,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("closeWebApp failed for launch_id %s: %s", launch_id, exc)
+
+    async def send_web_app_data(self, bot_user_id: int, button_text: str, data: str) -> None:
+        """Send sendWebAppData for a simple (keyboard) web app."""
+        response = await self._send_request(
+            {
+                "@type": "sendWebAppData",
+                "bot_user_id": bot_user_id,
+                "button_text": button_text,
+                "data": data,
+            },
+            timeout=30,
+        )
+        if isinstance(response, dict) and response.get("@type") == "error":
+            logger.error("sendWebAppData returned error for bot %s: %s", bot_user_id, response)
+            raise RuntimeError(f"sendWebAppData failed: {response.get('message')}")
+
+    async def get_menu_button(self, user_id: int) -> Optional[Dict[str, Any]]:
+        """Send getMenuButton and return the raw botMenuButton dict."""
+        try:
+            response = await self._send_request({"@type": "getMenuButton", "user_id": user_id}, timeout=10)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("getMenuButton failed for user %s: %s", user_id, exc)
+            return None
+        if not isinstance(response, dict) or response.get("@type") == "error":
+            return None
+        return response
+
+    async def get_user_full_info(self, user_id: int) -> Optional[Dict[str, Any]]:
+        """Send getUserFullInfo; the raw userFullInfo carries bot_info.menu_button.
+
+        getMenuButton is a bots-only API — a user account (userbot) must read a
+        bot's menu button here: userFullInfo.bot_info.menu_button is a botMenuButton
+        whose url is non-empty when the bot exposes a Mini App via the menu button.
+        """
+        try:
+            response = await self._send_request({"@type": "getUserFullInfo", "user_id": user_id}, timeout=15)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("getUserFullInfo failed for user %s: %s", user_id, exc)
+            return None
+        if not isinstance(response, dict) or response.get("@type") == "error":
+            return None
+        return response
+
+    async def get_main_web_app(
+        self, chat_id: int, bot_user_id: int, start_parameter: str = ""
+    ) -> Optional[Dict[str, Any]]:
+        """Send getMainWebApp and return the raw mainWebApp dict."""
+        payload = {
+            "@type": "getMainWebApp",
+            "chat_id": chat_id,
+            "bot_user_id": bot_user_id,
+            "start_parameter": start_parameter,
+            "parameters": self._default_webapp_open_parameters(),
+        }
+        try:
+            response = await self._send_request(payload, timeout=30)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("getMainWebApp failed for chat %s bot %s: %s", chat_id, bot_user_id, exc)
+            return None
+        if not isinstance(response, dict) or response.get("@type") == "error":
+            return None
+        return response
 
     def stop(self) -> None:
         self._running = False

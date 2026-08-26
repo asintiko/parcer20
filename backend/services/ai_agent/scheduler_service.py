@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 from threading import Lock
 from typing import Any, Dict, List
 
@@ -58,6 +59,14 @@ class AgentSchedulerService:
                 self._enqueue_receipt_watchdog,
                 trigger=CronTrigger(minute="*/3", timezone=timezone),
                 id="receipt-task-watchdog",
+                replace_existing=True,
+                coalesce=True,
+                max_instances=1,
+            )
+            scheduler.add_job(
+                self._dispatch_receipt_outbox,
+                trigger=CronTrigger(minute="*", timezone=timezone),
+                id="receipt-outbox-dispatch",
                 replace_existing=True,
                 coalesce=True,
                 max_instances=1,
@@ -242,19 +251,22 @@ class AgentSchedulerService:
         except Exception:
             logger.exception("Failed to enqueue receipt task watchdog")
 
+    def _dispatch_receipt_outbox(self) -> None:
+        """Publish committed inbox rows even after an earlier broker outage."""
+        try:
+            from workers.celery_worker import dispatch_pending_receipt_tasks
+
+            result = dispatch_pending_receipt_tasks(limit=200)
+            if result.get("checked"):
+                logger.info("Receipt outbox dispatch: %s", result)
+        except Exception:
+            logger.exception("Receipt outbox dispatch failed")
+
     def _enqueue_receipt_retention(self) -> None:
         try:
             self._celery.send_task("receipt_task_retention_cleanup")
         except Exception:
             logger.exception("Failed to enqueue receipt task retention cleanup")
-
-    def _enqueue_monitored_chat_sync(self) -> None:
-        if not _flag_truthy("MONITORED_CHAT_SYNC_ENABLED", "true"):
-            return
-        try:
-            self._celery.send_task("monitored_chat_sync_tick")
-        except Exception:
-            logger.exception("Failed to enqueue monitored chat sync")
 
     async def _run_monitored_chat_sync(self) -> None:
         """Run monitored-chat sync directly in the backend event loop.
@@ -265,14 +277,16 @@ class AgentSchedulerService:
         session and a long-lived uvicorn loop, so calling sync_all_active_chats
         here actually persists new messages.
 
-        Setting MONITORED_CHAT_SYNC_VIA_BACKEND=false reverts to the old
-        Celery enqueue path (kept as a manual fallback).
+        There is intentionally no Celery fallback: the worker must never open a
+        second TDLib client against a missing or shared session volume.
         """
         if not _flag_truthy("MONITORED_CHAT_SYNC_ENABLED", "true"):
             return
         if not _flag_truthy("MONITORED_CHAT_SYNC_VIA_BACKEND", "true"):
-            self._enqueue_monitored_chat_sync()
-            return
+            logger.error(
+                "MONITORED_CHAT_SYNC_VIA_BACKEND=false is unsafe and ignored; "
+                "sync remains on the authenticated backend TDLib loop"
+            )
 
         try:
             from services.monitored_chat_sync import sync_all_active_chats
@@ -311,29 +325,37 @@ class AgentSchedulerService:
                     timeout=per_chat_timeout,
                 )
                 return resp.get("items") or []
-            except TDLibUnavailableError:
+            except TDLibUnavailableError as exc:
                 logger.warning("TDLib unavailable; skipping chat %s", chat_id)
-                return []
-            except asyncio.TimeoutError:
+                raise RuntimeError(f"tdlib_unavailable:{exc}") from exc
+            except asyncio.TimeoutError as exc:
                 logger.warning(
                     "monitored_chat fetch timeout (%.1fs) for chat %s",
                     per_chat_timeout,
                     chat_id,
                 )
-                return []
+                raise RuntimeError(
+                    f"tdlib_timeout:{per_chat_timeout:.1f}s"
+                ) from exc
             except Exception:
                 logger.exception("monitored_chat fetch failed for chat %s", chat_id)
-                return []
+                raise
 
+        tick_started = time.monotonic()
         try:
             result = await sync_all_active_chats(fetch_callable=_fetch)
         except Exception:
-            logger.exception("monitored_chat_sync tick failed")
+            logger.exception(
+                "monitored_chat_sync tick failed after %.2fs",
+                time.monotonic() - tick_started,
+            )
             return
 
+        elapsed = time.monotonic() - tick_started
         new_total = sum(int(r.get("new_rows", 0) or 0) for r in result if isinstance(r, dict))
         logger.info(
-            "monitored_chat_sync tick (backend): chats=%s new_rows=%s",
+            "monitored_chat_sync tick (backend) took %.2fs (chats=%s new_rows=%s)",
+            elapsed,
             len(result),
             new_total,
         )

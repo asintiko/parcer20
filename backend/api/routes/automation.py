@@ -14,9 +14,7 @@ import os
 import json
 import time
 import threading
-import httpx
 import logging
-from bs4 import BeautifulSoup
 
 from config.ai_models import (
     AI_RETRY_COUNT,
@@ -41,6 +39,7 @@ from api.dependencies import require_tab_access, require_transactions_scope
 from services.access_control_service import get_scope_window, is_datetime_allowed, write_audit_log
 from services.period_lock_service import period_lock_service
 from services.ai_provider import get_text_ai_provider
+from services.web_search import search_operator_text
 
 router = APIRouter(prefix="/api/automation", tags=["automation"])
 logger = logging.getLogger(__name__)
@@ -253,29 +252,8 @@ def get_existing_applications(db: Session) -> List[str]:
 
 
 async def search_web_for_operator(operator_raw: str) -> str:
-    """Lightweight web search via DuckDuckGo HTML."""
-    try:
-        search_query = f"{operator_raw} Узбекистан приложение оплата"
-        async with httpx.AsyncClient(timeout=10.0) as client_http:
-            response = await client_http.get(
-                "https://html.duckduckgo.com/html/",
-                params={"q": search_query},
-                headers={"User-Agent": "Mozilla/5.0"},
-            )
-            if response.status_code == 200:
-                soup = BeautifulSoup(response.text, "html.parser")
-                snippets = []
-                results = soup.find_all("a", class_="result__snippet", limit=3)
-                for r in results:
-                    text = r.get_text(strip=True)
-                    if text and len(text) > 20:
-                        snippets.append(text)
-                if snippets:
-                    return "\n".join(snippets[:3])
-        return "Информация не найдена"
-    except Exception as e:  # noqa: BLE001
-        logger.warning("Web search error: %s", e)
-        return "Ошибка поиска"
+    """Lightweight web search via DuckDuckGo HTML (delegates to services.web_search)."""
+    return await search_operator_text(operator_raw)
 
 
 async def analyze_with_ai(operator_raw: str, existing_apps: List[str], transaction_context: dict | None = None) -> AISuggestion:

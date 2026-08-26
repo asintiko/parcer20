@@ -13,6 +13,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import uz.tbsparcer.sms.data.repo.SmsRepository
+import uz.tbsparcer.sms.data.local.SettingsStore
 import uz.tbsparcer.sms.domain.SmsLocalId
 import uz.tbsparcer.sms.work.WorkScheduler
 
@@ -20,19 +21,23 @@ class SmsReceiver : BroadcastReceiver() {
 
     @EntryPoint
     @InstallIn(SingletonComponent::class)
-    interface ReceiverEntryPoint { fun smsRepository(): SmsRepository }
+    interface ReceiverEntryPoint {
+        fun smsRepository(): SmsRepository
+        fun settingsStore(): SettingsStore
+    }
 
     override fun onReceive(context: Context, intent: Intent) {
         if (intent.action != Telephony.Sms.Intents.SMS_RECEIVED_ACTION) return
+        val entryPoint = EntryPointAccessors
+            .fromApplication(context.applicationContext, ReceiverEntryPoint::class.java)
+        if (!entryPoint.settingsStore().monitoringEnabled) return
         val msgs = Telephony.Sms.Intents.getMessagesFromIntent(intent) ?: return
         val sender = msgs.firstOrNull()?.originatingAddress ?: return
         val body = msgs.joinToString("") { it.messageBody ?: "" }
         val ts = msgs.firstOrNull()?.timestampMillis ?: System.currentTimeMillis()
         val deviceSmsId = SmsLocalId.of(sender, ts, body)
 
-        val repo = EntryPointAccessors
-            .fromApplication(context.applicationContext, ReceiverEntryPoint::class.java)
-            .smsRepository()
+        val repo = entryPoint.smsRepository()
 
         val pending = goAsync()
         val handler = CoroutineExceptionHandler { _, _ -> }

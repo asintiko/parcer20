@@ -1,6 +1,8 @@
-import { useEffect } from 'react';
-import { useQueryClient } from '@tanstack/react-query';
+import { useEffect, useRef } from 'react';
+import { useQueryClient, type QueryKey } from '@tanstack/react-query';
 import { API_BASE_URL, buildAuthorizedRequestHeaders } from '../services/api';
+
+const INVALIDATE_DEBOUNCE_MS = 250;
 
 const parseEventBlocks = (buffer: string) => {
     const blocks = buffer.split('\n\n');
@@ -26,11 +28,28 @@ const parseBlock = (block: string): { event: string; data: string } | null => {
 
 export function useAiAgentStream(threadId: string | null, enabled = true) {
     const queryClient = useQueryClient();
+    const debounceTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
 
     useEffect(() => {
         if (!threadId || !enabled) {
             return;
         }
+
+        const timers = debounceTimersRef.current;
+        // Coalesce bursty SSE-triggered invalidations: many events can land in a
+        // single read tick, so accumulate per-key and fire one invalidation each.
+        const invalidate = (queryKey: QueryKey) => {
+            const cacheKey = JSON.stringify(queryKey);
+            const existing = timers.get(cacheKey);
+            if (existing) clearTimeout(existing);
+            timers.set(
+                cacheKey,
+                setTimeout(() => {
+                    timers.delete(cacheKey);
+                    void queryClient.invalidateQueries({ queryKey });
+                }, INVALIDATE_DEBOUNCE_MS),
+            );
+        };
 
         const controller = new AbortController();
         let disposed = false;
@@ -61,17 +80,33 @@ export function useAiAgentStream(threadId: string | null, enabled = true) {
                     for (const block of complete) {
                         const parsed = parseBlock(block);
                         if (!parsed || parsed.event === 'heartbeat') continue;
+                        let payload: { status?: unknown } | null = null;
                         try {
-                            JSON.parse(parsed.data);
+                            payload = JSON.parse(parsed.data);
                         } catch {
                             continue;
                         }
-                        if (parsed.event === 'message' || parsed.event === 'run' || parsed.event === 'run_event') {
-                            void queryClient.invalidateQueries({ queryKey: ['agent-thread', threadId] });
-                            void queryClient.invalidateQueries({ queryKey: ['agent-threads'] });
-                            void queryClient.invalidateQueries({ queryKey: ['agent-launcher-state'] });
-                            void queryClient.invalidateQueries({ queryKey: ['agent-notifications'] });
-                            void queryClient.invalidateQueries({ queryKey: ['agent-reports'] });
+
+                        if (
+                            parsed.event === 'message' ||
+                            parsed.event === 'run' ||
+                            parsed.event === 'run_event'
+                        ) {
+                            // Conversation surface: always keep the open thread fresh.
+                            invalidate(['agent-thread', threadId]);
+                            invalidate(['agent-threads']);
+
+                            // Reports are only produced on run completion — touch that
+                            // cache exclusively on a terminal run event to avoid a
+                            // full reports refetch on every streamed token.
+                            if (
+                                parsed.event === 'run' &&
+                                String(payload?.status) === 'completed'
+                            ) {
+                                invalidate(['agent-reports']);
+                            }
+                        } else if (parsed.event === 'notification') {
+                            invalidate(['agent-notifications']);
                         }
                     }
                 }
@@ -86,6 +121,8 @@ export function useAiAgentStream(threadId: string | null, enabled = true) {
         return () => {
             disposed = true;
             controller.abort();
+            timers.forEach((timer) => clearTimeout(timer));
+            timers.clear();
         };
     }, [enabled, queryClient, threadId]);
 }

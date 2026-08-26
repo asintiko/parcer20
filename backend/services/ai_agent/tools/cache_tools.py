@@ -8,7 +8,12 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 from sqlalchemy.orm import Session
 
 from config.ai_models import AI_AGENT_RECEIPT_GRACE_MINUTES
-from database.models import DuplicateSuggestion, ReceiptProcessingTask
+from database.models import DuplicateSuggestion, ReceiptProcessingTask, Transaction
+from services.ai_agent.authorization import (
+    AgentAuthorizationError,
+    actor_id,
+    current_agent_authorization,
+)
 from services.ai_agent.report_service import generate_report
 from services.incident_service import upsert_receipt_incident
 from services.telegram_cache_service import TelegramCacheService
@@ -39,7 +44,7 @@ def _allowed_chat_ids(current_user: Dict[str, Any], requested_ids: Optional[Iter
     if role == 'admin' and not allowed_sources:
         return requested or None
     if not allowed_sources:
-        return requested or None
+        return []
     if not requested:
         return sorted(set(allowed_sources))
     filtered = [chat_id for chat_id in requested if chat_id in set(allowed_sources)]
@@ -228,11 +233,27 @@ def _build_monitored_chat_sync_audit_result(
 
 
 async def monitored_chat_sync_audit(db: Session, current_user: Dict[str, Any], scope: Optional[dict], args: Dict[str, Any]) -> ToolResult:
+    auth = current_agent_authorization(db, actor_id(current_user))
+    auth.require_dashboard()
     service = TelegramCacheService(db)
     requested_chat_ids = _parse_chat_ids(args)
-    chat_ids = _allowed_chat_ids(current_user, requested_chat_ids)
+    if requested_chat_ids:
+        chat_ids = [auth.authorize_chat(chat_id) for chat_id in requested_chat_ids]
+    elif auth.allowed_sources is not None:
+        chat_ids = sorted(auth.allowed_sources)
+    else:
+        chat_ids = None
+    if chat_ids == []:
+        raise AgentAuthorizationError("empty_source_scope")
     date_from = _parse_datetime(args.get('date_from') or args.get('period_start'))
     date_to = _parse_datetime(args.get('date_to') or args.get('period_end'))
+    if not auth.is_admin or (date_from is not None and date_to is not None):
+        date_from, date_to = auth.authorize_range(db, date_from, date_to)
+    else:
+        if date_from is not None:
+            auth.authorize_date(db, date_from)
+        if date_to is not None:
+            auth.authorize_date(db, date_to)
     progress_callback = _progress(args)
     grace_minutes = int(args.get('grace_minutes') or AI_AGENT_RECEIPT_GRACE_MINUTES)
     estimated_candidates = service.estimate_receipt_candidate_count(
@@ -288,6 +309,10 @@ async def monitored_chat_sync_audit(db: Session, current_user: Dict[str, Any], s
             'CACHE_GAP': 'cache_gap',
             'ORPHANED_IN_DB': 'manual_review',
         }.get(category, 'manual_review')
+        current_auth = current_agent_authorization(db, auth.user_id)
+        current_auth.authorize_chat(issue.get('chat_id'))
+        if date_from is not None and date_to is not None:
+            current_auth.authorize_range(db, date_from, date_to)
         upsert_receipt_incident(
             db,
             chat_id=int(issue.get('chat_id') or 0),
@@ -417,14 +442,33 @@ async def failed_receipt_investigator(db: Session, current_user: Dict[str, Any],
 
 
 async def duplicate_merge_preview(db: Session, current_user: Dict[str, Any], scope: Optional[dict], args: Dict[str, Any]) -> ToolResult:
+    auth = current_agent_authorization(db, actor_id(current_user))
+    auth.require_dashboard()
     limit = max(1, min(int(args.get('limit') or 10), 50))
-    rows = (
+    candidates = (
         db.query(DuplicateSuggestion)
         .filter(DuplicateSuggestion.status == 'pending')
         .order_by(DuplicateSuggestion.created_at.desc())
-        .limit(limit)
+        .limit(50)
         .all()
     )
+    rows = []
+    for suggestion in candidates:
+        pair = (
+            db.query(Transaction)
+            .filter(Transaction.id.in_([suggestion.primary_transaction_id, suggestion.duplicate_transaction_id]))
+            .all()
+        )
+        if len(pair) != 2:
+            continue
+        try:
+            for transaction in pair:
+                auth.authorize_transaction(db, transaction)
+        except AgentAuthorizationError:
+            continue
+        rows.append(suggestion)
+        if len(rows) >= limit:
+            break
     payload = [
         {
             'id': str(row.id),
@@ -468,11 +512,18 @@ async def duplicate_merge_preview(db: Session, current_user: Dict[str, Any], sco
 
 
 async def receipt_reparse_preview(db: Session, current_user: Dict[str, Any], scope: Optional[dict], args: Dict[str, Any]) -> ToolResult:
+    auth = current_agent_authorization(db, actor_id(current_user))
+    auth.require_dashboard()
     chat_id, message_id = _extract_trace_ids(args)
     if chat_id is None or message_id is None:
+        query = db.query(ReceiptProcessingTask).filter(ReceiptProcessingTask.status == 'failed')
+        if auth.allowed_sources is not None:
+            if not auth.allowed_sources:
+                query = query.filter(False)
+            else:
+                query = query.filter(ReceiptProcessingTask.chat_id.in_(auth.allowed_sources))
         row = (
-            db.query(ReceiptProcessingTask)
-            .filter(ReceiptProcessingTask.status == 'failed')
+            query
             .order_by(ReceiptProcessingTask.updated_at.desc(), ReceiptProcessingTask.id.desc())
             .first()
         )
@@ -484,6 +535,7 @@ async def receipt_reparse_preview(db: Session, current_user: Dict[str, Any], sco
             'assistant_message': 'Не нашел сообщения, для которого можно подготовить preview повторного разбора.',
             'cards': [{'type': 'warning', 'title': 'Нет данных', 'body': 'Сначала укажите chat_id/message_id или выберите failed чек.'}],
         }
+    auth.authorize_chat(chat_id)
     trace = TelegramCacheService(db).trace_message(chat_id=chat_id, message_id=message_id)
     return {
         'summary': 'Подготовил preview повторного разбора.',
@@ -533,9 +585,11 @@ async def monitor_config_inspector(db: Session, current_user: Dict[str, Any], sc
 
 
 async def report_publish_tool(db: Session, current_user: Dict[str, Any], scope: Optional[dict], args: Dict[str, Any]) -> ToolResult:
+    auth = current_agent_authorization(db, actor_id(current_user))
+    auth.require_admin('publish_team_report')
     report = generate_report(
         db,
-        created_by_user_id=int(current_user.get('id') or current_user.get('user_id') or 0),
+        created_by_user_id=auth.user_id,
         scope='team',
         publish_team_notification=False,
         publish_immediately=False,

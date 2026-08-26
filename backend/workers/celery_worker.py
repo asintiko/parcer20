@@ -4,19 +4,18 @@ Celery worker for async receipt processing (checks table)
 import os
 import json
 import logging
-import random
 import re
-import base64
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Optional
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytz
 import httpx
 from celery import Celery
 from dotenv import load_dotenv
 from services.fingerprint import compute_fingerprint_candidates
+from services.message_utils import is_metadata_only_chat, receipt_min_datetime
 from services import receipt_logger
 from core.logging_config import setup_logging
 
@@ -37,11 +36,12 @@ app.conf.update(
     result_serializer='json',
     timezone='Asia/Tashkent',
     enable_utc=True,
-    # At-least-once delivery: task is ACKed only after completion. Combined with
-    # task_reject_on_worker_lost, SIGTERM/SIGKILL during processing returns the
-    # message to the queue instead of silently losing the receipt.
+    # Tasks are ACKed after normal completion. If a child is hard-killed, the
+    # durable DB watchdog below owns bounded recovery.
     task_acks_late=True,
-    task_reject_on_worker_lost=True,
+    # A hard-killed child is acknowledged; the durable DB watchdog below owns
+    # bounded recovery instead of Redis redelivering poison work forever.
+    task_reject_on_worker_lost=False,
     # Disable noisy STARTED state writes — nobody reads them.
     task_track_started=False,
     task_time_limit=120,      # hard limit: 2 minutes
@@ -54,10 +54,23 @@ app.conf.update(
     broker_transport_options={
         "visibility_timeout": int(os.getenv("CELERY_VISIBILITY_TIMEOUT", "900")),
     },
+    task_routes={
+        "process_receipt": {"queue": "receipts.fast"},
+        "receipt_outbox_dispatch": {"queue": "maintenance"},
+        "receipt_task_watchdog_sweep": {"queue": "maintenance"},
+        "receipt_task_retention_cleanup": {"queue": "maintenance"},
+    },
 )
 
 BACKGROUND_AUDIT_MAX_CHUNKS_PER_TASK = int(os.getenv("AI_AGENT_AUDIT_MAX_CHUNKS_PER_TASK", "2"))
 BACKGROUND_AUDIT_REQUEUE_DELAY_SECONDS = int(os.getenv("AI_AGENT_AUDIT_REQUEUE_DELAY_SECONDS", "1"))
+BACKGROUND_AUDIT_MAX_CONTINUATIONS = int(os.getenv("AI_AGENT_AUDIT_MAX_CONTINUATIONS", "32"))
+BACKGROUND_AUDIT_MAX_TOTAL_MESSAGES = int(os.getenv("AI_AGENT_AUDIT_MAX_TOTAL_MESSAGES", "100000"))
+RECEIPT_MAX_PUBLISH_ATTEMPTS = int(os.getenv("RECEIPT_MAX_PUBLISH_ATTEMPTS", "12"))
+RECEIPT_MAX_PROCESSING_ATTEMPTS = int(os.getenv("RECEIPT_MAX_PROCESSING_ATTEMPTS", "4"))
+RECEIPT_OUTBOX_LEASE_SECONDS = int(os.getenv("RECEIPT_OUTBOX_LEASE_SECONDS", "120"))
+RECEIPT_MAX_DOWNLOAD_BYTES = int(os.getenv("RECEIPT_MAX_DOWNLOAD_BYTES", str(25 * 1024 * 1024)))
+RECEIPT_DOWNLOAD_TIMEOUT_SECONDS = float(os.getenv("RECEIPT_DOWNLOAD_TIMEOUT_SECONDS", "60"))
 
 
 TASHKENT_TZ = pytz.timezone("Asia/Tashkent")
@@ -138,9 +151,48 @@ def download_file_bytes(file_id: int) -> bytes:
     internal_api_key = os.getenv("INTERNAL_API_KEY")
     if internal_api_key:
         headers["X-Internal-Api-Key"] = internal_api_key
-    resp = _get_http_client().get(url, headers=headers)
-    resp.raise_for_status()
-    return resp.content
+    timeout = httpx.Timeout(RECEIPT_DOWNLOAD_TIMEOUT_SECONDS, connect=10.0)
+    chunks = bytearray()
+    with _get_http_client().stream("GET", url, headers=headers, timeout=timeout) as resp:
+        resp.raise_for_status()
+        content_length = resp.headers.get("Content-Length")
+        if content_length:
+            try:
+                declared_size = int(content_length)
+            except ValueError:
+                declared_size = 0
+            if declared_size > RECEIPT_MAX_DOWNLOAD_BYTES:
+                raise ValueError(
+                    f"receipt_file_too_large:{declared_size}>{RECEIPT_MAX_DOWNLOAD_BYTES}"
+                )
+        for chunk in resp.iter_bytes(chunk_size=64 * 1024):
+            chunks.extend(chunk)
+            if len(chunks) > RECEIPT_MAX_DOWNLOAD_BYTES:
+                raise ValueError(
+                    f"receipt_file_too_large:stream>{RECEIPT_MAX_DOWNLOAD_BYTES}"
+                )
+    return bytes(chunks)
+
+
+def _task_fallback_datetime(task_data: dict) -> Optional[datetime]:
+    value = (
+        task_data.get("source_received_at")
+        or task_data.get("message_date")
+        or task_data.get("timestamp")
+    )
+    if value in (None, ""):
+        return None
+    if isinstance(value, datetime):
+        return to_tashkent_naive(value)
+    if isinstance(value, (int, float)) or (isinstance(value, str) and value.isdigit()):
+        return datetime.fromtimestamp(float(value), tz=pytz.UTC).astimezone(TASHKENT_TZ).replace(tzinfo=None)
+    if isinstance(value, str):
+        try:
+            parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return to_tashkent_naive(parsed)
+    return None
 
 
 def download_pdf_text(file_id: int, return_bytes: bool = False):
@@ -184,17 +236,151 @@ def download_image_text(file_id: int, return_bytes: bool = False):
     return text
 
 
-def queue_receipt_task(task_data: dict, force: bool = False) -> str:
+def _receipt_queue_name(task_data: dict) -> str:
+    document = task_data.get("document") or {}
+    image = task_data.get("image") or {}
+    if document.get("file_id") or image.get("file_id"):
+        return "receipts.ocr"
+    return "receipts.fast"
+
+
+def _retry_delay_seconds(attempt: int) -> int:
+    return min(900, 10 * (3 ** max(0, attempt - 1)))
+
+
+def _publish_receipt_outbox_task(task_id: str) -> bool:
+    """Claim and publish one committed outbox row.
+
+    Returning ``False`` is safe: the row remains durable and a later dispatcher
+    pass retries it. A stable Celery id plus source identity makes an ambiguous
+    publish acknowledgement harmless.
     """
-    Enqueue Celery task with persistent tracking.
-    Returns task_id (existing for in-flight tasks).
-    If force=False (default), checks for existing transaction and skips if found.
+    from database.connection import get_db
+    from database.models import ReceiptProcessingTask
+
+    now = datetime.utcnow()
+    payload_json = None
+    publish_attempt = 0
+    queue_name = "receipts.fast"
+    with get_db() as db:
+        row = (
+            db.query(ReceiptProcessingTask)
+            .filter(ReceiptProcessingTask.task_id == str(task_id))
+            .with_for_update(skip_locked=True)
+            .first()
+        )
+        if not row or row.publish_state not in {"pending", "retry"}:
+            return False
+        if row.next_retry_at and row.next_retry_at > now:
+            return False
+        if int(row.publish_attempts or 0) >= RECEIPT_MAX_PUBLISH_ATTEMPTS:
+            row.status = "dead"
+            row.publish_state = "dead"
+            row.finished_at = now
+            row.last_error_kind = "publish_exhausted"
+            row.error = row.error or "broker_publish_attempts_exhausted"
+            db.commit()
+            _push_to_dlq(
+                celery_task_id=row.task_id,
+                task_data_json=row.payload_json or "{}",
+                error=RuntimeError(row.error),
+                tb_text="",
+                retries=int(row.publish_attempts or 0),
+                reason="publish_exhausted",
+            )
+            return False
+        row.publish_state = "publishing"
+        row.publish_attempts = int(row.publish_attempts or 0) + 1
+        row.heartbeat_at = now
+        publish_attempt = int(row.publish_attempts)
+        payload_json = row.payload_json or "{}"
+        try:
+            queue_name = _receipt_queue_name(json.loads(payload_json))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            queue_name = "receipts.fast"
+        db.commit()
+
+    try:
+        process_receipt_task.apply_async(
+            args=[payload_json],
+            task_id=str(task_id),
+            queue=queue_name,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Receipt outbox publish failed for %s", task_id)
+        with get_db() as db:
+            row = (
+                db.query(ReceiptProcessingTask)
+                .filter(ReceiptProcessingTask.task_id == str(task_id))
+                .first()
+            )
+            if row and row.publish_state == "publishing":
+                row.status = "retry"
+                row.publish_state = "retry"
+                row.next_retry_at = datetime.utcnow() + timedelta(
+                    seconds=_retry_delay_seconds(publish_attempt)
+                )
+                row.last_error_kind = "broker_publish"
+                row.error = str(exc)[:2000]
+                db.commit()
+        return False
+
+    with get_db() as db:
+        row = (
+            db.query(ReceiptProcessingTask)
+            .filter(ReceiptProcessingTask.task_id == str(task_id))
+            .first()
+        )
+        if row and row.publish_state == "publishing":
+            row.status = "queued"
+            row.publish_state = "published"
+            row.published_at = datetime.utcnow()
+            row.next_retry_at = None
+            row.error = None
+            row.last_error_kind = None
+            db.commit()
+    return True
+
+
+def dispatch_pending_receipt_tasks(limit: int = 100) -> dict:
+    """Publish due committed outbox rows; callable from scheduler or Celery beat."""
+    from sqlalchemy import or_
+
+    from database.connection import get_db
+    from database.models import ReceiptProcessingTask
+
+    now = datetime.utcnow()
+    with get_db() as db:
+        task_ids = [
+            str(task_id)
+            for (task_id,) in (
+                db.query(ReceiptProcessingTask.task_id)
+                .filter(
+                    ReceiptProcessingTask.publish_state.in_(["pending", "retry"]),
+                    or_(
+                        ReceiptProcessingTask.next_retry_at.is_(None),
+                        ReceiptProcessingTask.next_retry_at <= now,
+                    ),
+                )
+                .order_by(ReceiptProcessingTask.created_at.asc())
+                .limit(max(1, min(int(limit), 500)))
+                .all()
+            )
+        ]
+    published = sum(1 for task_id in task_ids if _publish_receipt_outbox_task(task_id))
+    return {"checked": len(task_ids), "published": published}
+
+
+def queue_receipt_task(task_data: dict, force: bool = False) -> str:
+    """Persist a receipt task before best-effort broker publication.
+
+    The returned stable task id identifies both the DB outbox row and every
+    Celery delivery. Existing active work for the same source message is reused.
     """
     from database.connection import get_db
     from database.models import ReceiptProcessingTask, Transaction
 
-    # Propagate request_id from caller's contextvar so the worker can
-    # correlate logs back to the originating HTTP request.
+    task_data = dict(task_data or {})
     if "request_id" not in task_data:
         try:
             from core.logging_config import get_request_id
@@ -205,70 +391,128 @@ def queue_receipt_task(task_data: dict, force: bool = False) -> str:
         except Exception:  # noqa: BLE001
             pass
 
-    chat_id = task_data.get('source_chat_id')
-    msg_id = task_data.get('source_message_id')
     try:
-        chat_id = int(chat_id) if chat_id is not None else None
-    except (TypeError, ValueError):
-        chat_id = None
-    try:
-        msg_id = int(msg_id) if msg_id is not None else None
-    except (TypeError, ValueError):
-        msg_id = None
+        chat_id = int(task_data.get("source_chat_id"))
+        msg_id = int(task_data.get("source_message_id"))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("source_chat_id and source_message_id are required") from exc
 
+    payload_json = json.dumps(task_data, ensure_ascii=False)
+    task_id = str(uuid4())
+    now = datetime.utcnow()
     with get_db() as db:
-        existing_task = None
-        if chat_id is not None and msg_id is not None:
-            # Check if already in processing queue
-            existing_task = (
-                db.query(ReceiptProcessingTask)
+        existing_task = (
+            db.query(ReceiptProcessingTask)
+            .filter(
+                ReceiptProcessingTask.chat_id == chat_id,
+                ReceiptProcessingTask.message_id == msg_id,
+            )
+            .with_for_update()
+            .first()
+        )
+        if existing_task and existing_task.status in {"queued", "processing", "retry"}:
+            return str(existing_task.task_id)
+
+        if not force:
+            existing_txn = (
+                db.query(Transaction)
                 .filter(
-                    ReceiptProcessingTask.chat_id == chat_id,
-                    ReceiptProcessingTask.message_id == msg_id
+                    Transaction.source_chat_id == chat_id,
+                    Transaction.source_message_id == msg_id,
                 )
                 .first()
             )
-            if existing_task and existing_task.status in ('queued', 'processing'):
-                return existing_task.task_id
-
-            # STRICT DUPLICATE CHECK: Check if transaction already exists
-            if not force:
-                existing_txn = (
-                    db.query(Transaction)
-                    .filter(
-                        Transaction.source_chat_id == chat_id,
-                        Transaction.source_message_id == msg_id
-                    )
-                    .first()
-                )
-                if existing_txn:
-                    # Return existing task_id or create a dummy response
-                    if existing_task:
-                        return existing_task.task_id
-                    # Message already processed, return a marker
-                    raise ValueError(f"Сообщение уже обработано (транзакция #{existing_txn.id})")
-
-        # Dispatch new Celery task
-        result = process_receipt_task.delay(json.dumps(task_data))
-
-        if chat_id is None or msg_id is None:
-            return result.id
+            if existing_txn:
+                if existing_task:
+                    return str(existing_task.task_id)
+                raise ValueError(f"Сообщение уже обработано (транзакция #{existing_txn.id})")
 
         if existing_task:
-            existing_task.task_id = result.id
-            existing_task.status = 'queued'
-            existing_task.error = None
+            existing_task.task_id = task_id
+            existing_task.status = "queued"
             existing_task.transaction_id = None
+            existing_task.error = None
+            existing_task.raw_message = None
+            existing_task.payload_json = payload_json
+            existing_task.force_reprocess = bool(force)
+            existing_task.publish_state = "pending"
+            existing_task.publish_attempts = 0
+            existing_task.processing_attempts = 0
+            existing_task.next_retry_at = now
+            existing_task.heartbeat_at = None
+            existing_task.published_at = None
+            existing_task.started_at = None
+            existing_task.finished_at = None
+            existing_task.last_error_kind = None
         else:
-            tracking = ReceiptProcessingTask(
-                task_id=result.id,
-                chat_id=chat_id,
-                message_id=msg_id,
-                status='queued'
+            db.add(
+                ReceiptProcessingTask(
+                    task_id=task_id,
+                    chat_id=chat_id,
+                    message_id=msg_id,
+                    status="queued",
+                    payload_json=payload_json,
+                    force_reprocess=bool(force),
+                    publish_state="pending",
+                    next_retry_at=now,
+                )
             )
-            db.add(tracking)
-        db.commit()
-        return result.id
+        # This commit is the outbox invariant: no broker publish can happen first.
+        try:
+            db.commit()
+        except Exception as exc:  # noqa: BLE001
+            from sqlalchemy.exc import IntegrityError
+
+            if not isinstance(exc, IntegrityError):
+                raise
+            db.rollback()
+            winner = (
+                db.query(ReceiptProcessingTask)
+                .filter(
+                    ReceiptProcessingTask.chat_id == chat_id,
+                    ReceiptProcessingTask.message_id == msg_id,
+                )
+                .first()
+            )
+            if not winner:
+                raise
+            return str(winner.task_id)
+
+    _publish_receipt_outbox_task(task_id)
+    return task_id
+
+
+def _update_tg_message_processing(
+    db,
+    *,
+    chat_id: int | None,
+    message_id: int | None,
+    status: str,
+    transaction_id: int | None = None,
+    error_code: str | None = None,
+    error_text: str | None = None,
+    duplicate_status: str | None = None,
+) -> None:
+    if chat_id is None or message_id is None:
+        return
+    from database.models import TgChatMessage
+
+    row = (
+        db.query(TgChatMessage)
+        .filter(
+            TgChatMessage.chat_id == int(chat_id),
+            TgChatMessage.message_id == int(message_id),
+        )
+        .first()
+    )
+    if not row:
+        return
+    row.processing_status = status
+    row.receipt_transaction_id = transaction_id
+    row.processing_error_code = error_code
+    row.processing_error_text = (error_text or "")[:2000] or None
+    if duplicate_status is not None:
+        row.duplicate_status = duplicate_status
 
 
 def register_receipt_incident(
@@ -315,6 +559,12 @@ def register_receipt_incident(
 )
 def run_agent_monitored_chat_sync_audit_task(self, task_payload_json: str):
     from database.connection import SessionLocal, get_db
+    from database.models import AgentRun, AgentThread
+    from services.ai_agent.authorization import (
+        AgentAuthorizationError,
+        current_agent_authorization,
+        require_same_source_set,
+    )
     from services.ai_agent.session_service import create_message, create_run_event, update_run
     from services.ai_agent.tools.cache_tools import _build_monitored_chat_sync_audit_result, _parse_datetime
     from services.incident_service import upsert_receipt_incident
@@ -323,17 +573,82 @@ def run_agent_monitored_chat_sync_audit_task(self, task_payload_json: str):
     task_payload = json.loads(task_payload_json or "{}")
     run_id = UUID(str(task_payload.get("run_id")))
     thread_id = UUID(str(task_payload.get("thread_id")))
-    payload = task_payload.get("payload") or {}
-    chat_ids = payload.get("chat_ids") or None
-    grace_minutes = int(payload.get("grace_minutes") or 5)
-    date_from = _parse_datetime(payload.get("date_from"))
-    date_to = _parse_datetime(payload.get("date_to"))
-    estimated_candidates = int(payload.get("estimated_candidates") or 0)
-    chunk_size = int(payload.get("chunk_size") or 500)
-    resume_state = task_payload.get("state") or {}
-
     try:
         with get_db() as db:
+            run = db.get(AgentRun, run_id)
+            thread = db.get(AgentThread, thread_id)
+            if run is None or thread is None:
+                raise AgentAuthorizationError("background_run_or_thread_not_found")
+            if run.thread_id != thread_id or int(run.created_by_user_id) != int(thread.created_by_user_id):
+                raise AgentAuthorizationError("background_run_thread_actor_mismatch")
+            if run.status in {"completed", "failed", "cancelled"}:
+                return {"status": run.status, "idempotent": True}
+
+            auth = current_agent_authorization(db, run.created_by_user_id)
+            auth.require_dashboard()
+            try:
+                stored_progress = json.loads(run.progress_json or "{}")
+            except Exception:
+                stored_progress = {}
+            resume_state = (
+                stored_progress.get("background_state")
+                if isinstance(stored_progress.get("background_state"), dict)
+                else {}
+            )
+            plan = stored_progress.get("background_authorization")
+            service = TelegramCacheService(db)
+            if not isinstance(plan, dict):
+                payload = task_payload.get("payload") or {}
+                requested_chat_ids = payload.get("chat_ids")
+                monitored_ids = set(service.list_monitored_chat_ids(only_enabled=True))
+                if requested_chat_ids:
+                    chat_ids = require_same_source_set(auth, requested_chat_ids)
+                elif auth.allowed_sources is None:
+                    chat_ids = tuple(sorted(monitored_ids))
+                else:
+                    chat_ids = tuple(sorted(monitored_ids.intersection(auth.allowed_sources)))
+                if not chat_ids or not set(chat_ids).issubset(monitored_ids):
+                    raise AgentAuthorizationError("background_source_scope_invalid")
+
+                date_from = _parse_datetime(payload.get("date_from"))
+                date_to = _parse_datetime(payload.get("date_to"))
+                if not auth.is_admin or (date_from is not None and date_to is not None):
+                    date_from, date_to = auth.authorize_range(db, date_from, date_to)
+                grace_minutes = max(0, min(int(payload.get("grace_minutes") or 5), 1440))
+                estimated_candidates = max(0, int(payload.get("estimated_candidates") or 0))
+                chunk_size = max(50, min(int(payload.get("chunk_size") or 500), 1000))
+                plan = {
+                    "actor_user_id": auth.user_id,
+                    "original_permissions_version": auth.permissions_version,
+                    "chat_ids": list(chat_ids),
+                    "date_from": date_from.isoformat() if date_from else None,
+                    "date_to": date_to.isoformat() if date_to else None,
+                    "grace_minutes": grace_minutes,
+                    "estimated_candidates": estimated_candidates,
+                    "chunk_size": chunk_size,
+                    "continuations_used": 0,
+                }
+                run.progress_json = json.dumps(
+                    {**stored_progress, "background_authorization": plan},
+                    ensure_ascii=False,
+                )
+                db.add(run)
+                db.commit()
+            else:
+                if int(plan.get("actor_user_id") or 0) != auth.user_id:
+                    raise AgentAuthorizationError("background_actor_changed")
+                chat_ids = require_same_source_set(auth, plan.get("chat_ids") or [])
+                date_from = _parse_datetime(plan.get("date_from"))
+                date_to = _parse_datetime(plan.get("date_to"))
+                if not auth.is_admin or (date_from is not None and date_to is not None):
+                    date_from, date_to = auth.authorize_range(db, date_from, date_to)
+                grace_minutes = max(0, min(int(plan.get("grace_minutes") or 5), 1440))
+                estimated_candidates = max(0, int(plan.get("estimated_candidates") or 0))
+                chunk_size = max(50, min(int(plan.get("chunk_size") or 500), 1000))
+
+            continuations_used = int(plan.get("continuations_used") or 0)
+            if continuations_used > BACKGROUND_AUDIT_MAX_CONTINUATIONS:
+                raise ValueError("background_audit_continuation_limit_exceeded")
             if not resume_state:
                 create_run_event(
                     db,
@@ -343,8 +658,8 @@ def run_agent_monitored_chat_sync_audit_task(self, task_payload_json: str):
                     status='running',
                     payload={
                         'mode': 'background',
-                        'date_from': payload.get('date_from'),
-                        'date_to': payload.get('date_to'),
+                        'date_from': plan.get('date_from'),
+                        'date_to': plan.get('date_to'),
                         'estimated_candidates': estimated_candidates,
                     },
                 )
@@ -376,7 +691,7 @@ def run_agent_monitored_chat_sync_audit_task(self, task_payload_json: str):
                     auto_commit=False,
                 )
 
-            summary = TelegramCacheService(db).audit_monitored_chats_chunked(
+            summary = service.audit_monitored_chats_chunked(
                 chat_ids=chat_ids,
                 date_from=date_from,
                 date_to=date_to,
@@ -386,13 +701,27 @@ def run_agent_monitored_chat_sync_audit_task(self, task_payload_json: str):
                 max_chunks=BACKGROUND_AUDIT_MAX_CHUNKS_PER_TASK,
                 issue_callback=_issue_to_incident,
             )
+            processed_messages = int(summary.get('processed_messages') or 0)
+            if processed_messages > BACKGROUND_AUDIT_MAX_TOTAL_MESSAGES:
+                db.rollback()
+                raise ValueError("background_audit_message_limit_exceeded")
+
+            # Authorization is reloaded after the chunk and immediately before
+            # incident publication. Revocation rolls the pending incidents back.
+            current_auth = current_agent_authorization(db, auth.user_id)
+            current_sources = require_same_source_set(current_auth, plan.get("chat_ids") or [])
+            if tuple(chat_ids) != current_sources:
+                db.rollback()
+                raise AgentAuthorizationError("background_source_scope_changed")
+            if date_from is not None and date_to is not None:
+                current_auth.authorize_range(db, date_from, date_to)
             db.commit()
 
             progress_payload = {
                 'mode': 'background',
                 'phase': summary.get('phase') or ('completed' if summary.get('complete') else 'scan_chunk'),
                 'current_chat_id': summary.get('current_chat_id'),
-                'processed_messages': int(summary.get('processed_messages') or 0),
+                'processed_messages': processed_messages,
                 'total_estimated_messages': int(summary.get('total_estimated_messages') or estimated_candidates),
                 'issues_found': int(summary.get('total_issues') or 0),
                 'completed_chat_ids': summary.get('completed_chat_ids') or [],
@@ -400,6 +729,7 @@ def run_agent_monitored_chat_sync_audit_task(self, task_payload_json: str):
                 'started_from_latest': True,
                 'categories': summary.get('categories') or {},
                 'percent': int(summary.get('percent') or 0),
+                'background_authorization': plan,
             }
 
             update_run(
@@ -419,21 +749,50 @@ def run_agent_monitored_chat_sync_audit_task(self, task_payload_json: str):
             )
 
             if not summary.get('complete'):
+                continuations_used += 1
+                if continuations_used > BACKGROUND_AUDIT_MAX_CONTINUATIONS:
+                    raise ValueError("background_audit_continuation_limit_exceeded")
+                plan = {**plan, "continuations_used": continuations_used}
+                next_state = {
+                    'monitored_ids': list(chat_ids),
+                    'completed_chat_ids': [
+                        int(item)
+                        for item in (summary.get('completed_chat_ids') or [])
+                        if int(item) in set(chat_ids)
+                    ],
+                    'seen_chat_ids': [
+                        int(item)
+                        for item in (summary.get('seen_chat_ids') or [])
+                        if int(item) in set(chat_ids)
+                    ],
+                    'cursor': summary.get('cursor'),
+                    'processed_messages': processed_messages,
+                    'total_estimated_messages': int(summary.get('total_estimated_messages') or estimated_candidates),
+                    'total_issues': int(summary.get('total_issues') or 0),
+                    'categories': summary.get('categories') or {},
+                    'by_chat': [
+                        item
+                        for item in (summary.get('by_chat') or [])
+                        if int(item.get('chat_id') or 0) in set(chat_ids)
+                    ],
+                    'issues_preview': summary.get('issues_preview') or [],
+                    'top_actionable_cases': summary.get('top_actionable_cases') or [],
+                }
+                cursor = next_state.get('cursor')
+                if isinstance(cursor, dict) and int(cursor.get('chat_id') or 0) not in set(chat_ids):
+                    next_state['cursor'] = None
+                progress_payload["background_authorization"] = plan
+                progress_payload["background_state"] = next_state
+                update_run(
+                    db,
+                    run_id=run_id,
+                    status='processing',
+                    progress=progress_payload,
+                    requires_confirmation=False,
+                )
                 next_payload = {
-                    **task_payload,
-                    'state': {
-                        'monitored_ids': summary.get('monitored_ids') or (resume_state.get('monitored_ids') if isinstance(resume_state, dict) else None),
-                        'completed_chat_ids': summary.get('completed_chat_ids') or [],
-                        'seen_chat_ids': summary.get('seen_chat_ids') or [],
-                        'cursor': summary.get('cursor'),
-                        'processed_messages': int(summary.get('processed_messages') or 0),
-                        'total_estimated_messages': int(summary.get('total_estimated_messages') or estimated_candidates),
-                        'total_issues': int(summary.get('total_issues') or 0),
-                        'categories': summary.get('categories') or {},
-                        'by_chat': summary.get('by_chat') or [],
-                        'issues_preview': summary.get('issues_preview') or [],
-                        'top_actionable_cases': summary.get('top_actionable_cases') or [],
-                    },
+                    'run_id': str(run_id),
+                    'thread_id': str(thread_id),
                 }
                 run_agent_monitored_chat_sync_audit_task.apply_async(
                     args=[json.dumps(next_payload, ensure_ascii=False)],
@@ -441,6 +800,12 @@ def run_agent_monitored_chat_sync_audit_task(self, task_payload_json: str):
                 )
                 return progress_payload
 
+            final_auth = current_agent_authorization(db, auth.user_id)
+            final_sources = require_same_source_set(final_auth, plan.get("chat_ids") or [])
+            if tuple(chat_ids) != final_sources:
+                raise AgentAuthorizationError("background_source_scope_changed")
+            if date_from is not None and date_to is not None:
+                final_auth.authorize_range(db, date_from, date_to)
             assistant_payload = _build_monitored_chat_sync_audit_result(
                 summary=summary,
                 date_from=date_from,
@@ -516,6 +881,43 @@ def run_agent_monitored_chat_sync_audit_task(self, task_payload_json: str):
         raise
 
 
+def _authorize_deferred_receipt_task(
+    db,
+    task_data: dict,
+    *,
+    transaction=None,
+    parsed_date=None,
+):
+    """Revalidate actor-bound reparse jobs immediately before mutation."""
+    action = str(task_data.get("requested_action") or "").strip()
+    if not action:
+        return None
+    if action != "agent_receipt_reparse":
+        raise ValueError("deferred_receipt_action_invalid")
+
+    from services.ai_agent.authorization import current_agent_authorization
+
+    try:
+        actor_user_id = int(task_data.get("requested_by_user_id"))
+        source_chat_id = int(task_data.get("source_chat_id"))
+        source_message_id = int(task_data.get("source_message_id"))
+        original_chat_id = int(task_data.get("original_source_chat_id"))
+        original_message_id = int(task_data.get("original_source_message_id"))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("deferred_receipt_authorization_invalid") from exc
+    if (source_chat_id, source_message_id) != (original_chat_id, original_message_id):
+        raise ValueError("deferred_receipt_source_changed")
+
+    auth = current_agent_authorization(db, actor_user_id)
+    auth.require_dashboard()
+    auth.authorize_chat(original_chat_id)
+    if transaction is not None:
+        auth.authorize_transaction(db, transaction, proposed_date=parsed_date)
+    elif parsed_date is not None:
+        auth.authorize_date(db, parsed_date)
+    return auth
+
+
 @app.task(name='process_receipt', bind=True, max_retries=3)
 def process_receipt_task(self, task_data_json: str):
     """
@@ -525,9 +927,17 @@ def process_receipt_task(self, task_data_json: str):
         task_data_json: JSON string containing receipt data
     """
     from database.connection import get_db
-    from database.models import Transaction, ParsingLog, ReceiptProcessingTask, OperatorReference, DuplicateMergeLog
+    from database.models import (
+        AccessAuditLog,
+        DuplicateSuggestion,
+        MonitoredBotChat,
+        OperatorReference,
+        ParsingLog,
+        ReceiptProcessingTask,
+        TgChatMessage,
+        Transaction,
+    )
     from parsers.parser_orchestrator import ParserOrchestrator
-    from services.receipt_processor import _merge_duplicate_transaction
     
     try:
         celery_task_id = self.request.id
@@ -564,8 +974,23 @@ def process_receipt_task(self, task_data_json: str):
         
         # Process with parser orchestrator
         with get_db() as db:
+            deferred_auth = _authorize_deferred_receipt_task(db, task_data)
+            if deferred_auth is not None and source_chat_id and source_message_id:
+                cached_date = (
+                    db.query(TgChatMessage.message_date)
+                    .filter(
+                        TgChatMessage.chat_id == int(source_chat_id),
+                        TgChatMessage.message_id == int(source_message_id),
+                    )
+                    .scalar()
+                )
+                if cached_date is not None:
+                    deferred_auth.authorize_date(db, cached_date)
             # Update tracking -> processing
             tracking = None
+            force_reprocess = False
+            existing_source_transaction = None
+            force_before_snapshot = None
             if source_chat_id and source_message_id:
                 tracking = (
                     db.query(ReceiptProcessingTask)
@@ -573,9 +998,68 @@ def process_receipt_task(self, task_data_json: str):
                     .first()
                 )
                 if tracking:
+                    if tracking.status == "dead":
+                        return {"success": False, "error": "task_is_dead"}
+                    force_reprocess = bool(tracking.force_reprocess)
                     tracking.status = 'processing'
                     tracking.error = None
+                    tracking.processing_attempts = int(tracking.processing_attempts or 0) + 1
+                    tracking.started_at = tracking.started_at or datetime.utcnow()
+                    tracking.heartbeat_at = datetime.utcnow()
+                    tracking.last_error_kind = None
+                    _update_tg_message_processing(
+                        db,
+                        chat_id=tracking.chat_id,
+                        message_id=tracking.message_id,
+                        status="processing",
+                    )
                     db.commit()
+
+                    is_auto_source = str(source_type or "").upper() in {
+                        "AUTO",
+                        "USERBOT",
+                    }
+                    skip_reason = None
+                    if is_auto_source:
+                        monitored = db.get(MonitoredBotChat, int(tracking.chat_id))
+                        if monitored is None or not monitored.enabled:
+                            skip_reason = "unmonitored_source"
+                        source_datetime = _task_fallback_datetime(task_data)
+                        if source_datetime is None:
+                            source_datetime = (
+                                db.query(TgChatMessage.message_date)
+                                .filter(
+                                    TgChatMessage.chat_id == int(tracking.chat_id),
+                                    TgChatMessage.message_id == int(tracking.message_id),
+                                )
+                                .scalar()
+                            )
+                        if source_datetime is None:
+                            skip_reason = skip_reason or "missing_source_date"
+                        elif source_datetime < receipt_min_datetime():
+                            skip_reason = skip_reason or "source_before_date_cutoff"
+
+                    if skip_reason:
+                        tracking.status = "done"
+                        tracking.publish_state = "done"
+                        tracking.error = f"skipped:{skip_reason}"
+                        tracking.finished_at = datetime.utcnow()
+                        tracking.heartbeat_at = datetime.utcnow()
+                        tracking.last_error_kind = skip_reason
+                        _update_tg_message_processing(
+                            db,
+                            chat_id=tracking.chat_id,
+                            message_id=tracking.message_id,
+                            status="done",
+                            error_code=skip_reason,
+                            error_text=tracking.error,
+                        )
+                        db.commit()
+                        return {
+                            "success": True,
+                            "skipped": True,
+                            "reason": skip_reason,
+                        }
                     try:
                         receipt_logger.log_received(
                             task_id=int(tracking.id),
@@ -585,6 +1069,25 @@ def process_receipt_task(self, task_data_json: str):
                         )
                     except Exception:  # noqa: BLE001
                         logger.debug("receipt_logger.log_received failed", exc_info=True)
+
+            if is_metadata_only_chat(source_chat_id):
+                if tracking:
+                    tracking.status = "done"
+                    tracking.transaction_id = None
+                    tracking.error = "metadata_only_chat_skipped"
+                    tracking.finished_at = datetime.utcnow()
+                    tracking.heartbeat_at = datetime.utcnow()
+                    tracking.last_error_kind = "metadata_only"
+                    _update_tg_message_processing(
+                        db,
+                        chat_id=tracking.chat_id,
+                        message_id=tracking.message_id,
+                        status="done",
+                        error_code="metadata_only",
+                        error_text="metadata_only_chat_skipped",
+                    )
+                    db.commit()
+                return {"success": True, "skipped": True, "reason": "metadata_only_chat"}
 
             # Idempotency: skip duplicates by source ids (transactions table)
             if source_chat_id and source_message_id:
@@ -605,25 +1108,47 @@ def process_receipt_task(self, task_data_json: str):
                         .first()
                     )
                     if existing:
-                        processing_time = int((datetime.now() - start_time).total_seconds() * 1000)
-                        if tracking:
-                            tracking.status = 'done'
-                            tracking.transaction_id = existing.id
+                        if force_reprocess:
+                            existing_source_transaction = existing
+                            force_before_snapshot = {
+                                key: str(getattr(existing, key, None))
+                                for key in (
+                                    "transaction_date", "amount", "currency", "card_last_4",
+                                    "operator_raw", "application_mapped", "transaction_type",
+                                    "balance_after", "receiver_name", "receiver_card",
+                                    "parsing_method", "parsing_confidence", "fingerprint",
+                                )
+                            }
+                        else:
+                            processing_time = int((datetime.now() - start_time).total_seconds() * 1000)
+                            if tracking:
+                                tracking.status = 'done'
+                                tracking.transaction_id = existing.id
+                                tracking.finished_at = datetime.utcnow()
+                                tracking.heartbeat_at = datetime.utcnow()
+                                _update_tg_message_processing(
+                                    db,
+                                    chat_id=tracking.chat_id,
+                                    message_id=tracking.message_id,
+                                    status="done",
+                                    transaction_id=int(existing.id),
+                                    duplicate_status="source_duplicate",
+                                )
+                                db.commit()
+                            log = ParsingLog(
+                                raw_message=raw_text_original,
+                                parsing_method=None,
+                                success=True,
+                                processing_time_ms=processing_time
+                            )
+                            db.add(log)
                             db.commit()
-                        log = ParsingLog(
-                            raw_message=raw_text_original,
-                            parsing_method=None,
-                            success=True,
-                            processing_time_ms=processing_time
-                        )
-                        db.add(log)
-                        db.commit()
-                        return {
-                            'success': True,
-                            'duplicate': True,
-                            'transaction_id': str(existing.uuid),
-                            'id': existing.id
-                        }
+                            return {
+                                'success': True,
+                                'duplicate': True,
+                                'transaction_id': str(existing.uuid),
+                                'id': existing.id
+                            }
 
             orchestrator = ParserOrchestrator(db)
             raw_text = raw_text_original or ""
@@ -636,6 +1161,9 @@ def process_receipt_task(self, task_data_json: str):
             is_image = image and image.get("file_id") and str(image.get("mime_type") or "").lower().startswith("image/")
             if is_pdf:
                 try:
+                    if tracking:
+                        tracking.heartbeat_at = datetime.utcnow()
+                        db.commit()
                     pdf_text, pdf_bytes = download_pdf_text(int(document['file_id']), return_bytes=True)
                 except Exception as e:
                     if tracking:
@@ -658,6 +1186,9 @@ def process_receipt_task(self, task_data_json: str):
                 raw_text = "\n\n".join(raw_text_parts).strip()
             elif is_image:
                 try:
+                    if tracking:
+                        tracking.heartbeat_at = datetime.utcnow()
+                        db.commit()
                     image_text, image_bytes = download_image_text(int(image["file_id"]), return_bytes=True)
                 except Exception as e:
                     if tracking:
@@ -680,13 +1211,20 @@ def process_receipt_task(self, task_data_json: str):
 
             # Text-first parsing
             if raw_text:
-                parsed_data = orchestrator.process(raw_text)
+                parsed_data = orchestrator.process(
+                    raw_text,
+                    fallback_datetime=_task_fallback_datetime(task_data),
+                )
+            if tracking:
+                tracking.heartbeat_at = datetime.utcnow()
+                db.commit()
 
             processing_time = int((datetime.now() - start_time).total_seconds() * 1000)
             
             if not parsed_data:
                 reason = getattr(orchestrator, "last_rejection_reason", None) or "unknown"
                 error_message = f"Parsing returned None: {reason}"
+                transient_rejection = "ai_transient" in str(reason).lower()
                 log = ParsingLog(
                     raw_message=raw_text,
                     success=False,
@@ -695,9 +1233,33 @@ def process_receipt_task(self, task_data_json: str):
                 )
                 db.add(log)
                 if tracking:
-                    tracking.status = 'failed'
                     tracking.error = error_message
                     tracking.raw_message = (raw_text or "")[:4000] if raw_text else None
+                    tracking.heartbeat_at = datetime.utcnow()
+                    attempts = int(tracking.processing_attempts or 0)
+                    if transient_rejection and attempts < RECEIPT_MAX_PROCESSING_ATTEMPTS:
+                        rejection_state = "retry"
+                        tracking.status = "retry"
+                        tracking.publish_state = "retry"
+                        tracking.next_retry_at = datetime.utcnow() + timedelta(
+                            seconds=_retry_delay_seconds(attempts)
+                        )
+                        tracking.last_error_kind = "ai_transient"
+                    else:
+                        rejection_state = "dead"
+                        tracking.status = "dead"
+                        tracking.publish_state = "dead"
+                        tracking.finished_at = datetime.utcnow()
+                        tracking.next_retry_at = None
+                        tracking.last_error_kind = "parser_rejected"
+                    _update_tg_message_processing(
+                        db,
+                        chat_id=tracking.chat_id,
+                        message_id=tracking.message_id,
+                        status=rejection_state,
+                        error_code=str(tracking.last_error_kind),
+                        error_text=error_message,
+                    )
                 db.commit()
                 try:
                     receipt_logger.log_failed(
@@ -723,8 +1285,24 @@ def process_receipt_task(self, task_data_json: str):
                         reason_text=error_message,
                         payload={'raw_text': (raw_text or '')[:1000]},
                     )
+                    db.commit()
+                    if rejection_state == "dead":
+                        _push_to_dlq(
+                            celery_task_id=celery_task_id,
+                            task_data_json=task_data_json,
+                            error=ValueError(error_message),
+                            tb_text="",
+                            retries=int(tracking.processing_attempts or 0),
+                            reason="parser_rejected",
+                        )
                 logger.warning("Parsing failed for receipt: %s", reason)
-                return {'success': False, 'error': error_message}
+                if transient_rejection and not tracking:
+                    raise RuntimeError(error_message)
+                return {
+                    'success': False,
+                    'error': error_message,
+                    'state': rejection_state if tracking else 'dead',
+                }
 
             # Suggest adding new reference entry if AI proposed one and it's not in DB yet
             suggestion = parsed_data.get("operator_reference_suggestion")
@@ -757,6 +1335,28 @@ def process_receipt_task(self, task_data_json: str):
 
             # Normalize fields
             tx_datetime = to_tashkent_naive(parsed_data['transaction_date'])
+            if tx_datetime < receipt_min_datetime():
+                if tracking:
+                    tracking.status = "done"
+                    tracking.publish_state = "done"
+                    tracking.error = "skipped:transaction_before_date_cutoff"
+                    tracking.finished_at = datetime.utcnow()
+                    tracking.heartbeat_at = datetime.utcnow()
+                    tracking.last_error_kind = "transaction_before_date_cutoff"
+                    _update_tg_message_processing(
+                        db,
+                        chat_id=tracking.chat_id,
+                        message_id=tracking.message_id,
+                        status="done",
+                        error_code="transaction_before_date_cutoff",
+                        error_text=tracking.error,
+                    )
+                    db.commit()
+                return {
+                    "success": True,
+                    "skipped": True,
+                    "reason": "transaction_before_date_cutoff",
+                }
             operator = parsed_data.get('operator_raw') or 'Unknown'
             app_name = parsed_data.get('application_mapped')
             amount = normalize_amount_positive(parsed_data['amount'])
@@ -809,181 +1409,164 @@ def process_receipt_task(self, task_data_json: str):
             )
             fp = fp_candidates[0]
 
-            # Check duplicates by all candidates to keep backward compatibility during transition.
-            existing_by_fp = db.query(Transaction).filter(Transaction.fingerprint.in_(fp_candidates)).first()
-            if existing_by_fp:
-                original_method = getattr(existing_by_fp, "parsing_method", None)
-                original_conf = float(getattr(existing_by_fp, "parsing_confidence", 0.0) or 0.0)
-                merged = _merge_duplicate_transaction(
-                    existing_by_fp,
-                    candidate_transaction_date=tx_datetime,
-                    candidate_operator_raw=operator,
-                    candidate_application_mapped=app_name,
-                    candidate_balance_after=balance,
-                    candidate_receiver_name=parsed_data.get("receiver_name"),
-                    candidate_receiver_card=parsed_data.get("receiver_card"),
-                    candidate_raw_message=raw_text,
-                    candidate_is_p2p=is_p2p,
-                    candidate_parsing_method=method_value,
-                    candidate_parsing_confidence=confidence_value,
-                    candidate_is_gpt=is_gpt_parsed_flag,
-                    candidate_source_type=tx_source_type,
+            # A fingerprint is intentionally fuzzy. Keep the nearest match only
+            # to create a reconciliation suggestion after inserting this source.
+            fingerprint_candidate = (
+                db.query(Transaction)
+                .filter(Transaction.fingerprint.in_(fp_candidates))
+                .filter(
+                    Transaction.id != existing_source_transaction.id
+                    if existing_source_transaction is not None
+                    else True
                 )
+                .order_by(Transaction.id.asc())
+                .first()
+            )
+
+            transaction_values = {
+                "raw_message": raw_text,
+                "source_type": tx_source_type,
+                "source_chat_id": chat_id_int,
+                "source_message_id": msg_id_int,
+                "transaction_date": tx_datetime,
+                "amount": store_amount,
+                "currency": currency,
+                "card_last_4": str(card_last4)[-4:] if card_last4 else None,
+                "operator_raw": operator,
+                "application_mapped": app_name,
+                "receiver_name": parsed_data.get("receiver_name"),
+                "receiver_card": parsed_data.get("receiver_card"),
+                "transaction_type": transaction_type,
+                "balance_after": balance,
+                "is_p2p": is_p2p,
+                "is_gpt_parsed": is_gpt_parsed_flag,
+                "parsing_confidence": confidence_value,
+                "parsing_method": method_value,
+                "fingerprint": fp,
+            }
+            _authorize_deferred_receipt_task(
+                db,
+                task_data,
+                transaction=existing_source_transaction,
+                parsed_date=tx_datetime,
+            )
+            if existing_source_transaction is not None:
+                transaction = existing_source_transaction
+                for key, value in transaction_values.items():
+                    setattr(transaction, key, value)
+                force_after_snapshot = {
+                    key: str(getattr(transaction, key, None))
+                    for key in (force_before_snapshot or {}).keys()
+                }
                 db.add(
-                    DuplicateMergeLog(
-                        fingerprint=fp,
-                        existing_transaction_id=int(existing_by_fp.id),
-                        source_chat_id=chat_id_int,
-                        source_message_id=msg_id_int,
-                        merged=bool(merged),
-                        candidate_method=method_value,
-                        candidate_confidence=float(confidence_value) if confidence_value is not None else None,
-                        existing_method=original_method,
-                        existing_confidence=original_conf,
+                    AccessAuditLog(
+                        action="receipt_force_reparse",
+                        success=True,
                         details_json=json.dumps(
                             {
-                                "original_method": original_method,
-                                "original_confidence": original_conf,
-                                "candidate_method": method_value,
-                                "candidate_confidence": confidence_value,
-                                "candidate_has_receiver": bool(parsed_data.get("receiver_name") or parsed_data.get("receiver_card")),
-                                "candidate_has_balance": parsed_data.get("balance_after") is not None,
+                                "transaction_id": int(transaction.id),
+                                "chat_id": chat_id_int,
+                                "message_id": msg_id_int,
+                                "before": force_before_snapshot or {},
+                                "after": force_after_snapshot,
+                                "worker_task_id": str(celery_task_id),
                             },
                             ensure_ascii=False,
                         ),
                     )
                 )
                 db.commit()
-                db.refresh(existing_by_fp)
-                processing_time = int((datetime.now() - start_time).total_seconds() * 1000)
-                if tracking:
-                    tracking.status = 'done'
-                    tracking.transaction_id = existing_by_fp.id
+                db.refresh(transaction)
+            else:
+                transaction = Transaction(**transaction_values)
+                db.add(transaction)
+                try:
                     db.commit()
-                log = ParsingLog(
-                    raw_message=raw_text,
-                    parsing_method=method_value,
-                    success=True,
-                    processing_time_ms=processing_time
-                )
-                db.add(log)
-                db.commit()
-                logger.info(
-                    "Duplicate receipt detected by fingerprint, skipping%s",
-                    " (merged richer fields)" if merged else "",
+                except Exception as exc:  # noqa: BLE001
+                    from sqlalchemy.exc import IntegrityError as _IntegrityError
+                    if isinstance(exc, _IntegrityError):
+                        db.rollback()
+                        logger.info(
+                            "Race-condition duplicate detected on commit; resolving by source identity",
+                        )
+                        existing = None
+                        if chat_id_int is not None and msg_id_int is not None:
+                            existing = (
+                                db.query(Transaction)
+                                .filter(
+                                    Transaction.source_chat_id == chat_id_int,
+                                    Transaction.source_message_id == msg_id_int,
+                                )
+                                .first()
+                            )
+                        if existing is not None:
+                            if tracking:
+                                tracking.status = 'done'
+                                tracking.transaction_id = existing.id
+                                tracking.error = None
+                                tracking.finished_at = datetime.utcnow()
+                                tracking.heartbeat_at = datetime.utcnow()
+                                _update_tg_message_processing(
+                                    db,
+                                    chat_id=tracking.chat_id,
+                                    message_id=tracking.message_id,
+                                    status="done",
+                                    transaction_id=int(existing.id),
+                                    duplicate_status="source_race_duplicate",
+                                )
+                                db.commit()
+                            return {
+                                'success': True,
+                                'duplicate': True,
+                                'transaction_id': str(existing.uuid),
+                                'id': existing.id,
+                            }
+                    raise
+
+            if fingerprint_candidate and fingerprint_candidate.id != transaction.id:
+                try:
+                    suggestion_task_id = UUID(str(celery_task_id)) if celery_task_id else None
+                except (TypeError, ValueError):
+                    suggestion_task_id = None
+                db.add(
+                    DuplicateSuggestion(
+                        task_id=suggestion_task_id,
+                        primary_transaction_id=int(fingerprint_candidate.id),
+                        duplicate_transaction_id=int(transaction.id),
+                        confidence=0.6,
+                        reasoning="fuzzy_fingerprint_match_requires_review",
+                        payload_json=json.dumps(
+                            {"fingerprint": fp, "candidates": fp_candidates},
+                            ensure_ascii=False,
+                        ),
+                    )
                 )
                 try:
-                    receipt_logger.log_duplicate(
-                        task_id=int(tracking.id) if tracking else None,
-                        transaction_id=existing_by_fp.id,
-                        duplicate_of_id=existing_by_fp.id,
-                        chat_id=tracking.chat_id if tracking else None,
-                        chat_title=str(tracking.chat_id) if tracking and tracking.chat_id else None,
-                        message_id=tracking.message_id if tracking else None,
-                        amount=existing_by_fp.amount,
-                        currency=existing_by_fp.currency,
-                        transaction_date=existing_by_fp.transaction_date,
-                        operator=existing_by_fp.operator_raw,
-                    )
+                    db.commit()
                 except Exception:  # noqa: BLE001
-                    logger.debug("receipt_logger.log_duplicate failed", exc_info=True)
-                return {
-                    'success': True,
-                    'duplicate': True,
-                    'transaction_id': str(existing_by_fp.uuid),
-                    'id': existing_by_fp.id
-                }
-
-            transaction = Transaction(
-                raw_message=raw_text,
-                source_type=tx_source_type,
-                source_chat_id=chat_id_int,
-                source_message_id=msg_id_int,
-                transaction_date=tx_datetime,
-                amount=store_amount,
-                currency=currency,
-                card_last_4=str(card_last4)[-4:] if card_last4 else None,
-                operator_raw=operator,
-                application_mapped=app_name,
-                receiver_name=parsed_data.get('receiver_name'),
-                receiver_card=parsed_data.get('receiver_card'),
-                transaction_type=transaction_type,
-                balance_after=balance,
-                is_p2p=is_p2p,
-                is_gpt_parsed=is_gpt_parsed_flag,
-                parsing_confidence=confidence_value,
-                parsing_method=method_value,
-                fingerprint=fp,
-            )
-
-            db.add(transaction)
-            try:
-                db.commit()
-            except Exception as exc:  # noqa: BLE001
-                from sqlalchemy.exc import IntegrityError as _IntegrityError
-                if isinstance(exc, _IntegrityError):
+                    logger.exception("Failed to persist duplicate suggestion")
                     db.rollback()
-                    logger.info(
-                        "Race-condition duplicate detected on commit; resolving by lookup",
-                    )
-                    existing = (
-                        db.query(Transaction)
-                        .filter(Transaction.fingerprint == fp)
-                        .first()
-                    )
-                    if existing is None and chat_id_int and msg_id_int:
-                        existing = (
-                            db.query(Transaction)
-                            .filter(
-                                Transaction.source_chat_id == chat_id_int,
-                                Transaction.source_message_id == msg_id_int,
-                            )
-                            .first()
-                        )
-                    if existing is not None:
-                        # Merge richer fields from current parse into existing row
-                        # so race recovery doesn't drop better data.
-                        try:
-                            from services.receipt_processor import (
-                                _merge_duplicate_transaction,
-                            )
-
-                            _merge_duplicate_transaction(
-                                existing,
-                                candidate_transaction_date=tx_datetime,
-                                candidate_operator_raw=operator or "",
-                                candidate_application_mapped=app_name,
-                                candidate_balance_after=balance,
-                                candidate_receiver_name=parsed_data.get("receiver_name"),
-                                candidate_receiver_card=parsed_data.get("receiver_card"),
-                                candidate_raw_message=raw_text or "",
-                                candidate_is_p2p=is_p2p,
-                                candidate_parsing_method=method_value,
-                                candidate_parsing_confidence=confidence_value,
-                                candidate_is_gpt=is_gpt_parsed_flag,
-                                candidate_source_type=tx_source_type,
-                            )
-                            db.commit()
-                        except Exception:  # noqa: BLE001
-                            logger.exception("Race-recovery merge failed")
-                            db.rollback()
-                        if tracking:
-                            tracking.status = 'done'
-                            tracking.transaction_id = existing.id
-                            tracking.error = None
-                            db.commit()
-                        return {
-                            'success': True,
-                            'duplicate': True,
-                            'transaction_id': str(existing.uuid),
-                            'id': existing.id,
-                        }
-                raise
+                _update_tg_message_processing(
+                    db,
+                    chat_id=chat_id_int,
+                    message_id=msg_id_int,
+                    status="processing",
+                    duplicate_status="candidate",
+                )
 
             if tracking:
                 tracking.status = 'done'
                 tracking.transaction_id = transaction.id
                 tracking.error = None
+                tracking.finished_at = datetime.utcnow()
+                tracking.heartbeat_at = datetime.utcnow()
+                _update_tg_message_processing(
+                    db,
+                    chat_id=tracking.chat_id,
+                    message_id=tracking.message_id,
+                    status="done",
+                    transaction_id=int(transaction.id),
+                )
                 db.commit()
 
             log = ParsingLog(
@@ -1056,7 +1639,9 @@ def process_receipt_task(self, task_data_json: str):
         import traceback as _traceback
         tb_text = _traceback.format_exc()
 
-        # Log exception
+        durable_state = None
+        durable_attempts = 0
+        terminal_error = _is_terminal_worker_error(e)
         try:
             with get_db() as db:
                 tracking = (
@@ -1065,11 +1650,36 @@ def process_receipt_task(self, task_data_json: str):
                     .first()
                 )
                 if tracking:
-                    tracking.status = 'failed'
                     tracking.error = str(e)
                     _rt = raw_text if 'raw_text' in locals() else ''
                     tracking.raw_message = (_rt or "")[:4000] if _rt else None
-                    # Persist traceback in incident payload (DB column may not yet exist)
+                    tracking.heartbeat_at = datetime.utcnow()
+                    durable_attempts = int(tracking.processing_attempts or 0)
+                    if terminal_error or durable_attempts >= RECEIPT_MAX_PROCESSING_ATTEMPTS:
+                        durable_state = "dead"
+                        tracking.status = "dead"
+                        tracking.publish_state = "dead"
+                        tracking.finished_at = datetime.utcnow()
+                        tracking.next_retry_at = None
+                        tracking.last_error_kind = (
+                            "terminal" if terminal_error else "processing_exhausted"
+                        )
+                    else:
+                        durable_state = "retry"
+                        tracking.status = "retry"
+                        tracking.publish_state = "retry"
+                        tracking.next_retry_at = datetime.utcnow() + timedelta(
+                            seconds=_retry_delay_seconds(durable_attempts)
+                        )
+                        tracking.last_error_kind = "transient_worker"
+                    _update_tg_message_processing(
+                        db,
+                        chat_id=tracking.chat_id,
+                        message_id=tracking.message_id,
+                        status=str(durable_state),
+                        error_code=str(tracking.last_error_kind),
+                        error_text=str(e),
+                    )
                     register_receipt_incident(
                         db,
                         chat_id=tracking.chat_id,
@@ -1106,21 +1716,33 @@ def process_receipt_task(self, task_data_json: str):
         except Exception:
             logger.exception("Failed to record worker failure")
 
-        # Smart retry: exponential backoff + skip terminal classes.
+        if durable_state == "dead":
+            _push_to_dlq(
+                celery_task_id=getattr(self.request, "id", None),
+                task_data_json=task_data_json,
+                error=e,
+                tb_text=tb_text if 'tb_text' in locals() else "",
+                retries=durable_attempts,
+                reason="terminal" if terminal_error else "processing_exhausted",
+            )
+            return {"success": False, "error": str(e)[:300], "state": "dead"}
+        if durable_state == "retry":
+            return {"success": False, "error": str(e)[:300], "state": "retry"}
+
+        # Legacy direct .delay() callers have no durable row. Preserve bounded
+        # Celery retry behavior for them until all callers use queue_receipt_task.
         retry_count = self.request.retries or 0
-        # Exponential backoff with jitter: 10s, 30s, 90s
-        countdown = min(120, 10 * (3 ** retry_count)) + random.randint(0, 5)
-        if _is_terminal_worker_error(e):
-            logger.info("Terminal error class %s; not retrying", type(e).__name__)
+        countdown = _retry_delay_seconds(retry_count + 1)
+        if terminal_error:
             _push_to_dlq(
                 celery_task_id=getattr(self.request, "id", None),
                 task_data_json=task_data_json,
                 error=e,
                 tb_text=tb_text if 'tb_text' in locals() else "",
                 retries=retry_count,
-                reason="terminal",
+                reason="terminal_untracked",
             )
-            return {"success": False, "error": str(e)[:300]}
+            return {"success": False, "error": str(e)[:300], "state": "dead"}
         try:
             raise self.retry(exc=e, countdown=countdown)
         except Exception as retry_exc:  # noqa: BLE001
@@ -1149,10 +1771,10 @@ def _push_to_dlq(
     retries: int,
     reason: str,
 ) -> None:
-    """Persist failed receipt task to receipt_task_dlq for manual replay."""
+    """Persist one terminal receipt failure through the ORM-backed DLQ."""
     try:
         from database.connection import get_db
-        from sqlalchemy import text as _sql_text
+        from database.models import ReceiptProcessingTask, ReceiptTaskDLQ
 
         chat_id = None
         message_id = None
@@ -1165,27 +1787,33 @@ def _push_to_dlq(
         except Exception:  # noqa: BLE001
             pass
         with get_db() as db:
-            db.execute(
-                _sql_text(
-                    """
-                    INSERT INTO receipt_task_dlq (
-                        task_id, chat_id, message_id, payload_json,
-                        error_text, traceback, retries
-                    )
-                    VALUES (:task_id, :chat_id, :message_id, :payload_json,
-                            :error_text, :traceback, :retries)
-                    """
-                ),
-                {
-                    "task_id": str(celery_task_id or "")[:64] or "unknown",
-                    "chat_id": chat_id,
-                    "message_id": message_id,
-                    "payload_json": (task_data_json or "")[:50000],
-                    "error_text": (str(error) + f" [reason={reason}]")[:2000],
-                    "traceback": (tb_text or "")[:6000],
-                    "retries": int(retries),
-                },
+            stable_task_id = str(celery_task_id or "")[:255] or "unknown"
+            existing = (
+                db.query(ReceiptTaskDLQ)
+                .filter(ReceiptTaskDLQ.task_id == stable_task_id)
+                .order_by(ReceiptTaskDLQ.id.desc())
+                .first()
             )
+            tracking = (
+                db.query(ReceiptProcessingTask)
+                .filter(ReceiptProcessingTask.task_id == stable_task_id)
+                .first()
+            )
+            values = {
+                "tracking_task_id": int(tracking.id) if tracking else None,
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "payload_json": (task_data_json or "{}")[:50000],
+                "error_text": str(error)[:2000],
+                "traceback": (tb_text or "")[:6000],
+                "retries": int(retries),
+                "reason": str(reason)[:40],
+            }
+            if existing:
+                for key, value in values.items():
+                    setattr(existing, key, value)
+            else:
+                db.add(ReceiptTaskDLQ(task_id=stable_task_id, **values))
             db.commit()
     except Exception:  # noqa: BLE001
         logger.exception("Failed to push to receipt_task_dlq")
@@ -1259,10 +1887,16 @@ def agent_run_watchdog_sweep_task():
 
 @app.task(name='receipt_task_watchdog_sweep')
 def receipt_task_watchdog_sweep_task():
-    """Mark stuck receipt processing tasks as failed."""
+    """Recover stuck receipt tasks and publish due outbox work."""
     from services.receipt_watchdog import sweep_stuck_receipt_tasks
 
     return sweep_stuck_receipt_tasks()
+
+
+@app.task(name='receipt_outbox_dispatch')
+def receipt_outbox_dispatch_task():
+    """Publish committed receipt outbox rows that are ready for delivery."""
+    return dispatch_pending_receipt_tasks()
 
 
 @app.task(name='receipt_task_retention_cleanup')

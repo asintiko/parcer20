@@ -17,6 +17,8 @@ class BackfillWorker @AssistedInject constructor(
     private val settings: SettingsStore,
 ) : CoroutineWorker(ctx, params) {
     override suspend fun doWork(): Result {
+        if (!settings.monitoringEnabled) return Result.success()
+        repo.requeueAuthErrors()
         repo.collectFromInbox(settings.backfillSinceMillis)
         repo.syncPending()
         return Result.success()

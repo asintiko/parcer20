@@ -53,7 +53,7 @@ from services.root_access_config_service import (
 from services.system_settings_service import is_otp_enabled
 from services.internal_api_key_service import (
     has_configured_internal_api_key,
-    is_valid_internal_api_key,
+    is_internal_request,
 )
 
 router = APIRouter(prefix="/api/security", tags=["security"])
@@ -310,11 +310,11 @@ def _scope_payload_for_id(db: Session, scope_id: int) -> Optional[Dict[str, Any]
     return None
 
 
-def _require_internal_key(value: Optional[str]) -> None:
+def _require_internal_request(request: Request) -> None:
     if not has_configured_internal_api_key():
         raise HTTPException(status_code=503, detail="Internal API key is not configured")
-    if not is_valid_internal_api_key(value):
-        raise HTTPException(status_code=403, detail="Invalid internal API key")
+    if not is_internal_request(request):
+        raise HTTPException(status_code=403, detail="Invalid internal request origin")
 
 
 async def _notify_admins(message_text: str) -> None:
@@ -402,7 +402,7 @@ async def get_root_access_status(
 @router.get("/scopes", response_model=List[AccessScopeResponse])
 async def list_scopes(
     db: Session = Depends(get_db_session),
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(require_admin_user),
     _system: Optional[Dict[str, Any]] = Depends(get_system_access_context),
 ) -> List[AccessScopeResponse]:
     _ = current_user
@@ -427,7 +427,7 @@ async def create_scope(
     payload: AccessScopeCreate,
     request: Request,
     db: Session = Depends(get_db_session),
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(require_admin_user),
     _system: Optional[Dict[str, Any]] = Depends(get_system_access_context),
 ) -> AccessScopeResponse:
     _readonly_scopes_guard()
@@ -474,7 +474,7 @@ async def update_scope(
     payload: AccessScopeUpdate,
     request: Request,
     db: Session = Depends(get_db_session),
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(require_admin_user),
     _system: Optional[Dict[str, Any]] = Depends(get_system_access_context),
 ) -> AccessScopeResponse:
     _readonly_scopes_guard()
@@ -537,7 +537,7 @@ async def delete_scope(
     scope_id: int,
     request: Request,
     db: Session = Depends(get_db_session),
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(require_admin_user),
     _system: Optional[Dict[str, Any]] = Depends(get_system_access_context),
 ) -> Dict[str, Any]:
     _readonly_scopes_guard()
@@ -902,27 +902,30 @@ async def verify_launch_password(
     if row is None:
         token = create_launch_session_token(ip_address=_request_ip(request))
         decoded = verify_launch_session_token(token) or {}
+        if not decoded:
+            raise HTTPException(status_code=503, detail="session_store_unavailable")
         session_id: Optional[str] = None
-        if decoded:
-            session_id = await register_active_session(
-                token_payload=decoded,
-                token_kind="launch_session",
-                user_id=None,
-                ip_address=_request_ip(request),
-                subject="app_launch",
+        session_id = await register_active_session(
+            token_payload=decoded,
+            token_kind="launch_session",
+            user_id=None,
+            ip_address=_request_ip(request),
+            subject="app_launch",
+        )
+        if session_id != str(decoded.get("sid") or ""):
+            raise HTTPException(status_code=503, detail="session_registration_failed")
+        try:
+            await publish_auth_event(
+                "launch_session_created",
+                {
+                    "session_id": session_id,
+                    "ip": _request_ip(request),
+                    "subject": "app_launch",
+                    "exp": decoded.get("exp"),
+                },
             )
-            try:
-                await publish_auth_event(
-                    "launch_session_created",
-                    {
-                        "session_id": session_id or decoded.get("sid"),
-                        "ip": _request_ip(request),
-                        "subject": "app_launch",
-                        "exp": decoded.get("exp"),
-                    },
-                )
-            except Exception:
-                logger.debug("Failed to publish launch_session_created for unprotected launch", exc_info=True)
+        except Exception:
+            logger.debug("Failed to publish launch_session_created for unprotected launch", exc_info=True)
         exp = decoded.get("exp")
         return AppLaunchVerifyResponse(
             verified=True,
@@ -945,27 +948,30 @@ async def verify_launch_password(
 
         token = create_launch_session_token(ip_address=_request_ip(request))
         decoded = verify_launch_session_token(token) or {}
+        if not decoded:
+            raise HTTPException(status_code=503, detail="session_store_unavailable")
         session_id: Optional[str] = None
-        if decoded:
-            session_id = await register_active_session(
-                token_payload=decoded,
-                token_kind="launch_session",
-                user_id=None,
-                ip_address=_request_ip(request),
-                subject="app_launch",
+        session_id = await register_active_session(
+            token_payload=decoded,
+            token_kind="launch_session",
+            user_id=None,
+            ip_address=_request_ip(request),
+            subject="app_launch",
+        )
+        if session_id != str(decoded.get("sid") or ""):
+            raise HTTPException(status_code=503, detail="session_registration_failed")
+        try:
+            await publish_auth_event(
+                "launch_session_created",
+                {
+                    "session_id": session_id,
+                    "ip": _request_ip(request),
+                    "subject": "app_launch",
+                    "exp": decoded.get("exp"),
+                },
             )
-            try:
-                await publish_auth_event(
-                    "launch_session_created",
-                    {
-                        "session_id": session_id or decoded.get("sid"),
-                        "ip": _request_ip(request),
-                        "subject": "app_launch",
-                        "exp": decoded.get("exp"),
-                    },
-                )
-            except Exception:
-                logger.debug("Failed to publish launch_session_created after password verify", exc_info=True)
+        except Exception:
+            logger.debug("Failed to publish launch_session_created after password verify", exc_info=True)
         exp = decoded.get("exp")
         return AppLaunchVerifyResponse(
             verified=True,
@@ -990,10 +996,10 @@ async def verify_launch_password(
 @internal_router.post("/app/set-launch-password")
 async def internal_set_launch_password(
     payload: AppLaunchVerifyRequest,
-    x_internal_api_key: Optional[str] = Header(None, alias="X-Internal-API-Key"),
+    request: Request,
     db: Session = Depends(get_db_session),
 ) -> Dict[str, Any]:
-    _require_internal_key(x_internal_api_key)
+    _require_internal_request(request)
     password_hash, salt = hash_password(payload.password)
     row = db.get(AppLaunchConfig, 1)
     if row is None:
@@ -1031,10 +1037,10 @@ async def list_locked_periods(
 @internal_router.post("/locked-periods")
 async def create_locked_period(
     payload: LockedPeriodCreateRequest,
-    x_internal_api_key: Optional[str] = Header(None, alias="X-Internal-API-Key"),
+    request: Request,
     db: Session = Depends(get_db_session),
 ) -> Dict[str, Any]:
-    _require_internal_key(x_internal_api_key)
+    _require_internal_request(request)
     row = period_lock_service.lock_period(
         date_from=payload.date_from,
         date_to=payload.date_to,
@@ -1055,10 +1061,10 @@ async def create_locked_period(
 @internal_router.delete("/locked-periods/{lock_id}")
 async def delete_locked_period(
     lock_id: int,
-    x_internal_api_key: Optional[str] = Header(None, alias="X-Internal-API-Key"),
+    request: Request,
     db: Session = Depends(get_db_session),
 ) -> Dict[str, Any]:
-    _require_internal_key(x_internal_api_key)
+    _require_internal_request(request)
     ok = period_lock_service.unlock_period(lock_id, db)
     if not ok:
         raise HTTPException(status_code=404, detail="Lock not found")
@@ -1331,7 +1337,7 @@ async def get_audit_logs(
     limit: int = Query(200, ge=1, le=2000),
     offset: int = Query(0, ge=0, le=200000),
     db: Session = Depends(get_db_session),
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(require_admin_user),
     _system: Optional[Dict[str, Any]] = Depends(get_system_access_context),
 ) -> List[AuditRecordResponse]:
     _ = current_user, _system

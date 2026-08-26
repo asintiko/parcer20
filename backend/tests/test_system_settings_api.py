@@ -11,8 +11,8 @@ from api.main import app
 from database.connection import get_db_session
 from database.models import User
 from services.access_control_service import hash_password
-from services.auth_service import create_app_user_token
 from services.root_access_config_service import hash_password_pbkdf2, reset_root_access_cache
+from fake_auth_redis import install_fake_auth_redis, issue_active_app_token
 
 
 def _seed_admin(db_session, username: str = "admin") -> User:
@@ -70,6 +70,7 @@ def client(db_session, monkeypatch, tmp_path):
     monkeypatch.setenv("SYSTEM_ACCESS_ENFORCED", "true")
     monkeypatch.setenv("SCOPES_MANAGED_BY_CONFIG", "false")
     monkeypatch.setenv("ROOT_ACCESS_SERVER_CONFIG_PATH", str(config_path))
+    install_fake_auth_redis(monkeypatch)
     reset_root_access_cache()
 
     original_lifespan = app.router.lifespan_context
@@ -91,13 +92,7 @@ def client(db_session, monkeypatch, tmp_path):
 
 def test_system_settings_get_and_patch(client, db_session):
     admin = _seed_admin(db_session)
-    token = create_app_user_token(
-        user_id=int(admin.id),
-        username=admin.username,
-        role=admin.role,
-        permissions_version=int(admin.permissions_version or 1),
-        display_name=admin.display_name,
-    )
+    token = issue_active_app_token(admin)
     headers = {"Authorization": f"Bearer {token}"}
 
     get_res = client.get("/api/system-settings", headers=headers)

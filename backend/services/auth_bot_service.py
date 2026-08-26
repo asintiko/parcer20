@@ -40,6 +40,10 @@ if not JWT_SECRET:
     raise EnvironmentError("JWT_SECRET environment variable is required")
 
 
+class SessionStoreUnavailableError(RuntimeError):
+    """Raised when session security state cannot be read reliably."""
+
+
 @dataclass
 class OTPRecord:
     code: str
@@ -159,12 +163,39 @@ def _is_session_revoked(session_id: Optional[str]) -> bool:
         redis_client = _get_sync_redis()
         return bool(redis_client.exists(_revoked_key(session_id)))
     except Exception:
-        # Fail open to avoid taking API down when Redis has transient issues.
-        return False
+        # Revocation state is a security control. An unknown state must deny.
+        return True
 
 
 def is_session_revoked(session_id: Optional[str]) -> bool:
     return _is_session_revoked(session_id)
+
+
+async def is_active_session(
+    session_id: Optional[str],
+    *,
+    expected_kind: Optional[str] = None,
+) -> bool:
+    """Return whether a server-side session exists and is not revoked.
+
+    Store failures are distinct from an inactive session so HTTP boundaries can
+    return 503 while still denying access.
+    """
+    sid = str(session_id or "").strip()
+    if not sid:
+        return False
+    try:
+        redis_client = await get_redis()
+        if await redis_client.exists(_revoked_key(sid)):
+            return False
+        data = await redis_client.hgetall(_session_key(sid))
+    except Exception as exc:
+        raise SessionStoreUnavailableError("session store unavailable") from exc
+    if not data:
+        return False
+    if expected_kind and str(data.get("token_kind") or "") != str(expected_kind):
+        return False
+    return True
 
 
 async def publish_auth_event(event: str, payload: Optional[Dict[str, Any]] = None) -> int:

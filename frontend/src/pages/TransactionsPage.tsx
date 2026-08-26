@@ -492,27 +492,34 @@ export function TransactionsPage() {
     const securityStatusQuery = useQuery({
         queryKey: ['security-status'],
         queryFn: securityApi.getStatus,
-        refetchInterval: 30000,
+        staleTime: 5 * 60 * 1000,
+        gcTime: 24 * 60 * 60 * 1000,
+        refetchInterval: 5 * 60 * 1000,
     });
     const hasSecurityStatusSnapshot = isAdmin || Boolean(securityStatusQuery.data);
     const transactionsInitQuery = useQuery({
         queryKey: ['transactions-init'],
         queryFn: transactionsApi.getInit,
         enabled: hasSecurityStatusSnapshot,
-        staleTime: 60_000,
-        refetchInterval: 30_000,
+        staleTime: 5 * 60 * 1000,
+        gcTime: 24 * 60 * 60 * 1000,
+        refetchInterval: 10 * 60 * 1000,
         retry: 1,
     });
     const scopesQuery = useQuery({
         queryKey: ['security-scopes'],
         queryFn: securityApi.listScopes,
         enabled: hasSecurityStatusSnapshot && Boolean(securityStatusQuery.data?.scopes_enabled),
-        refetchInterval: 30000,
+        staleTime: 5 * 60 * 1000,
+        gcTime: 24 * 60 * 60 * 1000,
+        refetchInterval: 5 * 60 * 1000,
     });
     const lockedPeriodsQuery = useQuery({
         queryKey: ['security-locked-periods'],
         queryFn: securityApi.getLockedPeriods,
-        refetchInterval: 60000,
+        staleTime: 5 * 60 * 1000,
+        gcTime: 24 * 60 * 60 * 1000,
+        refetchInterval: 10 * 60 * 1000,
         retry: false,
     });
     const securityStatusErrorDetail = (securityStatusQuery.error as any)?.response?.data?.detail;
@@ -759,7 +766,7 @@ export function TransactionsPage() {
                 date_to: selectedYear !== null ? isoEndOfYear(selectedYear) : undefined,
             }),
         enabled: !isLockedView && hasSecurityStatusSnapshot,
-        staleTime: 30_000,
+        staleTime: 2 * 60 * 1000,
         retry: 1,
         refetchOnWindowFocus: false,
     });
@@ -1111,6 +1118,7 @@ export function TransactionsPage() {
         queryKey: ['reference-operators-for-autocomplete'],
         queryFn: () => referenceApi.getOperators({ all: true }),
         staleTime: 5 * 60 * 1000, // 5 minutes
+        gcTime: 24 * 60 * 60 * 1000,
     });
 
     // Combine operators from transactions and reference

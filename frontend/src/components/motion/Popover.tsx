@@ -1,6 +1,7 @@
 import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { motion, AnimatePresence, type Variants } from 'motion/react';
+import { useRegisterOverlay } from '../../utils/overlayStore';
 
 /**
  * Popover that renders into <body> via portal and positions itself
@@ -37,6 +38,8 @@ export const Popover: React.FC<PopoverProps> = ({
 }) => {
     const popRef = useRef<HTMLDivElement | null>(null);
     const [pos, setPos] = useState<{ top: number; left: number } | null>(null);
+
+    useRegisterOverlay(open);
 
     // Compute position when open or on layout change
     useLayoutEffect(() => {

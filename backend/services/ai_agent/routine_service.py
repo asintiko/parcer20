@@ -106,8 +106,16 @@ def _parse_run_at(value: Any) -> Optional[datetime]:
 # --------------------------------------------------------------------------- #
 # CRUD
 # --------------------------------------------------------------------------- #
-def list_routines(db: Session) -> List[Dict[str, Any]]:
-    rows = db.query(AgentRoutine).order_by(AgentRoutine.created_at.desc()).all()
+def list_routines(
+    db: Session,
+    *,
+    actor_user_id: Optional[int] = None,
+    is_admin: bool = False,
+) -> List[Dict[str, Any]]:
+    query = db.query(AgentRoutine)
+    if actor_user_id is not None and not is_admin:
+        query = query.filter(AgentRoutine.created_by_user_id == int(actor_user_id))
+    rows = query.order_by(AgentRoutine.created_at.desc()).all()
     return [serialize_routine(r) for r in rows]
 
 
@@ -215,13 +223,20 @@ def list_runs(db: Session, routine_id: UUID, limit: int = 50) -> List[Dict[str, 
 # --------------------------------------------------------------------------- #
 # Execution (SAFE primitives only)
 # --------------------------------------------------------------------------- #
-_ADMIN_CTX = {"role": "admin", "user_id": 0, "id": 0}  # routines run with full read scope
+_BUILTIN_SERVICE_CTX = {
+    "role": "admin",
+    "user_id": 0,
+    "id": 0,
+    "service_principal": _BUILTIN_RECEIPT_AUDIT_MARKER,
+}
 
 
 async def _run_kind(
     db: Session,
     kind: str,
     config: Dict[str, Any],
+    current_user: Dict[str, Any],
+    scope: Optional[Dict[str, Any]],
     task_prompt: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Dispatch a routine to a vetted tool / headless agent run. Returns result dict."""
@@ -231,9 +246,9 @@ async def _run_kind(
     args = dict(config or {})
     if kind == "reconcile":
         # Full health + chat↔DB reconciliation across all chats.
-        return await weekly_health_check(db, _ADMIN_CTX, None, args)
+        return await weekly_health_check(db, current_user, scope, args)
     if kind == "summary":
-        return await period_summary(db, _ADMIN_CTX, None, args)
+        return await period_summary(db, current_user, scope, args)
     if kind == "receipt_audit":
         # Compare locally-synced TG receipts vs DB over a configurable lookback.
         days = int(args.get("days") or 7)
@@ -244,7 +259,7 @@ async def _run_kind(
             "date_from": start.isoformat(),
             "date_to": end.isoformat(),
         }
-        return await weekly_health_check(db, _ADMIN_CTX, None, audit_args)
+        return await weekly_health_check(db, current_user, scope, audit_args)
     # custom → run the saved NL task through the agent's native tool-calling loop
     # (safe read tools; mutations stay behind confirmation and never auto-apply).
     from services.ai_agent.orchestrator import get_orchestrator
@@ -252,8 +267,13 @@ async def _run_kind(
     prompt = (task_prompt or "").strip()
     if not prompt:
         # No prompt to execute — fall back to the safe reconcile primitive.
-        return await weekly_health_check(db, _ADMIN_CTX, None, args)
-    return await get_orchestrator().run_task(db=db, task_prompt=prompt, scope=None, current_user=_ADMIN_CTX)
+        return await weekly_health_check(db, current_user, scope, args)
+    return await get_orchestrator().run_task(
+        db=db,
+        task_prompt=prompt,
+        scope=scope,
+        current_user=current_user,
+    )
 
 
 def _format_report(routine: AgentRoutine, result: Dict[str, Any]) -> str:
@@ -288,7 +308,6 @@ def _format_receipt_audit_report(routine: AgentRoutine, result: Dict[str, Any]) 
     total_failed = int(totals.get("failed") or 0)
     total_stuck = int(totals.get("stuck") or 0)
     dup_groups = int(totals.get("duplicate_groups") or 0)
-    orphans = int(totals.get("orphan_rows") or 0)
 
     def _accuracy(tx: int, failed: int) -> Optional[float]:
         denom = tx + failed
@@ -319,7 +338,7 @@ def _format_receipt_audit_report(routine: AgentRoutine, result: Dict[str, Any]) 
     lines.append(
         f"💰 Транзакций: {total_tx}  ·  ❌ Ошибок: {total_failed}  ·  ⏳ Застряло: {total_stuck}"
     )
-    lines.append(f"♻️ Дубликат-групп: {dup_groups}  ·  🏷 Без маппинга: {orphans}")
+    lines.append(f"♻️ Дубликат-групп: {dup_groups}")
 
     # Per-chat breakdown (cap to keep message compact).
     rendered = 0
@@ -387,7 +406,32 @@ async def execute_routine(routine_id: UUID, *, trigger: str = "schedule") -> Dic
             config = {}
 
         try:
-            result = await _run_kind(db, routine.kind, config, task_prompt=routine.task_prompt)
+            is_builtin = (
+                routine.created_by_user_id is None
+                and routine.kind == "receipt_audit"
+                and routine.name == _BUILTIN_RECEIPT_AUDIT_NAME
+                and config.get("builtin") == _BUILTIN_RECEIPT_AUDIT_MARKER
+            )
+            owner_auth = None
+            if is_builtin:
+                execution_user = _BUILTIN_SERVICE_CTX
+                execution_scope = None
+            else:
+                from services.ai_agent.authorization import current_agent_authorization
+
+                owner_auth = current_agent_authorization(db, routine.created_by_user_id)
+                owner_auth.require_dashboard()
+                execution_user = owner_auth.user
+                execution_scope = owner_auth.tool_scope()
+
+            result = await _run_kind(
+                db,
+                routine.kind,
+                config,
+                current_user=execution_user,
+                scope=execution_scope,
+                task_prompt=routine.task_prompt,
+            )
             summary = result.get("summary") or "Готово"
             run.status = "ok"
             run.summary = summary
@@ -405,6 +449,8 @@ async def execute_routine(routine_id: UUID, *, trigger: str = "schedule") -> Dic
                 run.finished_at = datetime.utcnow()
             routine.last_status = "error"
             routine.last_summary = None
+            if "inactive_or_missing_actor" in str(exc) or "invalid_actor" in str(exc):
+                routine.enabled = False
             db.commit()
             logger.exception("Routine %s execution failed", routine_id)
             return {"ok": False, "error": str(exc)}
@@ -420,7 +466,8 @@ async def execute_routine(routine_id: UUID, *, trigger: str = "schedule") -> Dic
             report_text = _format_receipt_audit_report(routine, result)
         else:
             report_text = _format_report(routine, result)
-        if routine.deliver_to_channel:
+        can_deliver_to_channel = is_builtin or bool(owner_auth and owner_auth.is_admin)
+        if routine.deliver_to_channel and can_deliver_to_channel:
             try:
                 await _deliver_to_channel(report_text)
             except Exception:

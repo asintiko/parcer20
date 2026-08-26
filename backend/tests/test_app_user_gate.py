@@ -1,11 +1,4 @@
-"""Tests for get_current_app_user role-escalation gate (fix 2.5).
-
-The synthetic-operator fallback exists only for the QR / legacy login path, which
-returns a roleless payload. Before the gate, ANY signature-valid roleless JWT (a
-refresh_token presented as a bearer, for instance) was silently upgraded to
-operator/dashboard access. The fallback is now restricted to the QR/legacy token
-kinds.
-"""
+"""Tests for the strict app-user token-purpose gate."""
 import asyncio
 
 import pytest
@@ -21,26 +14,34 @@ def _run(current_user):
 
 
 def test_user_with_role_passes_through_unchanged():
-    user = {"role": "admin", "user_id": 1, "allowed_tabs": ["dashboard"]}
+    user = {
+        "role": "admin",
+        "user_id": 1,
+        "allowed_tabs": ["dashboard"],
+        "token_kind": "app_user",
+    }
     assert _run(user) is user
 
 
-def test_qr_legacy_roleless_synthesizes_operator():
+def test_qr_legacy_roleless_is_rejected():
     user = {"token_kind": "qr_legacy", "user_id": 7, "phone": "+99890"}
-    result = _run(user)
-    assert result["role"] == "operator"
-    assert result["user_id"] == 7
-    assert result["token_kind"] == "legacy"
+    with pytest.raises(HTTPException) as exc:
+        _run(user)
+    assert exc.value.status_code == 401
 
 
-def test_qr_user_roleless_synthesizes_operator():
+def test_qr_user_roleless_is_rejected():
     user = {"token_kind": "qr_user", "user_id": 8}
-    assert _run(user)["role"] == "operator"
+    with pytest.raises(HTTPException) as exc:
+        _run(user)
+    assert exc.value.status_code == 401
 
 
-def test_legacy_kind_raw_payload_synthesizes_operator():
+def test_legacy_kind_raw_payload_is_rejected():
     user = {"kind": "legacy", "user_id": 9}
-    assert _run(user)["role"] == "operator"
+    with pytest.raises(HTTPException) as exc:
+        _run(user)
+    assert exc.value.status_code == 401
 
 
 def test_roleless_app_user_is_rejected():

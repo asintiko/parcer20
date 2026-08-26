@@ -19,6 +19,10 @@ def parser():
         ("1 100.90", Decimal("1100.90")),
         ("535.000,40", Decimal("535000.40")),
         ("2 052 200,14", Decimal("2052200.14")),
+        ("500,000", Decimal("500000")),
+        ("3.000.000", Decimal("3000000")),
+        ("1,234.56", Decimal("1234.56")),
+        ("1.234,56", Decimal("1234.56")),
     ],
 )
 def test_normalize_amount(parser, raw, expected):
@@ -296,3 +300,34 @@ Bal: 1500000.00 UZS"""
     assert res["transaction_type"] == "DEBIT"
     assert res["amount"] == Decimal("250000.00")
     assert res["card_last_4"] == "6714"
+
+
+def test_ru_transfer_does_not_use_sender_name_as_receiver(parser):
+    text = """Отправитель: 561468******4483
+Имя отправителя: RAK VALENTINA PETROVNA
+Получатель: 491699******1116
+Дата транзакции: 31.01.2026 11:12:51
+Сумма отправителя: 500,000 UZS"""
+    res = parser.parse(text)
+    assert res
+    assert res["card_last_4"] == "4483"
+    assert res["receiver_card"] == "1116"
+    assert res["receiver_name"] is None
+
+
+def test_ru_merchant_receipt_maps_nazvanie_as_operator_not_receiver(parser):
+    text = """Отправителя 491699******1116
+Имя отправителя SVYATOSLAV LI
+№ транзакции 54c61ed5-cb13-4b74-bbc4-2c23f88e5534
+Дата транзакции 09.01.2026 12:20:03
+Комиссия отправителя 0.00 UZS
+Сумма отправителя 590,000.00 UZS
+Название UZUM MARKET FAST PAY
+Информация"""
+    res = parser.parse(text)
+    assert res
+    assert res["amount"] == Decimal("590000.00")
+    assert res["operator_raw"] == "UZUM MARKET FAST PAY"
+    assert res["receiver_name"] is None
+    assert res["receiver_card"] is None
+    assert res["is_p2p"] is False

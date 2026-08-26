@@ -6,7 +6,6 @@ export const ru = {
         telegramClient: 'Telegram клиент',
         settings: 'Настройки',
         security: 'Безопасность',
-        automation: 'Автоматизация',
         logs: 'Логи',
         audit: 'Аудит безопасности',
     },

@@ -16,11 +16,27 @@ class SettingsViewModel @Inject constructor(
     val settings: SettingsStore,
     private val repo: SmsRepository,
 ) : AndroidViewModel(app) {
-    fun save(baseUrl: String, mobileKey: String, theme: String) {
+    fun save(baseUrl: String, deviceId: String, mobileKey: String, theme: String): Boolean {
+        val credentialsChanged = deviceId.trim() != settings.deviceId || mobileKey.trim() != settings.mobileKey
+        if (!settings.saveProvisioning(deviceId, mobileKey)) return false
         settings.baseUrl = baseUrl.trim()
-        settings.mobileKey = mobileKey.trim()
         settings.themeMode = theme
+        if (settings.monitoringEnabled) {
+            WorkScheduler.schedulePeriodic(getApplication())
+            if (credentialsChanged) WorkScheduler.runBackfill(getApplication())
+        }
+        return true
     }
+
+    fun saveProvisioning(deviceId: String, mobileKey: String): Boolean =
+        settings.saveProvisioning(deviceId, mobileKey)
+
+    fun completeOnboarding(): Boolean {
+        if (!settings.completeOnboarding()) return false
+        WorkScheduler.schedulePeriodic(getApplication())
+        return true
+    }
+
     fun setBackfillDate(millis: Long) { settings.backfillSinceMillis = millis }
     fun runBackfill() = WorkScheduler.runBackfill(getApplication())
     fun runReconcile(from: Long, to: Long) = WorkScheduler.runReconcile(getApplication(), from, to)

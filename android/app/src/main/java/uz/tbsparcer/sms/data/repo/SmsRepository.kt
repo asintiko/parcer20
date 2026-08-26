@@ -27,6 +27,14 @@ sealed interface SyncOutcome {
     data object Retry : SyncOutcome
 }
 
+/** One distinct SMS sender (address/short-code) seen in the inbox, for the allowlist picker. */
+data class SenderInfo(
+    val address: String,
+    val count: Int,
+    val sampleText: String,
+    val looksBank: Boolean,
+)
+
 @Singleton
 class SmsRepository @Inject constructor(
     @ApplicationContext private val ctx: Context,
@@ -44,18 +52,23 @@ class SmsRepository @Inject constructor(
     fun authError(): Boolean = settings.authError
     suspend fun byId(id: String) = dao.byId(id)
     suspend fun clear() = dao.clear()
+    suspend fun requeueAuthErrors() = dao.requeueAuthErrors()
     suspend fun purgeOld(cutoff: Long) = dao.purgeOld(cutoff)
 
     /** Read inbox since [sinceMillis], filter bank SMS, insert new as pending. Returns inserted count. */
     suspend fun collectFromInbox(sinceMillis: Long): Int =
-        collectInbox("date >= ?", arrayOf(sinceMillis.toString()))
+        if (settings.monitoringEnabled) collectInbox("date >= ?", arrayOf(sinceMillis.toString())) else 0
 
     /** Bounded variant for reconcile: only SMS received within [from]..[to]. */
     suspend fun collectFromInbox(from: Long, to: Long): Int =
-        collectInbox("date >= ? AND date <= ?", arrayOf(from.toString(), to.toString()))
+        if (settings.monitoringEnabled) {
+            collectInbox("date >= ? AND date <= ?", arrayOf(from.toString(), to.toString()))
+        } else 0
 
     private suspend fun collectInbox(selection: String, args: Array<String>): Int {
         val existing = dao.allIds().toHashSet()
+        // Empty allowlist = collect from everyone (back-compat with installs that never picked).
+        val allowed = settings.selectedSenders
         val cursor = ctx.contentResolver.query(
             Uri.parse("content://sms/inbox"),
             arrayOf("_id", "address", "body", "date"),
@@ -70,6 +83,7 @@ class SmsRepository @Inject constructor(
                 val sender = c.getString(addrIdx) ?: ""
                 val body = c.getString(bodyIdx) ?: ""
                 val date = c.getLong(dateIdx)
+                if (!isSenderAllowed(sender, allowed)) continue
                 val id = SmsLocalId.of(sender, date, body)
                 if (existing.contains(id)) continue
                 if (!SmsFilter.isBankSms(sender, body)) continue
@@ -86,6 +100,8 @@ class SmsRepository @Inject constructor(
     }
 
     suspend fun insertRealtime(deviceSmsId: String, sender: String, body: String, receivedAt: Long) {
+        if (!settings.monitoringEnabled) return
+        if (!isSenderAllowed(sender, settings.selectedSenders)) return
         if (!SmsFilter.isBankSms(sender, body)) return
         dao.insertAll(listOf(
             SmsRecord(deviceSmsId, sender, body, receivedAt, null, null, SyncStatus.PENDING,
@@ -93,8 +109,50 @@ class SmsRepository @Inject constructor(
         ))
     }
 
+    /**
+     * Distinct inbox senders with a usage count and a sample body, bank-likely ones first.
+     * Drives the onboarding/settings allowlist picker. Empty (no permission / empty inbox)
+     * on failure — never throws.
+     */
+    suspend fun listInboxSenders(): List<SenderInfo> {
+        val cursor = try {
+            ctx.contentResolver.query(
+                Uri.parse("content://sms/inbox"),
+                arrayOf("address", "body", "date"),
+                null, null, "date DESC",
+            )
+        } catch (e: SecurityException) {
+            return emptyList()
+        } ?: return emptyList()
+        // Group by normalized address; keep the most recent body as the sample (cursor is date DESC,
+        // so the first row seen per address wins).
+        data class Agg(var display: String, var count: Int, var sample: String)
+        val byKey = LinkedHashMap<String, Agg>()
+        cursor.use { c ->
+            val addrIdx = c.getColumnIndex("address")
+            val bodyIdx = c.getColumnIndex("body")
+            while (c.moveToNext()) {
+                val raw = c.getString(addrIdx)?.trim().orEmpty()
+                if (raw.isEmpty()) continue
+                val body = c.getString(bodyIdx).orEmpty()
+                val key = normalizeSender(raw)
+                val agg = byKey.getOrPut(key) { Agg(raw, 0, body) }
+                agg.count++
+            }
+        }
+        return byKey.values.map { a ->
+            SenderInfo(a.display, a.count, a.sample, SmsFilter.isBankSms(a.display, a.sample))
+        }.sortedWith(compareByDescending<SenderInfo> { it.looksBank }.thenByDescending { it.count })
+    }
+
+    private fun isSenderAllowed(sender: String, allowed: Set<String>): Boolean {
+        if (allowed.isEmpty()) return true
+        return normalizeSender(sender) in allowed
+    }
+
     /** Push pending rows to backend; write back per-item results. */
     suspend fun syncPending(): SyncOutcome {
+        if (!settings.monitoringEnabled) return SyncOutcome.Empty
         val pending = dao.pending(RETRY_CAP)
         if (pending.isEmpty()) return SyncOutcome.Empty
         val req = SmsIngestRequest(
@@ -156,6 +214,7 @@ class SmsRepository @Inject constructor(
      * actually landed vs. what was already there (including from Telegram).
      */
     suspend fun reconcile(from: Long, to: Long): SyncOutcome {
+        if (!settings.monitoringEnabled) return SyncOutcome.Empty
         collectFromInbox(from, to)
         dao.requeueRange(from, to)
         var created = 0; var duplicates = 0; var skipped = 0; var errors = 0
@@ -179,5 +238,10 @@ class SmsRepository @Inject constructor(
     companion object {
         const val RETRY_CAP = 10
         const val RECONCILE_MAX_ITERATIONS = 50
+
+        /** Canonical key for allowlist comparison: trimmed + lowercased. Display keeps the original. */
+        fun normalizeSender(address: String): String = address.trim().lowercase()
     }
 }
+
+private fun normalizeSender(address: String): String = SmsRepository.normalizeSender(address)

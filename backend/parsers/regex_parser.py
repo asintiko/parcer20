@@ -9,6 +9,37 @@ from decimal import Decimal
 import pytz
 
 
+def normalize_localized_decimal(value: Any) -> Decimal:
+    """Convert localized financial text to ``Decimal`` deterministically."""
+    if value is None:
+        raise ValueError("Amount string is None")
+    cleaned = re.sub(r"\s+", "", str(value).replace("\u00a0", " ").strip())
+    cleaned = re.sub(r"[^0-9,.'’]", "", cleaned).replace("'", "").replace("’", "")
+    if not cleaned or not re.search(r"\d", cleaned):
+        raise ValueError(f"Invalid amount string: '{value}'")
+
+    separators = [index for index, char in enumerate(cleaned) if char in ",."]
+    if not separators:
+        canonical = cleaned
+    else:
+        last_separator = separators[-1]
+        fractional_digits = len(cleaned) - last_separator - 1
+        decimal_separator = cleaned[last_separator] if fractional_digits in (1, 2) else None
+        if decimal_separator is None:
+            canonical = re.sub(r"[,.]", "", cleaned)
+        else:
+            integer_part = re.sub(r"[,.]", "", cleaned[:last_separator])
+            fractional_part = cleaned[last_separator + 1 :]
+            if not integer_part or not fractional_part.isdigit():
+                raise ValueError(f"Invalid amount string: '{value}'")
+            canonical = f"{integer_part}.{fractional_part}"
+
+    try:
+        return Decimal(canonical)
+    except Exception as exc:
+        raise ValueError(f"Invalid amount string: '{value}'") from exc
+
+
 class RegexParser:
     """Parser using regex patterns for structured receipt extraction"""
     
@@ -143,13 +174,6 @@ class RegexParser:
         card_last_4 = self.extract_card_last4(sender_line) if sender_line else self.extract_card_last4(text)
         receiver_card = self.extract_card_last4(receiver_line) if receiver_line else None
 
-        sender_name_match = self._search_any(
-            text,
-            [
-                r'Sender name\s*[:\-]?\s*([^\n\r]+)',
-                r'Имя\s+отправителя\s*[:\-]?\s*([^\n\r]+)',
-            ],
-        )
         receiver_name_match = self._search_any(
             text,
             [
@@ -213,9 +237,17 @@ class RegexParser:
                 date_match.group(2),
             )
 
-        operator_raw = "Uzum Bank"
+        merchant_match = re.search(r'Название\s*[:\-]?\s*([^\n\r]+)', text, re.IGNORECASE)
+        operator_raw = merchant_match.group(1).strip() if merchant_match else "Uzum Bank"
 
-        receiver_name_match = re.search(r'(?:Receiver name|Имя\s+получател[ьяя]?|Имя\s+отправителя|Имя)\s+([^\n\r]+)', text, re.IGNORECASE)
+        receiver_name_match = self._search_any(
+            text,
+            [
+                r'Receiver name\s*[:\-]?\s*([^\n\r]+)',
+                r'Имя\s+получател[ья]?\s*[:\-]?\s*([^\n\r]+)',
+                r'Получател[ья]?\s+имя\s*[:\-]?\s*([^\n\r]+)',
+            ],
+        )
         receiver_name = receiver_name_match.group(1).strip() if receiver_name_match else None
 
         sender_line = sender_mask.group(1).strip() if sender_mask else None
@@ -240,43 +272,17 @@ class RegexParser:
             'balance_after': None,
             'parsing_method': 'REGEX_TRANSFER',
             'parsing_confidence': 0.9,
-            'is_p2p': True,
+            'is_p2p': receiver_mask is not None and merchant_match is None,
         }
     
     def normalize_amount(self, amount_str: str) -> Decimal:
-        """Normalize amount string to Decimal with robust thousand/decimal handling."""
-        if amount_str is None:
-            raise ValueError("Amount string is None")
-        cleaned = amount_str.strip().replace("\u00a0", "").replace(" ", "")
+        """Normalize a localized amount without guessing three-digit groups as decimals.
 
-        has_dot = "." in cleaned
-        has_comma = "," in cleaned
-
-        if has_dot and has_comma:
-            # Decide decimal separator by last occurrence
-            last_dot = cleaned.rfind(".")
-            last_comma = cleaned.rfind(",")
-            if last_dot > last_comma:
-                # dot is decimal, remove commas
-                cleaned = cleaned.replace(",", "")
-            else:
-                # comma is decimal, remove dots then swap comma to dot
-                cleaned = cleaned.replace(".", "")
-                cleaned = cleaned.replace(",", ".")
-        elif has_comma and not has_dot:
-            cleaned = cleaned.replace(",", ".")
-
-        # Strip all except digits and dot
-        cleaned = re.sub(r"[^0-9\.]", "", cleaned)
-
-        if cleaned.count(".") > 1:
-            parts = cleaned.split(".")
-            cleaned = "".join(parts[:-1]) + "." + parts[-1]
-
-        if cleaned == "" or cleaned == ".":
-            raise ValueError(f"Invalid amount string: '{amount_str}'")
-
-        return Decimal(cleaned)
+        A single comma/dot followed by three digits is a thousands separator
+        (``500,000``), while one or two trailing digits denote decimals
+        (``500,50``). Repeated three-digit groups are always thousands separators.
+        """
+        return normalize_localized_decimal(amount_str)
 
     def normalize_currency(self, currency: Optional[str]) -> str:
         if not currency:

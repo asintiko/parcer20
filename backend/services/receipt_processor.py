@@ -3,15 +3,16 @@ import asyncio
 import json
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Any, Dict, Optional, TYPE_CHECKING
+from typing import Any, Callable, Dict, Optional, TYPE_CHECKING
 
 import pytz
 from fastapi import HTTPException
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from database.models import DuplicateMergeLog, Transaction
+from database.models import AccessAuditLog, DuplicateMergeLog, TgChatMessage, Transaction
 from parsers.parser_orchestrator import ParserOrchestrator
 from parsers.pdf_extractor import (
     extract_text_from_image_path,
@@ -23,7 +24,7 @@ from database.connection import SessionLocal
 
 if TYPE_CHECKING:
     # Avoid runtime circular import
-    from api.routes.transactions import ProcessReceiptResponse, ParsingInfo
+    from api.routes.transactions import ProcessReceiptResponse
 
 METHOD_QUALITY_BONUS = {
     "REGEX_TRANSFER": 18.0,
@@ -289,12 +290,110 @@ def _merge_duplicate_transaction(
     return updated
 
 
+def _parse_text_in_worker(
+    text: str,
+    fallback_datetime: Optional[datetime] = None,
+) -> Optional[Dict[str, Any]]:
+    """Run CPU/network-heavy parsing with a thread-local SQLAlchemy session."""
+    with SessionLocal() as parser_db:
+        return ParserOrchestrator(parser_db).process(text, fallback_datetime=fallback_datetime)
+
+
+def _extract_and_parse_in_worker(
+    path: str,
+    *,
+    caption: str,
+    media_kind: str,
+    fallback_datetime: Optional[datetime],
+) -> tuple[Optional[Dict[str, Any]], str, Optional[str]]:
+    notes: Optional[str] = None
+    try:
+        if media_kind == "pdf":
+            extracted = extract_text_from_pdf(path, max_pages=2)
+        else:
+            extracted = extract_text_from_image_path(path)
+    except Exception as exc:  # noqa: BLE001
+        extracted = ""
+        notes = f"{media_kind.upper()} extraction failed: {exc}"
+
+    combined = "\n\n".join(part for part in (caption, extracted) if part).strip()
+    if not combined:
+        return None, caption or f"[{media_kind}]", notes
+    return _parse_text_in_worker(combined, fallback_datetime), combined, notes
+
+
+def _message_fallback_datetime(value: Any) -> Optional[datetime]:
+    if value is None:
+        return None
+    try:
+        if isinstance(value, (int, float)):
+            return datetime.fromtimestamp(float(value), tz=timezone.utc).astimezone(
+                pytz.timezone("Asia/Tashkent")
+            )
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            return pytz.timezone("Asia/Tashkent").localize(parsed)
+        return parsed.astimezone(pytz.timezone("Asia/Tashkent"))
+    except (TypeError, ValueError, OSError):
+        return None
+
+
+def _validate_download(path: str, *, media_kind: str) -> None:
+    configured = (
+        os.getenv("RECEIPT_MAX_PDF_BYTES", str(25 * 1024 * 1024))
+        if media_kind == "pdf"
+        else os.getenv("RECEIPT_MAX_IMAGE_BYTES", str(15 * 1024 * 1024))
+    )
+    limit = max(1, int(configured))
+    try:
+        size = os.path.getsize(path)
+    except OSError as exc:
+        raise HTTPException(status_code=422, detail=f"Unreadable {media_kind} file: {exc}") from exc
+    if size > limit:
+        raise HTTPException(
+            status_code=413,
+            detail=f"{media_kind.upper()} exceeds the configured {limit // (1024 * 1024)} MB limit",
+        )
+
+
+def _transaction_snapshot(txn: Transaction) -> Dict[str, Any]:
+    fields = (
+        "transaction_date", "amount", "currency", "card_last_4", "operator_raw",
+        "application_mapped", "transaction_type", "balance_after", "receiver_name",
+        "receiver_card", "parsing_method", "parsing_confidence", "fingerprint",
+    )
+    return {name: str(getattr(txn, name, None)) for name in fields}
+
+
+def _mark_tg_message(
+    db: Session,
+    *,
+    chat_id: int,
+    message_id: int,
+    transaction_id: int,
+    duplicate: bool,
+) -> None:
+    row = (
+        db.query(TgChatMessage)
+        .filter(TgChatMessage.chat_id == int(chat_id), TgChatMessage.message_id == int(message_id))
+        .first()
+    )
+    if row is None:
+        return
+    row.processing_status = "done"
+    row.processing_error_code = None
+    row.processing_error_text = None
+    row.receipt_transaction_id = int(transaction_id)
+    row.duplicate_status = "source_duplicate" if duplicate else None
+
+
 async def process_tdlib_message(
     chat_id: int,
     message_id: int,
     force: bool,
     db: Session,
     manager: TelegramTDLibManager,
+    authorize_result: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> "ProcessReceiptResponse":
     """Process a Telegram message into a Transaction, reusing existing logic."""
     # Late imports to break circular dependency
@@ -313,6 +412,15 @@ async def process_tdlib_message(
         )
         .first()
     )
+    if existing is not None and authorize_result is not None:
+        authorize_result(
+            {
+                "transaction_date": existing.transaction_date,
+                "source_chat_id": existing.source_chat_id,
+                "source_message_id": existing.source_message_id,
+                "source_type": existing.source_type,
+            }
+        )
     if existing and not force:
         return ProcessReceiptResponse(
             created=False,
@@ -342,9 +450,9 @@ async def process_tdlib_message(
     file_name: Optional[str] = None
     image_file_id: Optional[int] = None
     image_mime_type: Optional[str] = None
-    image_file_name: Optional[str] = None
     parsing_notes: Optional[str] = None
     caption = text
+    fallback_datetime = _message_fallback_datetime(message.get("date"))
 
     document = message.get("document") or {}
     photo = message.get("photo") or {}
@@ -357,7 +465,6 @@ async def process_tdlib_message(
             if str(mime_type).lower().startswith("image/"):
                 image_file_id = file_id
                 image_mime_type = mime_type
-                image_file_name = file_name
                 file_id = None
                 mime_type = None
                 file_name = None
@@ -367,12 +474,6 @@ async def process_tdlib_message(
     if photo and photo.get("file_id"):
         image_file_id = photo.get("file_id")
         image_mime_type = photo.get("mime_type") or "image/jpeg"
-        image_file_name = photo.get("file_name") or "photo.jpg"
-
-    try:
-        orchestrator = ParserOrchestrator(db)
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=500, detail=f"Parser initialization failed: {exc}")
 
     raw_text_for_parser = text
     parsed: Optional[Dict[str, Any]] = None
@@ -380,7 +481,6 @@ async def process_tdlib_message(
     # Handle documents/images
     is_pdf = (mime_type or "").lower() == "application/pdf" or (file_name or "").lower().endswith(".pdf")
     is_image = bool(image_file_id) or str(image_mime_type or "").lower().startswith("image/")
-    extracted_text: Optional[str] = None
     pdf_path: Optional[str] = None
     image_path: Optional[str] = None
 
@@ -398,24 +498,14 @@ async def process_tdlib_message(
             raise HTTPException(status_code=404, detail="PDF file not found")
 
         try:
-            try:
-                extracted_text = extract_text_from_pdf(pdf_path, max_pages=2)
-            except ImportError as exc:
-                raise HTTPException(status_code=500, detail=str(exc))
-            except Exception as exc:  # noqa: BLE001
-                parsing_notes = f"PDF text extraction failed: {exc}"
-                extracted_text = ""
-
-            combined_text = "\n\n".join([p for p in [caption, extracted_text] if p]).strip()
-            raw_text_for_parser = combined_text or caption or ""
-
-            # Try text-first parsing when we have meaningful text
-            if extracted_text and len(extracted_text) >= 80:
-                parsed = orchestrator.process(raw_text_for_parser)
-                conf = parsed.get("parsing_confidence") if parsed else None
-                if conf is None or conf < 0.75:
-                    parsing_notes = (parsing_notes + "; " if parsing_notes else "") + "Text parse confidence low after OCR"
-                    parsed = None
+            _validate_download(pdf_path, media_kind="pdf")
+            parsed, raw_text_for_parser, parsing_notes = await asyncio.to_thread(
+                _extract_and_parse_in_worker,
+                pdf_path,
+                caption=caption,
+                media_kind="pdf",
+                fallback_datetime=fallback_datetime,
+            )
         finally:
             try:
                 if pdf_path and os.path.isfile(pdf_path):
@@ -437,20 +527,14 @@ async def process_tdlib_message(
             raise HTTPException(status_code=404, detail="Image file not found")
 
         try:
-            extracted_text = extract_text_from_image_path(image_path)
-            combined_text = "\n\n".join([p for p in [caption, extracted_text] if p]).strip()
-            raw_text_for_parser = combined_text or caption or ""
-
-            if raw_text_for_parser:
-                parsed = orchestrator.process(raw_text_for_parser)
-                conf = parsed.get("parsing_confidence") if parsed else None
-                if conf is None or conf < 0.75:
-                    parsed = None
-
-            if not parsed and not raw_text_for_parser:
-                raise HTTPException(status_code=422, detail="Cannot parse receipt from screenshot")
-            if not raw_text_for_parser:
-                raw_text_for_parser = caption or extracted_text or f"[screenshot:{image_file_name or 'image'}]"
+            _validate_download(image_path, media_kind="image")
+            parsed, raw_text_for_parser, parsing_notes = await asyncio.to_thread(
+                _extract_and_parse_in_worker,
+                image_path,
+                caption=caption,
+                media_kind="image",
+                fallback_datetime=fallback_datetime,
+            )
         finally:
             try:
                 if image_path and os.path.isfile(image_path):
@@ -462,7 +546,11 @@ async def process_tdlib_message(
         raw_text_for_parser = text
         if not raw_text_for_parser:
             raise HTTPException(status_code=422, detail="Empty message content")
-        parsed = orchestrator.process(raw_text_for_parser)
+        parsed = await asyncio.to_thread(
+            _parse_text_in_worker,
+            raw_text_for_parser,
+            fallback_datetime,
+        )
 
     if not parsed:
         raise HTTPException(status_code=422, detail="Cannot parse receipt after OCR/text extraction")
@@ -493,7 +581,9 @@ async def process_tdlib_message(
     store_amount = -abs(amount) if txn_type == "DEBIT" else abs(amount)
 
     operator_raw = parsed.get("operator_raw") or "Unknown"
-    card_last4 = parsed.get("card_last_4") or parsed.get("card_last4") or "0000"
+    raw_card = parsed.get("card_last_4") or parsed.get("card_last4")
+    card_digits = "".join(ch for ch in str(raw_card or "") if ch.isdigit())
+    card_last4 = card_digits[-4:] if card_digits else None
     balance_after = parsed.get("balance_after")
     application_mapped = parsed.get("application_mapped")
     currency = parsed.get("currency") or "UZS"
@@ -501,7 +591,8 @@ async def process_tdlib_message(
     legacy_ai_parsed_flag = (parsed.get("parsing_method") or "").upper().startswith("GPT")
     parsed_is_p2p = parsed.get("is_p2p")
 
-    # Compute fingerprint candidates for duplicate detection (legacy + v2 in dual mode).
+    # Fingerprints are fuzzy reconciliation candidates only.  Source identity is
+    # the sole automatic idempotency key for online ingestion.
     fp_candidates = compute_fingerprint_candidates(
         amount=amount,
         transaction_date=transaction_date,
@@ -511,60 +602,7 @@ async def process_tdlib_message(
     )
     fp = fp_candidates[0]
 
-    # Check duplicates by all candidates to keep backward compatibility during transition.
-    existing_by_fp = db.query(Transaction).filter(Transaction.fingerprint.in_(fp_candidates)).first()
-    if existing_by_fp and not force:
-        original_method = getattr(existing_by_fp, "parsing_method", None)
-        original_conf = float(getattr(existing_by_fp, "parsing_confidence", 0.0) or 0.0)
-        merged = _merge_duplicate_transaction(
-            existing_by_fp,
-            candidate_transaction_date=transaction_date,
-            candidate_operator_raw=operator_raw,
-            candidate_application_mapped=application_mapped,
-            candidate_balance_after=balance_after,
-            candidate_receiver_name=parsed.get("receiver_name"),
-            candidate_receiver_card=parsed.get("receiver_card"),
-            candidate_raw_message=raw_text_for_parser,
-            candidate_is_p2p=parsed_is_p2p if parsed_is_p2p is not None else "P2P" in operator_raw.upper(),
-            candidate_parsing_method=parsed.get("parsing_method"),
-            candidate_parsing_confidence=parsed.get("parsing_confidence"),
-            candidate_is_gpt=legacy_ai_parsed_flag,
-            candidate_source_type="AUTO",
-        )
-        duplicate_log_payload = {
-            "fingerprint": fp,
-            "existing_transaction_id": int(existing_by_fp.id),
-            "source_chat_id": chat_id,
-            "source_message_id": message_id,
-            "merged": merged,
-            "candidate_method": parsed.get("parsing_method"),
-            "candidate_confidence": parsed.get("parsing_confidence"),
-            "existing_method": original_method,
-            "existing_confidence": original_conf,
-            "details": {
-                "original_method": original_method,
-                "original_confidence": original_conf,
-                "candidate_method": parsed.get("parsing_method"),
-                "candidate_confidence": parsed.get("parsing_confidence"),
-                "candidate_has_receiver": bool(parsed.get("receiver_name") or parsed.get("receiver_card")),
-                "candidate_has_balance": parsed.get("balance_after") is not None,
-            },
-        }
-        db.commit()
-        db.refresh(existing_by_fp)
-        asyncio.create_task(_append_duplicate_log_background(**duplicate_log_payload))
-        return ProcessReceiptResponse(
-            created=False,
-            duplicate=True,
-            transaction=build_transaction_response(existing_by_fp),
-            parsing=ParsingInfo(
-                method=getattr(existing_by_fp, "parsing_method", None),
-                confidence=getattr(existing_by_fp, "parsing_confidence", None),
-                notes="Duplicate detected by fingerprint; merged richer fields" if merged else "Duplicate detected by fingerprint",
-            ),
-        )
-
-    txn = Transaction(
+    values = dict(
         transaction_date=transaction_date,
         operator_raw=operator_raw,
         application_mapped=application_mapped,
@@ -586,10 +624,109 @@ async def process_tdlib_message(
         fingerprint=fp,
     )
 
+    # Authorization is deliberately after parsing/normalization but before any
+    # transaction, TgChatMessage, or audit mutation. Route policy can therefore
+    # decide on the final parsed date/source without cleanup compensation.
+    if authorize_result is not None:
+        authorize_result(dict(values))
+
+    if existing and force:
+        before = _transaction_snapshot(existing)
+        for field, value in values.items():
+            # Source identity is immutable during a force reparse.
+            if field not in {"source_chat_id", "source_message_id", "source_type"}:
+                setattr(existing, field, value)
+        existing.updated_at = datetime.utcnow()
+        after = _transaction_snapshot(existing)
+        db.add(
+            AccessAuditLog(
+                action="receipt_force_reparse",
+                success=True,
+                details_json=json.dumps(
+                    {
+                        "transaction_id": int(existing.id),
+                        "chat_id": int(chat_id),
+                        "message_id": int(message_id),
+                        "before": before,
+                        "after": after,
+                    },
+                    ensure_ascii=False,
+                ),
+            )
+        )
+        _mark_tg_message(
+            db,
+            chat_id=chat_id,
+            message_id=message_id,
+            transaction_id=int(existing.id),
+            duplicate=False,
+        )
+        db.commit()
+        db.refresh(existing)
+        return ProcessReceiptResponse(
+            created=False,
+            duplicate=False,
+            transaction=build_transaction_response(existing),
+            parsing=ParsingInfo(
+                method=parsed.get("parsing_method"),
+                confidence=parsed.get("parsing_confidence"),
+                notes="Reprocessed existing transaction; previous values retained in audit log",
+            ),
+        )
+
+    txn = Transaction(**values)
+
     try:
         db.add(txn)
+        db.flush()
+        _mark_tg_message(
+            db,
+            chat_id=chat_id,
+            message_id=message_id,
+            transaction_id=int(txn.id),
+            duplicate=False,
+        )
         db.commit()
         db.refresh(txn)
+    except IntegrityError:
+        db.rollback()
+        raced = (
+            db.query(Transaction)
+            .filter(
+                Transaction.source_chat_id == int(chat_id),
+                Transaction.source_message_id == int(message_id),
+            )
+            .first()
+        )
+        if raced is None:
+            raise HTTPException(status_code=409, detail="Transaction identity conflict")
+        if authorize_result is not None:
+            authorize_result(
+                {
+                    "transaction_date": raced.transaction_date,
+                    "source_chat_id": raced.source_chat_id,
+                    "source_message_id": raced.source_message_id,
+                    "source_type": raced.source_type,
+                }
+            )
+        _mark_tg_message(
+            db,
+            chat_id=chat_id,
+            message_id=message_id,
+            transaction_id=int(raced.id),
+            duplicate=True,
+        )
+        db.commit()
+        return ProcessReceiptResponse(
+            created=False,
+            duplicate=True,
+            transaction=build_transaction_response(raced),
+            parsing=ParsingInfo(
+                method=getattr(raced, "parsing_method", None),
+                confidence=getattr(raced, "parsing_confidence", None),
+                notes="Already processed by another worker",
+            ),
+        )
     except Exception as exc:  # noqa: BLE001
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Failed to save transaction: {exc}")

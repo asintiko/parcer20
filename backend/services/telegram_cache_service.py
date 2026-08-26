@@ -162,12 +162,12 @@ class TelegramCacheService:
                     "last_realtime_seen_at": chat.last_realtime_seen_at.isoformat() if chat.last_realtime_seen_at else None,
                     "last_receipt_candidate_at": chat.last_receipt_candidate_at.isoformat() if chat.last_receipt_candidate_at else None,
                     "last_sync_issue_at": chat.last_sync_issue_at.isoformat() if chat.last_sync_issue_at else None,
-                    "cursor_status": cursor.status if cursor else "not_started",
-                    "cursor_message_id": int(cursor.cursor_message_id) if cursor else 0,
+                    "cursor_status": cursor.monitor_status if cursor else "not_started",
+                    "cursor_message_id": int(cursor.monitor_cursor_message_id) if cursor else 0,
                     "loaded_count": int(cursor.loaded_count) if cursor else 0,
                     "lag_messages": int(cursor.lag_messages) if cursor else 0,
                     "lag_seconds": int(cursor.lag_seconds) if cursor else 0,
-                    "cursor_error": cursor.error if cursor else None,
+                    "cursor_error": cursor.monitor_error if cursor else None,
                 }
             )
         return payload

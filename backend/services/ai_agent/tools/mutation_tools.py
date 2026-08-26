@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional
 from sqlalchemy.orm import Session
 
 from database.models import Transaction
+from services.ai_agent.authorization import actor_id, current_agent_authorization
 
 
 def _json_default(value: Any) -> Any:
@@ -83,6 +84,10 @@ async def create_transaction(
     args: Dict[str, Any],
 ) -> Dict[str, Any]:
     payload = {k: v for k, v in args.items() if not k.startswith("_")}
+    auth = current_agent_authorization(db, actor_id(current_user))
+    auth.require_admin("create_transaction")
+    auth.require_dashboard()
+    auth.authorize_date(db, payload.get("transaction_datetime"))
 
     summary_lines: List[str] = [
         f"Дата: {payload.get('transaction_datetime')}",
@@ -161,19 +166,8 @@ async def update_transaction(
             ],
         }
 
-    chat_ids = _scope_chat_ids(scope)
-    if chat_ids is not None and tx.source_chat_id is not None and int(tx.source_chat_id) not in chat_ids:
-        return {
-            "summary": "Нет доступа к транзакции в текущем scope.",
-            "assistant_message": "Нет доступа к этой транзакции.",
-            "cards": [
-                {
-                    "type": "warning",
-                    "title": "Update transaction",
-                    "body": "Нет доступа к транзакции в текущем scope.",
-                }
-            ],
-        }
+    auth = current_agent_authorization(db, actor_id(current_user))
+    auth.authorize_transaction(db, tx, proposed_date=patch.get("transaction_date"))
 
     before = _serialize_transaction(tx)
     diff = _patch_diff(before, patch)
@@ -238,6 +232,7 @@ async def bulk_update_transactions(
             continue
 
     patch = args.get("patch") or {}
+    transaction_ids = list(dict.fromkeys(transaction_ids))
     if not transaction_ids or not isinstance(patch, dict) or not patch:
         return {
             "summary": "Нет данных для массового обновления.",
@@ -251,16 +246,18 @@ async def bulk_update_transactions(
             ],
         }
 
+    if len(transaction_ids) > 200:
+        raise ValueError("bulk_update_limit_exceeded:200")
+
     rows = db.query(Transaction).filter(Transaction.id.in_(transaction_ids)).all()
     found_ids = {int(row.id) for row in rows}
     missing_ids = [tid for tid in transaction_ids if tid not in found_ids]
+    if missing_ids:
+        raise ValueError("bulk_update_missing_transactions:" + ",".join(str(item) for item in missing_ids[:20]))
 
-    chat_ids = _scope_chat_ids(scope)
-    if chat_ids is not None:
-        rows = [
-            row for row in rows
-            if row.source_chat_id is None or int(row.source_chat_id) in chat_ids
-        ]
+    auth = current_agent_authorization(db, actor_id(current_user))
+    for row in rows:
+        auth.authorize_transaction(db, row, proposed_date=patch.get("transaction_date"))
 
     sample_diff: List[Dict[str, Any]] = []
     for row in rows[:5]:
@@ -270,7 +267,7 @@ async def bulk_update_transactions(
 
     confirmation_payload = {
         "action": "bulk_update_transactions",
-        "args": {"transaction_ids": [int(row.id) for row in rows], "patch": patch},
+        "args": {"transaction_ids": transaction_ids, "patch": patch},
         "idempotency_key": _idempotency_key(
             "bulk_update_transactions",
             {"ids": sorted(int(row.id) for row in rows), "patch": patch},

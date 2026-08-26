@@ -1,15 +1,19 @@
-import React from 'react';
+import React, { useEffect, useState } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import { FileText, CheckCheck, Download, ScanLine, Check, Loader2, RefreshCw } from 'lucide-react';
-import type { TelegramChatMessage } from '../../services/api';
+import { telegramClientApi, type TelegramChatMessage, type TgKeyboardButton } from '../../services/api';
+import { InlineKeyboard } from './InlineKeyboard';
 
 interface MessageBubbleProps {
+    chatId: number;
     message: TelegramChatMessage;
     selectionMode?: boolean;
     selected?: boolean;
     onToggleSelect?: (id: number) => void;
     onProcess?: (message: TelegramChatMessage) => void;
     onContextMenu?: (e: React.MouseEvent, message: TelegramChatMessage) => void;
+    onOpenWebApp?: (message: TelegramChatMessage, btn: TgKeyboardButton) => void;
+    onOpenLink?: (url: string) => void;
     processing?: boolean;
     processed?: boolean;
     failed?: boolean;
@@ -73,12 +77,15 @@ const ProcessIcon: React.FC<{ processing?: boolean; processed?: boolean; failed?
 };
 
 export const MessageBubble: React.FC<MessageBubbleProps> = ({
+    chatId,
     message,
     selectionMode,
     selected,
     onToggleSelect,
     onProcess,
     onContextMenu,
+    onOpenWebApp,
+    onOpenLink,
     processing,
     processed,
     failed,
@@ -88,6 +95,54 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({
     const time = formatTime(message.date);
     const hasId = Boolean(message.id);
     const showProcess = !selectionMode && hasId && Boolean(onProcess);
+    const [photoObjectUrl, setPhotoObjectUrl] = useState<string | null>(null);
+
+    useEffect(() => {
+        const messageId = message.id;
+        const photo = message.photo;
+        if (!messageId || !photo?.file_id) {
+            setPhotoObjectUrl(null);
+            return;
+        }
+        let disposed = false;
+        let objectUrl: string | null = null;
+        void telegramClientApi
+            .downloadOwnedFile(chatId, messageId, photo.file_id, photo.file_name)
+            .then((blob) => {
+                if (disposed) return;
+                objectUrl = URL.createObjectURL(blob);
+                setPhotoObjectUrl(objectUrl);
+            })
+            .catch(() => {
+                if (!disposed) setPhotoObjectUrl(null);
+            });
+        return () => {
+            disposed = true;
+            if (objectUrl) URL.revokeObjectURL(objectUrl);
+        };
+    }, [chatId, message.id, message.photo]);
+
+    const downloadDocument = async (event: React.MouseEvent<HTMLAnchorElement>) => {
+        event.preventDefault();
+        if (selectionMode || !message.id || !message.document?.file_id) return;
+        try {
+            const blob = await telegramClientApi.downloadOwnedFile(
+                chatId,
+                message.id,
+                message.document.file_id,
+                message.document.file_name,
+            );
+            const objectUrl = URL.createObjectURL(blob);
+            const link = document.createElement('a');
+            link.href = objectUrl;
+            link.download = message.document.file_name || 'document';
+            link.rel = 'noreferrer';
+            link.click();
+            setTimeout(() => URL.revokeObjectURL(objectUrl), 0);
+        } catch {
+            // The owner-bound endpoint remains fail-closed on auth or ownership errors.
+        }
+    };
 
     const handleClick = (e: React.MouseEvent) => {
         if (selectionMode && onToggleSelect && message.id) {
@@ -165,9 +220,9 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({
             <div className="tg-msg-bubble-wrap">
                 <div className="tg-msg-bubble">
                     {message.photo ? (
-                        message.photo.download_url ? (
+                        photoObjectUrl ? (
                             <a
-                                href={message.photo.download_url}
+                                href={photoObjectUrl}
                                 target="_blank"
                                 rel="noreferrer"
                                 className="tg-msg-photo"
@@ -177,7 +232,7 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({
                                 }}
                             >
                                 <img
-                                    src={message.photo.download_url}
+                                    src={photoObjectUrl}
                                     alt={message.photo.file_name || 'photo'}
                                     loading="lazy"
                                 />
@@ -199,14 +254,10 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({
 
                     {message.document ? (
                         <a
-                            href={message.document.download_url || '#'}
-                            target="_blank"
-                            rel="noreferrer"
+                            href="#"
                             className="tg-msg-document"
                             aria-label={`Скачать ${message.document.file_name || 'документ'}`}
-                            onClick={(e) => {
-                                if (selectionMode) e.preventDefault();
-                            }}
+                            onClick={downloadDocument}
                         >
                             <span className="tg-msg-doc-icon">
                                 <FileText size={16} />
@@ -225,6 +276,14 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({
                     ) : null}
 
                     {message.text ? <div className="tg-msg-text">{message.text}</div> : null}
+
+                    {message.reply_markup ? (
+                        <InlineKeyboard
+                            markup={message.reply_markup}
+                            onOpenWebApp={(btn) => onOpenWebApp?.(message, btn)}
+                            onOpenLink={(url) => onOpenLink?.(url)}
+                        />
+                    ) : null}
 
                     <div className="tg-msg-meta">
                         <AnimatePresence>

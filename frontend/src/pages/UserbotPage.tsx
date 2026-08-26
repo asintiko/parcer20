@@ -2,13 +2,15 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { motion, AnimatePresence } from 'motion/react';
 import { Phone, Lock, Unlock, KeyRound, Plug, PlugZap, AlertOctagon, Eye, EyeOff, ScanLine, CheckSquare, ArrowRight, Loader2, AlertCircle } from 'lucide-react';
-import { telegramClientApi, type TelegramChat, type TelegramChatMessage } from '../services/api';
+import { telegramClientApi, type TelegramChat, type TelegramChatMessage, type TgKeyboardButton } from '../services/api';
 import { useToast } from '../components/Toast';
 import { useHiddenChatsOverlay } from '../hooks/useHiddenChatsOverlay';
 import { useKeyboardShortcuts } from '../hooks/useKeyboardShortcuts';
 import { ChatList, type ChatFilter } from '../components/telegram/ChatList';
-import { ChatHeader, type DateRange } from '../components/telegram/ChatHeader';
+import { ChatHeader, type DateRange, type MenuAppOpenRequest } from '../components/telegram/ChatHeader';
 import { MessageStream } from '../components/telegram/MessageStream';
+import { MiniAppProvider, useMiniApp } from '../hooks/useMiniApp';
+import { MiniAppHost } from '../components/telegram/MiniAppHost';
 import { MessageInput } from '../components/telegram/MessageInput';
 import { EmptyState } from '../components/telegram/EmptyState';
 import { BulkBar } from '../components/telegram/BulkBar';
@@ -146,9 +148,177 @@ type ContextTarget =
     | { kind: 'message'; message: TelegramChatMessage }
     | null;
 
+// sender_id may be a bare number or a TDLib-shaped object ({ user_id } / { chat_id }).
+const senderNumericId = (sender: unknown): number | null => {
+    if (typeof sender === 'number') return sender;
+    if (sender && typeof sender === 'object') {
+        const s = sender as { user_id?: number; chat_id?: number };
+        if (typeof s.user_id === 'number') return s.user_id;
+        if (typeof s.chat_id === 'number') return s.chat_id;
+    }
+    return null;
+};
+
+const openExternalLink = (url: string): void => {
+    // In Electron a setWindowOpenHandler routes this to shell.openExternal.
+    window.open(url, '_blank', 'noopener');
+};
+
 type PasswordDialogState =
     | { open: false }
     | { open: true; chat: TelegramChat; mode: 'set' | 'remove' };
+
+interface ChatPaneProps {
+    activeChat: TelegramChat;
+    activeChatId: number;
+    messages: TelegramChatMessage[];
+    isLoading?: boolean;
+    selectionMode: boolean;
+    selectedIds: Set<number>;
+    processingIds: Set<number>;
+    processedIds: Set<number>;
+    failedIds: Set<number>;
+    bulkStats: { processed: number; failed: number; total: number };
+    bulkBusy: boolean;
+    dateRange: DateRange;
+    forceScrollKey: number;
+    sending: boolean;
+    onBack: () => void;
+    onToggleMonitor: (chatId: number, on: boolean) => void;
+    onToggleSelection: () => void;
+    onDateRangeChange: (range: DateRange) => void;
+    onToggleSelect: (id: number) => void;
+    onProcess: (message: TelegramChatMessage) => void;
+    onMessageContextMenu: (e: React.MouseEvent, message: TelegramChatMessage) => void;
+    onBulkProcess: () => void;
+    onCancelSelection: () => void;
+    onSelectAll: () => void;
+    onDeselectAll: () => void;
+    onSend: (text: string) => void;
+    onAttach: (file: File) => void;
+}
+
+// Lives INSIDE <MiniAppProvider> so it can call useMiniApp() to open mini apps.
+const ChatPane: React.FC<ChatPaneProps> = ({
+    activeChat,
+    activeChatId,
+    messages,
+    isLoading,
+    selectionMode,
+    selectedIds,
+    processingIds,
+    processedIds,
+    failedIds,
+    bulkStats,
+    bulkBusy,
+    dateRange,
+    forceScrollKey,
+    sending,
+    onBack,
+    onToggleMonitor,
+    onToggleSelection,
+    onDateRangeChange,
+    onToggleSelect,
+    onProcess,
+    onMessageContextMenu,
+    onBulkProcess,
+    onCancelSelection,
+    onSelectAll,
+    onDeselectAll,
+    onSend,
+    onAttach,
+}) => {
+    const miniApp = useMiniApp();
+
+    const handleOpenWebApp = useCallback(
+        (message: TelegramChatMessage, btn: TgKeyboardButton) => {
+            if (!btn.url) return;
+            const markup = message.reply_markup;
+            miniApp.open({
+                chatId: activeChatId,
+                botUserId: senderNumericId(message.sender_id),
+                url: btn.url,
+                buttonKind: markup?.kind === 'keyboard' ? 'keyboard' : 'inline',
+                buttonText: btn.text,
+            });
+        },
+        [miniApp, activeChatId],
+    );
+
+    const handleOpenMenuApp = useCallback(
+        (req: MenuAppOpenRequest) => {
+            miniApp.open({
+                chatId: req.chatId,
+                botUserId: req.botUserId,
+                url: req.url,
+                buttonKind: 'menu',
+                buttonText: req.text,
+            });
+        },
+        [miniApp],
+    );
+
+    return (
+        <>
+            <ChatHeader
+                chat={activeChat}
+                onBack={onBack}
+                onToggleMonitor={onToggleMonitor}
+                onToggleSelection={onToggleSelection}
+                selectionMode={selectionMode}
+                dateRange={dateRange}
+                onDateRangeChange={onDateRangeChange}
+                onOpenMenuApp={handleOpenMenuApp}
+            />
+
+            {selectionMode ? (
+                <BulkBar
+                    total={messages.filter((m) => Boolean(m.id)).length}
+                    selectedCount={selectedIds.size}
+                    processed={bulkStats.processed}
+                    failed={bulkStats.failed}
+                    inFlight={processingIds.size}
+                    busy={bulkBusy}
+                    onProcess={onBulkProcess}
+                    onCancel={onCancelSelection}
+                    onSelectAll={onSelectAll}
+                    onDeselectAll={onDeselectAll}
+                />
+            ) : null}
+
+            <MessageStream
+                key={activeChatId}
+                chatId={activeChatId}
+                messages={messages}
+                isLoading={isLoading}
+                selectionMode={selectionMode}
+                selectedIds={selectedIds}
+                onToggleSelect={onToggleSelect}
+                onProcess={onProcess}
+                onMessageContextMenu={onMessageContextMenu}
+                onOpenWebApp={handleOpenWebApp}
+                onOpenLink={openExternalLink}
+                processingIds={processingIds}
+                processedIds={processedIds}
+                failedIds={failedIds}
+                forceScrollToBottomKey={forceScrollKey}
+                emptyTitle={dateRange.from || dateRange.to ? 'В выбранном периоде сообщений нет' : undefined}
+                emptySub={dateRange.from || dateRange.to ? 'Попробуйте расширить диапазон дат.' : undefined}
+            />
+
+            {!selectionMode ? (
+                <MessageInput
+                    onSend={onSend}
+                    onAttach={onAttach}
+                    sending={sending}
+                    placeholder={`Сообщение в «${activeChat.title}»…`}
+                />
+            ) : null}
+
+            <MiniAppHost />
+        </>
+    );
+};
 
 export const UserbotPage: React.FC = () => {
     const queryClient = useQueryClient();
@@ -618,62 +788,41 @@ export const UserbotPage: React.FC = () => {
             />
 
             <main className="tg-message-pane">
-                {activeChat ? (
-                    <>
-                        <ChatHeader
-                            chat={activeChat}
+                {activeChat && activeChatId ? (
+                    <MiniAppProvider>
+                        <ChatPane
+                            activeChat={activeChat}
+                            activeChatId={activeChatId}
+                            messages={messages}
+                            isLoading={messagesQuery.isLoading}
+                            selectionMode={selectionMode}
+                            selectedIds={selectedIds}
+                            processingIds={processingIds}
+                            processedIds={effectiveProcessedIds}
+                            failedIds={effectiveFailedIds}
+                            bulkStats={bulkStats}
+                            bulkBusy={bulkBusy}
+                            dateRange={dateRange}
+                            forceScrollKey={forceScrollKey}
+                            sending={sendMutation.isPending || sendPdfMutation.isPending}
                             onBack={() => setActiveChatId(null)}
                             onToggleMonitor={handleToggleMonitor}
                             onToggleSelection={() => {
                                 setSelectionMode((v) => !v);
                                 if (selectionMode) setSelectedIds(new Set());
                             }}
-                            selectionMode={selectionMode}
-                            dateRange={dateRange}
                             onDateRangeChange={setDateRange}
-                        />
-
-                        {selectionMode ? (
-                            <BulkBar
-                                total={messages.filter((m) => Boolean(m.id)).length}
-                                selectedCount={selectedIds.size}
-                                processed={bulkStats.processed}
-                                failed={bulkStats.failed}
-                                inFlight={processingIds.size}
-                                busy={bulkBusy}
-                                onProcess={handleBulkProcess}
-                                onCancel={handleCancelSelection}
-                                onSelectAll={handleSelectAll}
-                                onDeselectAll={handleDeselectAll}
-                            />
-                        ) : null}
-
-                        <MessageStream
-                            key={activeChatId}
-                            messages={messages}
-                            isLoading={messagesQuery.isLoading}
-                            selectionMode={selectionMode}
-                            selectedIds={selectedIds}
                             onToggleSelect={handleToggleSelect}
                             onProcess={handleProcess}
                             onMessageContextMenu={openMessageContextMenu}
-                            processingIds={processingIds}
-                            processedIds={effectiveProcessedIds}
-                            failedIds={effectiveFailedIds}
-                            forceScrollToBottomKey={forceScrollKey}
-                            emptyTitle={dateRange.from || dateRange.to ? 'В выбранном периоде сообщений нет' : undefined}
-                            emptySub={dateRange.from || dateRange.to ? 'Попробуйте расширить диапазон дат.' : undefined}
+                            onBulkProcess={handleBulkProcess}
+                            onCancelSelection={handleCancelSelection}
+                            onSelectAll={handleSelectAll}
+                            onDeselectAll={handleDeselectAll}
+                            onSend={handleSend}
+                            onAttach={handleAttach}
                         />
-
-                        {!selectionMode ? (
-                            <MessageInput
-                                onSend={handleSend}
-                                onAttach={handleAttach}
-                                sending={sendMutation.isPending || sendPdfMutation.isPending}
-                                placeholder={`Сообщение в «${activeChat.title}»…`}
-                            />
-                        ) : null}
-                    </>
+                    </MiniAppProvider>
                 ) : (
                     <EmptyState />
                 )}

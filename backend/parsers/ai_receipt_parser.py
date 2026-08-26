@@ -2,12 +2,12 @@
 from typing import Optional, Dict, Any, List
 from datetime import datetime
 from decimal import Decimal
-import json
 import re
 import logging
 from pydantic import BaseModel, Field, field_validator
 import pytz
 from config.ai_models import DEEPSEEK_TEXT_MODEL
+from parsers.regex_parser import normalize_localized_decimal
 from services.ai_provider import get_text_ai_provider
 
 logger = logging.getLogger(__name__)
@@ -15,23 +15,23 @@ logger = logging.getLogger(__name__)
 
 class TransactionSchema(BaseModel):
     """Structured output schema for AI receipt parsing."""
-    amount: float = Field(description="Transaction amount as a number")
+    amount: Decimal = Field(gt=0, description="Transaction amount as a positive decimal")
     currency: str = Field(default="UZS", description="Currency code (UZS, USD, etc.)")
-    transaction_date_iso: Optional[str] = Field(default=None, description="Transaction date and time in ISO 8601 format (YYYY-MM-DDTHH:MM:SS)")
+    transaction_date_iso: str = Field(description="Transaction date and time in ISO 8601 format (YYYY-MM-DDTHH:MM:SS)")
     card_last_4: Optional[str] = Field(None, description="Last 4 digits of card number")
     operator_raw: Optional[str] = Field(None, description="Raw operator/merchant name from receipt")
     transaction_type: str = Field(description="Transaction type: DEBIT, CREDIT, CONVERSION, or REVERSAL")
-    balance_after: Optional[float] = Field(None, description="Account balance after transaction")
+    balance_after: Optional[Decimal] = Field(None, ge=0, description="Account balance after transaction")
     receiver_name: Optional[str] = Field(None, description="Receiver name for P2P transfers (e.g., Иван Иванов)")
     receiver_card: Optional[str] = Field(None, description="Last 4 digits of receiver card for P2P transfers")
-    confidence: float = Field(description="Confidence score from 0.0 to 1.0")
+    confidence: float = Field(ge=0.0, le=1.0, description="Confidence score from 0.0 to 1.0")
 
     @field_validator("transaction_type", mode="before")
     @classmethod
     def _normalize_transaction_type(cls, value: Any) -> str:
         allowed = {"DEBIT", "CREDIT", "CONVERSION", "REVERSAL"}
         if not value:
-            return "DEBIT"
+            raise ValueError("transaction_type is required")
         token = str(value).strip().upper()
         if token in allowed:
             return token
@@ -43,37 +43,62 @@ class TransactionSchema(BaseModel):
             "EXCHANGE": "CONVERSION", "CONVERT": "CONVERSION",
             "CANCEL": "REVERSAL", "CANCELLED": "REVERSAL", "VOID": "REVERSAL",
         }
-        return synonyms.get(token, "DEBIT")
+        normalized = synonyms.get(token)
+        if normalized is None:
+            raise ValueError(f"Unsupported transaction type: {value!r}")
+        return normalized
 
-    @field_validator("amount", mode="before")
+    @field_validator("amount", "balance_after", mode="before")
     @classmethod
-    def _coerce_amount(cls, value: Any) -> float:
+    def _coerce_amount(cls, value: Any) -> Optional[Decimal]:
         """Accept '3,000,000.00' / '3 000 000,00' / '3.000.000' / numeric."""
         if value is None or value == "":
-            return 0.0
-        if isinstance(value, (int, float)):
-            return float(value)
-        s = str(value).strip()
-        # Strip currency suffix if present
-        s = re.sub(r"[A-Za-zА-Яа-я]+\s*$", "", s).strip()
-        # Remove thousands separators (space, comma when followed by 3 digits, dot when followed by 3 digits)
-        s = re.sub(r"\s+", "", s)
-        # If we have both `,` and `.`, assume the last one is decimal
-        if "," in s and "." in s:
-            if s.rfind(",") > s.rfind("."):
-                s = s.replace(".", "").replace(",", ".")
-            else:
-                s = s.replace(",", "")
-        elif "," in s:
-            # If 3-digit groups present, comma is thousands; else decimal
-            if re.search(r",\d{3}(?:\D|$)", s):
-                s = s.replace(",", "")
-            else:
-                s = s.replace(",", ".")
+            return None
+        if isinstance(value, bool):
+            raise ValueError("Boolean is not a monetary amount")
+        if isinstance(value, (int, float, Decimal)):
+            if Decimal(str(value)) < 0:
+                raise ValueError("Monetary amount cannot be negative")
+            return normalize_localized_decimal(value)
+        token = str(value).strip()
+        if re.match(r"^[\-−]", token):
+            raise ValueError("Monetary amount cannot be negative")
+        token = re.sub(
+            r"\s*(?:UZS|USD|EUR|RUB|KZT|GBP|CNY|СУМ|СЎМ|SUM)\s*$",
+            "",
+            token,
+            flags=re.IGNORECASE,
+        )
+        if re.search(r"[^0-9\s,.'’+]", token):
+            raise ValueError("Monetary amount contains unsupported characters")
+        return normalize_localized_decimal(token)
+
+    @field_validator("transaction_date_iso", mode="before")
+    @classmethod
+    def _validate_transaction_date(cls, value: Any) -> str:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("transaction_date_iso is required")
+        token = value.strip()
+        if not re.search(r"[T ]\d{2}:\d{2}", token):
+            raise ValueError("transaction_date_iso must include date and time")
         try:
-            return float(s)
-        except ValueError:
-            return 0.0
+            datetime.fromisoformat(token.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ValueError("transaction_date_iso must be valid ISO 8601") from exc
+        return token
+
+    @field_validator("card_last_4", "receiver_card", mode="before")
+    @classmethod
+    def _normalize_card_last_4(cls, value: Any) -> Optional[str]:
+        if value is None or value == "":
+            return None
+        token = str(value).strip()
+        if re.search(r"[^0-9*\s-]", token):
+            raise ValueError("Card field contains unsupported characters")
+        digits = re.sub(r"\D", "", token)
+        if len(digits) < 4:
+            raise ValueError("Card field must contain at least four digits")
+        return digits[-4:]
 
     @field_validator("currency", mode="before")
     @classmethod
@@ -89,21 +114,23 @@ class TransactionSchema(BaseModel):
             "DOLLAR": "USD", "ДОЛЛАР": "USD",
         }
         token = synonyms.get(token, token)
-        return token if token in allowed else "UZS"
+        if token not in allowed:
+            raise ValueError(f"Unsupported currency: {value!r}")
+        return token
 
 
 class ApplicationResolveSchema(BaseModel):
     """Structured output for application resolution"""
     application_name: str
     is_p2p: bool
-    confidence: float = 0.5
+    confidence: float = Field(default=0.5, ge=0.0, le=1.0)
     recommended_operator_name: Optional[str] = None
     reasoning: Optional[str] = None
 
 
 class ReceiptAiParser:
     """Parser using DeepSeek text completion for receipt extraction."""
-    
+
     def __init__(self, api_key: Optional[str] = None, timezone: str = "Asia/Tashkent", allow_without_api_key: bool = True):
         self.text_provider = get_text_ai_provider()
         self.text_enabled = bool(self.text_provider.enabled)
@@ -112,7 +139,8 @@ class ReceiptAiParser:
             raise ValueError("AI provider is required")
         self.enabled = self.text_enabled
         self.tz = pytz.timezone(timezone)
-        
+        self.last_error_kind: Optional[str] = None
+
         self.system_prompt = """You are a financial data analyst specialized in Uzbek payment systems.
 
 Your task is to analyze receipt text from Uzbek banks and payment systems (Uzcard, Humo, Click, Payme, etc.) and extract structured transaction data.
@@ -146,7 +174,7 @@ Return ONLY a JSON object with EXACTLY these keys (use null for unknown values, 
 - receiver_name (string|null)
 - receiver_card (string|null)
 - confidence (number 0..1, required)"""
-    
+
     def _mask_sensitive_text(self, text: str) -> str:
         """Mask long digit sequences to avoid leaking card/phone numbers."""
         if not text:
@@ -165,16 +193,8 @@ Return ONLY a JSON object with EXACTLY these keys (use null for unknown values, 
         masked = re.sub(r"\+?\d[\d -]{9,14}", mask_digits, masked)
         return masked
 
-    def _convert_schema(self, parsed: TransactionSchema) -> Dict[str, Any]:
-        if parsed.transaction_date_iso:
-            try:
-                transaction_date = datetime.fromisoformat(parsed.transaction_date_iso.replace('Z', '+00:00'))
-            except ValueError:
-                logger.warning("AI returned unparseable date %r; using now()", parsed.transaction_date_iso)
-                transaction_date = datetime.now(self.tz)
-        else:
-            logger.info("AI returned no transaction_date; using now() as fallback")
-            transaction_date = datetime.now(self.tz)
+    def _convert_schema(self, parsed: TransactionSchema, *, date_source: str = "receipt") -> Dict[str, Any]:
+        transaction_date = datetime.fromisoformat(parsed.transaction_date_iso.replace('Z', '+00:00'))
         if transaction_date.tzinfo is None:
             transaction_date = self.tz.localize(transaction_date)
         else:
@@ -183,25 +203,43 @@ Return ONLY a JSON object with EXACTLY these keys (use null for unknown values, 
         transaction_date = transaction_date.replace(tzinfo=None)
 
         return {
-            'amount': Decimal(str(parsed.amount)),
+            'amount': parsed.amount,
             'currency': parsed.currency,
             'transaction_type': parsed.transaction_type,
             'card_last_4': parsed.card_last_4,
             'operator_raw': parsed.operator_raw,
             'transaction_date': transaction_date,
-            'balance_after': Decimal(str(parsed.balance_after)) if parsed.balance_after else None,
+            'balance_after': parsed.balance_after if parsed.balance_after is not None else None,
             'receiver_name': parsed.receiver_name[:255] if parsed.receiver_name else None,
             'receiver_card': parsed.receiver_card if parsed.receiver_card else None,
             # Legacy DB enum retained for backward compatibility; user-facing UI treats this as generic AI parsing.
             'parsing_method': 'GPT',
-            'parsing_confidence': parsed.confidence
+            'parsing_confidence': parsed.confidence,
+            'date_source': date_source,
         }
 
-    def parse(self, text: str) -> Optional[Dict[str, Any]]:
+    @staticmethod
+    def _with_source_datetime(result: Any, fallback_datetime: Optional[datetime]) -> tuple[Any, str]:
+        """Use trusted ingestion time only when the receipt/AI has no date."""
+        if not isinstance(result, dict):
+            return result, "receipt"
+        if result.get("transaction_date_iso") not in (None, ""):
+            return result, "receipt"
+        if fallback_datetime is None:
+            return result, "receipt"
+        if not isinstance(fallback_datetime, datetime):
+            raise ValueError("fallback_datetime must be a datetime")
+        enriched = dict(result)
+        enriched["transaction_date_iso"] = fallback_datetime.isoformat()
+        return enriched, "source_received_at"
+
+    def parse(self, text: str, fallback_datetime: Optional[datetime] = None) -> Optional[Dict[str, Any]]:
         """Parse receipt text via the shared DeepSeek text provider."""
         if not self.text_enabled:
+            self.last_error_kind = "disabled"
             logger.info("AI text parsing skipped: DEEPSEEK_API_KEY not configured")
             return None
+        self.last_error_kind = None
         masked_text = self._mask_sensitive_text(text or "")
         base_messages = [
             {"role": "system", "content": self.system_prompt},
@@ -213,13 +251,18 @@ Return ONLY a JSON object with EXACTLY these keys (use null for unknown values, 
                 messages=base_messages,
                 temperature=0.1,
                 max_tokens=900,
+                retry_count=0,
+                timeout_seconds=25,
             )
+            result, date_source = self._with_source_datetime(result, fallback_datetime)
             parsed = TransactionSchema.model_validate(result)
-            return self._convert_schema(parsed)
+            self.last_error_kind = None
+            return self._convert_schema(parsed, date_source=date_source)
         except Exception as first_exc:  # noqa: BLE001
             from pydantic import ValidationError as _PydValidationError
 
             if not isinstance(first_exc, _PydValidationError):
+                self.last_error_kind = "transient"
                 logger.warning("AI text parsing error: %s", first_exc)
                 return None
             # One-shot retry with the validation error fed back to the model.
@@ -241,10 +284,17 @@ Return ONLY a JSON object with EXACTLY these keys (use null for unknown values, 
                     messages=retry_messages,
                     temperature=0.05,
                     max_tokens=900,
+                    retry_count=0,
+                    timeout_seconds=25,
                 )
+                result, date_source = self._with_source_datetime(result, fallback_datetime)
                 parsed = TransactionSchema.model_validate(result)
-                return self._convert_schema(parsed)
+                self.last_error_kind = None
+                return self._convert_schema(parsed, date_source=date_source)
             except Exception as second_exc:  # noqa: BLE001
+                self.last_error_kind = (
+                    "validation" if isinstance(second_exc, _PydValidationError) else "transient"
+                )
                 logger.warning(
                     "AI text parsing failed after retry: first=%s second=%s",
                     first_exc,
@@ -315,6 +365,8 @@ Return ONLY a JSON object with EXACTLY these keys (use null for unknown values, 
                 ],
                 temperature=0.15,
                 max_tokens=600,
+                retry_count=0,
+                timeout_seconds=15,
             )
             parsed = ApplicationResolveSchema.model_validate(result)
 

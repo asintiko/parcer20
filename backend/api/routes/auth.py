@@ -20,7 +20,11 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from api.dependencies import get_current_app_user, get_current_user as resolve_current_user
+from api.dependencies import (
+    get_current_app_user,
+    get_current_user as resolve_current_user,
+    require_session_active,
+)
 from database.connection import get_db_session
 from database.models import User
 from services.access_control_service import create_scope_token_from_values, write_audit_log
@@ -39,7 +43,7 @@ from services.user_service import authenticate, build_permissions_snapshot
 from api.dependencies import get_effective_folder_scope_for_user
 from services.totp_service import verify_2fa_code
 from services.system_settings_service import is_totp_2fa_enabled
-from services.auth_bot_service import get_redis, is_session_revoked, register_active_session, revoke_active_session, touch_active_session
+from services.auth_bot_service import get_redis, register_active_session, revoke_active_session
 
 router = APIRouter(prefix="/api/auth", tags=["authentication"])
 logger = logging.getLogger(__name__)
@@ -376,6 +380,66 @@ async def _store_access_token_compat(user_id: int, token: str) -> None:
         logger.debug("Failed to store compatibility access token for user_id=%s", user_id, exc_info=True)
 
 
+async def _register_refresh_backed_app_session(
+    *,
+    refresh_token: str,
+    expected_sid: str,
+    user: User,
+    ip_address: str,
+) -> str:
+    """Register an app session for the full lifetime of its refresh token."""
+    refresh_claims = verify_jwt_token(refresh_token) or {}
+    refresh_sid = str(refresh_claims.get("sid") or "").strip()
+    if (
+        str(refresh_claims.get("kind") or "") != "refresh_token"
+        or not refresh_claims.get("exp")
+        or not refresh_sid
+        or refresh_sid != expected_sid
+    ):
+        raise HTTPException(status_code=503, detail="session_registration_failed")
+
+    registered_sid = await register_active_session(
+        token_payload=refresh_claims,
+        token_kind="app_user",
+        user_id=int(user.id),
+        ip_address=ip_address,
+        subject=user.username,
+    )
+    if registered_sid != expected_sid:
+        raise HTTPException(status_code=503, detail="session_registration_failed")
+    return registered_sid
+
+
+async def _acquire_refresh_rotation_lock(jti: str) -> tuple[str, str]:
+    if not jti:
+        raise HTTPException(status_code=401, detail="invalid_refresh_token")
+    key = f"auth:refresh:rotate-lock:{jti}"
+    owner = secrets.token_urlsafe(24)
+    try:
+        redis = await get_redis()
+        acquired = await redis.set(key, owner, nx=True, ex=30)
+    except Exception as exc:
+        logger.error("Refresh rotation lock store unavailable: %s", exc)
+        raise HTTPException(status_code=503, detail="session_store_unavailable") from exc
+    if not acquired:
+        raise HTTPException(status_code=401, detail="refresh_token_reused")
+    return key, owner
+
+
+async def _release_refresh_rotation_lock(key: str, owner: str) -> None:
+    try:
+        redis = await get_redis()
+        await redis.eval(
+            "if redis.call('get', KEYS[1]) == ARGV[1] then "
+            "return redis.call('del', KEYS[1]) else return 0 end",
+            1,
+            key,
+            owner,
+        )
+    except Exception:
+        logger.warning("Failed to release refresh rotation lock key=%s", key, exc_info=True)
+
+
 async def _issue_login_success(
     *,
     db: Session,
@@ -397,18 +461,8 @@ async def _issue_login_success(
     )
     decoded_access = verify_jwt_token(token) or {}
     sid = str(decoded_access.get("sid") or "")
-    if sid:
-        try:
-            await register_active_session(
-                token_payload=decoded_access,
-                token_kind="app_user",
-                user_id=int(user.id),
-                ip_address=_request_ip(request),
-                subject=user.username,
-            )
-            await touch_active_session(sid)
-        except Exception:
-            logger.debug("Failed to register/touch active session sid=%s", sid, exc_info=True)
+    if not sid:
+        raise HTTPException(status_code=503, detail="session_registration_failed")
 
     refresh_payload = await create_refresh_token(
         user_id=int(user.id),
@@ -419,6 +473,12 @@ async def _issue_login_success(
         ttl_days=refresh_ttl_days,
     )
     refresh_token = str(refresh_payload.get("token") or "")
+    await _register_refresh_backed_app_session(
+        refresh_token=refresh_token,
+        expected_sid=sid,
+        user=user,
+        ip_address=_request_ip(request),
+    )
     if refresh_token:
         _set_refresh_cookie(response, refresh_token, max_age_seconds=refresh_ttl_days * 24 * 3600)
 
@@ -653,13 +713,7 @@ async def refresh_auth_token(
     incoming_refresh = verify_jwt_token(refresh_token) or {}
     if str(incoming_refresh.get("kind") or "") != "refresh_token":
         raise HTTPException(status_code=401, detail="invalid_refresh_token")
-    incoming_sid = str(incoming_refresh.get("sid") or "").strip()
-    if incoming_sid and is_session_revoked(incoming_sid):
-        try:
-            await revoke_refresh_family(incoming_refresh.get("family_id"))
-        except Exception:
-            logger.debug("Failed to revoke refresh family for revoked sid=%s", incoming_sid, exc_info=True)
-        raise HTTPException(status_code=401, detail="session_revoked")
+    await require_session_active(incoming_refresh)
     user_id = int(incoming_refresh.get("user_id") or incoming_refresh.get("sub") or 0)
     user = db.get(User, user_id)
     if not user or not user.is_active:
@@ -679,7 +733,11 @@ async def refresh_auth_token(
         raise HTTPException(status_code=401, detail="permissions_outdated")
 
     refresh_ttl_days = _normalize_session_ttl_days(user) + 7
-    rotated = await rotate_refresh_token(refresh_token, ttl_days=refresh_ttl_days)
+    lock_key, lock_owner = await _acquire_refresh_rotation_lock(str(incoming_refresh.get("jti") or ""))
+    try:
+        rotated = await rotate_refresh_token(refresh_token, ttl_days=refresh_ttl_days)
+    finally:
+        await _release_refresh_rotation_lock(lock_key, lock_owner)
     if not rotated:
         raise HTTPException(status_code=401, detail="invalid_refresh_token")
 
@@ -697,23 +755,20 @@ async def refresh_auth_token(
         sid=access_sid or None,
         ttl_minutes=access_ttl_minutes,
     )
+    decoded_access = verify_jwt_token(token) or {}
+    access_token_sid = str(decoded_access.get("sid") or "")
+    if not access_token_sid:
+        raise HTTPException(status_code=503, detail="session_registration_failed")
+    await _register_refresh_backed_app_session(
+        refresh_token=refresh_jwt,
+        expected_sid=access_token_sid,
+        user=user,
+        ip_address=_request_ip(request),
+    )
     await _store_access_token_compat(int(user.id), token)
     if refresh_jwt:
         _set_refresh_cookie(response, refresh_jwt, max_age_seconds=refresh_ttl_days * 24 * 3600)
     snapshot = build_permissions_snapshot(user)
-
-    try:
-        decoded_access = verify_jwt_token(token) or {}
-        await register_active_session(
-            token_payload=decoded_access,
-            token_kind="app_user",
-            user_id=int(user.id),
-            ip_address=_request_ip(request),
-            subject=user.username,
-        )
-        await touch_active_session(str(decoded_access.get("sid") or ""))
-    except Exception:
-        logger.debug("Failed to register/touch active session during refresh", exc_info=True)
     _safe_audit_log(
         db,
         action="token_refreshed",
@@ -846,6 +901,17 @@ async def confirm_qr_login(
     if not user:
         raise HTTPException(status_code=403, detail="No user linked to this Telegram account")
 
+    if _requires_2fa(user, db):
+        _safe_audit_log(
+            db,
+            action="qr_login_2fa_required",
+            success=False,
+            user_id=int(user.id),
+            ip_address=data.get("ip", "unknown"),
+            details={"telegram_id": telegram_id},
+        )
+        raise HTTPException(status_code=403, detail="qr_login_requires_2fa")
+
     # Issue tokens
     snapshot = build_permissions_snapshot(user)
     token = create_app_user_token(
@@ -857,17 +923,8 @@ async def confirm_qr_login(
     )
     decoded_access = verify_jwt_token(token) or {}
     sid = str(decoded_access.get("sid") or "")
-    if sid:
-        try:
-            await register_active_session(
-                token_payload=decoded_access,
-                token_kind="qr_login",
-                user_id=int(user.id),
-                ip_address=_request_ip(request),
-                subject=user.username,
-            )
-        except Exception:
-            logger.debug("Failed to register QR active session sid=%s", sid, exc_info=True)
+    if not sid:
+        raise HTTPException(status_code=503, detail="session_registration_failed")
 
     refresh_payload = await create_refresh_token(
         user_id=int(user.id),
@@ -878,6 +935,12 @@ async def confirm_qr_login(
         ttl_days=_normalize_session_ttl_days(user) + 7,
     )
     refresh_token = str(refresh_payload.get("token") or "")
+    await _register_refresh_backed_app_session(
+        refresh_token=refresh_token,
+        expected_sid=sid,
+        user=user,
+        ip_address=_request_ip(request),
+    )
     if refresh_token:
         _set_refresh_cookie(
             response,

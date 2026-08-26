@@ -48,8 +48,6 @@ def _inject_allowed_chat_ids(
             chat_ids.append(int(item))
         except (TypeError, ValueError):
             continue
-    if not chat_ids:
-        return scope
     enriched = dict(scope) if isinstance(scope, dict) else {}
     enriched["allowed_chat_ids"] = sorted(set(chat_ids))
     return enriched
@@ -72,6 +70,10 @@ SYSTEM_PROMPT_NATIVE = (
     "- 'Экспорт ...' — `export_transactions`.\n"
     "- 'Сбрось фильтры' — `clear_filters_with_cursor`.\n"
     "- 'Перемотай / открой / покажи #N' — `scroll_to_transaction` / `open_transaction_details`.\n"
+    "- 'Сопоставь приложения / размечай операторов' — `app_mapping` (уверенные применит сам). "
+    "'Проверь данные / найди ошибки в полях' — `data_verification`. 'Сверь чеки / что не попало в "
+    "базу' — `bot_reconciliation`. Эти инструменты сами отдают результат и шаги в чат, никуда не "
+    "переходи. 'Откати / верни как было' — `rollback_automation`.\n"
     "- Если просят 'проверь чат X / найди ошибки в чате X' — `chat_vs_db_reconcile`.\n"
     "- 'Найди дубликаты' — `find_duplicate_transactions`.\n"
     "- 'Найди без маппинга / без оператора' — `find_orphan_transactions`.\n"
@@ -88,6 +90,17 @@ SYSTEM_PROMPT_NATIVE = (
     "данных достаточно, отвечай текстом.\n"
     "- Если пользователь спрашивает про данные, на которые у инструментов нет фильтра — "
     "объясни ограничение текстом, не подменяй параметрами.\n"
+    "\nГрафика: когда уместно (аналитика, сравнение, распределение, прогресс), рисуй компактную "
+    "inline-SVG диаграмму прямо в ответе (бар/линия/донат). Разрешены ТОЛЬКО теги svg, path, g, "
+    "rect, circle, line, polyline, polygon, ellipse, text, tspan, defs, linearGradient, "
+    "radialGradient, stop и атрибуты viewBox, d, fill, stroke, stroke-width, x, y, cx, cy, r, "
+    "width, height, transform, opacity, points, text-anchor, font-size. Запрещены script, style, "
+    "foreignObject и любые on*-атрибуты. Размер задавай через viewBox, цвета — простой hex или "
+    "currentColor. Пример бар-чарта:\n"
+    "<svg viewBox=\"0 0 200 100\"><rect x=\"10\" y=\"40\" width=\"30\" height=\"60\" fill=\"currentColor\"/>"
+    "<rect x=\"50\" y=\"20\" width=\"30\" height=\"80\" fill=\"currentColor\"/>"
+    "<rect x=\"90\" y=\"60\" width=\"30\" height=\"40\" fill=\"currentColor\"/>"
+    "<text x=\"25\" y=\"98\" text-anchor=\"middle\" font-size=\"8\">A</text></svg>\n"
 )
 
 
@@ -102,8 +115,50 @@ class AgentOrchestrator:
         self.provider = get_text_ai_provider()
 
     @staticmethod
+    def _safe_tool_args(arguments: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """Compact, non-sensitive snapshot of tool arguments for run events.
+
+        Drops internal/private keys, coerces values to short strings so the
+        frontend can show "что/зачем" without leaking raw text or large blobs.
+        """
+        if not isinstance(arguments, dict):
+            return {}
+        out: Dict[str, Any] = {}
+        for key, value in arguments.items():
+            if not isinstance(key, str) or key.startswith("_"):
+                continue
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                if isinstance(value, str) and len(value) > 120:
+                    out[key] = value[:120] + "…"
+                else:
+                    out[key] = value
+            elif isinstance(value, (list, tuple)):
+                out[key] = f"[{len(value)} items]"
+            elif isinstance(value, dict):
+                out[key] = f"{{{len(value)} keys}}"
+            else:
+                out[key] = str(value)[:120]
+            if len(out) >= 8:
+                break
+        return out
+
+    @staticmethod
     def _tool_progress_label(tool_name: str, progress: Dict[str, Any]) -> str:
         step = str(progress.get("step") or "").strip().lower()
+        # Automation tools emit a human-readable `stage`/`description` per poll.
+        stage = progress.get("stage") or progress.get("description")
+        if isinstance(stage, str) and stage.strip():
+            return stage.strip()[:255]
+        if tool_name == "app_mapping":
+            return "Сопоставляю операторов"
+        if tool_name in {"apply_mapping_suggestions", "apply_verification_suggestions"}:
+            return "Применяю предложения"
+        if tool_name == "data_verification":
+            return "Проверяю транзакции"
+        if tool_name in {"bot_reconciliation", "auto_parse_reconciliation"}:
+            return "Сверяю с Telegram"
+        if tool_name == "rollback_automation":
+            return "Откатываю изменения"
         if tool_name == "transaction_analytics":
             return "Считаю итог за период"
         if tool_name == "report_builder":
@@ -120,6 +175,18 @@ class AgentOrchestrator:
             return "Ищу ошибки"
         if tool_name in {"duplicate_merge_preview", "receipt_reparse_preview"}:
             return "Готовлю действия"
+        if tool_name == "auto_describe_operators":
+            if step == "web_search":
+                return f"🌐 Читаю в интернете: {progress.get('operator', '')}".strip()
+            if step == "done":
+                return "Готово"
+            return "Описываю операторов"
+        if tool_name == "set_operator_description":
+            return "Записываю описание"
+        if tool_name == "list_operator_descriptions":
+            return "Показываю описания"
+        if tool_name == "rollback_operator_descriptions":
+            return "Откатываю описания"
         if step == "planning":
             return "Понимаю запрос"
         return "Проверяю данные"
@@ -376,7 +443,7 @@ class AgentOrchestrator:
                         create_run_event(
                             db,
                             run_id=run_id,
-                            event_type="failed",
+                            event_type="tool_failed",
                             label=f"Невалидные аргументы для {tool_name}",
                             status="failed",
                             payload={"tool_name": tool_name, "error": validation_error[:1000]},
@@ -408,6 +475,7 @@ class AgentOrchestrator:
                     },
                 }
 
+                safe_args = self._safe_tool_args(validated)
                 if run_id is not None:
                     create_run_event(
                         db,
@@ -415,7 +483,13 @@ class AgentOrchestrator:
                         event_type="tool_selected",
                         label=f"Выбран инструмент: {tool_name}",
                         status="completed",
-                        payload={"tool_name": tool_name, "arguments": validated},
+                        payload={
+                            "tool_name": tool_name,
+                            "arguments": safe_args,
+                            "step": "tool_execution",
+                            "current": total_tool_calls,
+                            "total": max_calls,
+                        },
                     )
                     update_run(
                         db,
@@ -425,6 +499,8 @@ class AgentOrchestrator:
                             "step": "tool_execution",
                             "percent": min(95, 10 + total_tool_calls * 20),
                             "tool_name": tool_name,
+                            "current": total_tool_calls,
+                            "total": max_calls,
                         },
                     )
                     create_run_event(
@@ -433,35 +509,57 @@ class AgentOrchestrator:
                         event_type="tool_started",
                         label=self._tool_progress_label(tool_name, {"step": "tool_execution"}),
                         status="running",
-                        payload={"tool_name": tool_name},
+                        payload={
+                            "tool_name": tool_name,
+                            "arguments": safe_args,
+                            "step": "tool_execution",
+                            "current": total_tool_calls,
+                            "total": max_calls,
+                        },
                     )
 
                 base_percent = min(95, 10 + total_tool_calls * 20)
 
                 def progress_callback(
-                    progress: Dict[str, Any], _name: str = tool_name, _base: int = base_percent
+                    progress: Dict[str, Any],
+                    _name: str = tool_name,
+                    _base: int = base_percent,
+                    _current: int = total_tool_calls,
+                    _total: int = max_calls,
                 ) -> None:
                     if run_id is None:
                         return
-                    percent = self._progress_percent(progress, _base)
-                    update_run(
-                        db,
-                        run_id=run_id,
-                        status="processing",
-                        progress={
-                            "step": progress.get("step") or "tool_execution",
-                            "percent": percent,
-                            "tool_name": _name,
-                        },
-                    )
-                    create_run_event(
-                        db,
-                        run_id=run_id,
-                        event_type="tool_progress",
-                        label=self._tool_progress_label(_name, progress),
-                        status=self._run_event_status(progress),
-                        payload={"tool_name": _name, **progress},
-                    )
+                    # Telemetry must never crash the tool it instruments — a failed
+                    # progress write should not abort an otherwise-healthy run.
+                    try:
+                        percent = self._progress_percent(progress, _base)
+                        update_run(
+                            db,
+                            run_id=run_id,
+                            status="processing",
+                            progress={
+                                "step": progress.get("step") or "tool_execution",
+                                "percent": percent,
+                                "tool_name": _name,
+                                "current": _current,
+                                "total": _total,
+                            },
+                        )
+                        create_run_event(
+                            db,
+                            run_id=run_id,
+                            event_type="tool_progress",
+                            label=self._tool_progress_label(_name, progress),
+                            status=self._run_event_status(progress),
+                            payload={
+                                "tool_name": _name,
+                                "current": _current,
+                                "total": _total,
+                                **progress,
+                            },
+                        )
+                    except Exception:  # noqa: BLE001
+                        logger.debug("progress telemetry write failed", exc_info=True)
 
                 try:
                     result = await execute_tool(
@@ -506,7 +604,13 @@ class AgentOrchestrator:
                         event_type="tool_finished",
                         label="Готово",
                         status="completed",
-                        payload={"tool_name": tool_name, "summary": result.get("summary")},
+                        payload={
+                            "tool_name": tool_name,
+                            "summary": result.get("summary"),
+                            "step": "tool_execution",
+                            "current": total_tool_calls,
+                            "total": max_calls,
+                        },
                     )
 
                 messages.append(
@@ -660,25 +764,28 @@ class AgentOrchestrator:
         )
 
         def progress_callback(progress: Dict[str, Any]) -> None:
-            percent = self._progress_percent(progress, 30)
-            update_run(
-                db,
-                run_id=run_id,
-                status="processing",
-                progress={
-                    "step": progress.get("step") or "tool_execution",
-                    "percent": percent,
-                    "tool_name": tool_name,
-                },
-            )
-            create_run_event(
-                db,
-                run_id=run_id,
-                event_type="tool_progress",
-                label=self._tool_progress_label(tool_name, progress),
-                status=self._run_event_status(progress),
-                payload={"tool_name": tool_name, **progress},
-            )
+            try:
+                percent = self._progress_percent(progress, 30)
+                update_run(
+                    db,
+                    run_id=run_id,
+                    status="processing",
+                    progress={
+                        "step": progress.get("step") or "tool_execution",
+                        "percent": percent,
+                        "tool_name": tool_name,
+                    },
+                )
+                create_run_event(
+                    db,
+                    run_id=run_id,
+                    event_type="tool_progress",
+                    label=self._tool_progress_label(tool_name, progress),
+                    status=self._run_event_status(progress),
+                    payload={"tool_name": tool_name, **progress},
+                )
+            except Exception:  # noqa: BLE001
+                logger.debug("progress telemetry write failed", exc_info=True)
 
         try:
             result = await execute_tool(

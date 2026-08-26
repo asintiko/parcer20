@@ -1,6 +1,8 @@
 import React from 'react';
 import { motion, AnimatePresence, type Variants } from 'motion/react';
 import { X } from 'lucide-react';
+import { useRegisterOverlay } from '../../utils/overlayStore';
+import { useModalFocus } from '../../hooks/useModalFocus';
 
 /**
  * Right-side editorial drawer / sheet primitive.
@@ -44,22 +46,11 @@ export const Sheet: React.FC<SheetProps> = ({
     width = 480,
     ariaLabel,
 }) => {
-    React.useEffect(() => {
-        if (!open) return;
-        const onKey = (e: KeyboardEvent) => {
-            if (e.key === 'Escape') {
-                e.preventDefault();
-                onClose();
-            }
-        };
-        window.addEventListener('keydown', onKey);
-        const prev = document.body.style.overflow;
-        document.body.style.overflow = 'hidden';
-        return () => {
-            window.removeEventListener('keydown', onKey);
-            document.body.style.overflow = prev;
-        };
-    }, [open, onClose]);
+    const sheetRef = React.useRef<HTMLElement>(null);
+    const titleId = React.useId();
+    const subtitleId = React.useId();
+    useRegisterOverlay(open);
+    useModalFocus(open, sheetRef, onClose);
 
     return (
         <AnimatePresence>
@@ -75,10 +66,14 @@ export const Sheet: React.FC<SheetProps> = ({
                         aria-hidden
                     />
                     <motion.aside
+                        ref={sheetRef}
                         className="sp-shell sp-sheet"
                         role="dialog"
                         aria-modal="true"
                         aria-label={ariaLabel}
+                        aria-labelledby={ariaLabel ? undefined : titleId}
+                        aria-describedby={subtitle ? subtitleId : undefined}
+                        tabIndex={-1}
                         variants={panelVariants}
                         initial="hidden"
                         animate="visible"
@@ -88,11 +83,11 @@ export const Sheet: React.FC<SheetProps> = ({
                         <div className="sp-sheet-head">
                             <div style={{ minWidth: 0 }}>
                                 {typeof title === 'string' ? (
-                                    <h3 className="sp-sheet-title">{title}</h3>
+                                    <h3 id={titleId} className="sp-sheet-title">{title}</h3>
                                 ) : (
-                                    title
+                                    <div id={titleId}>{title}</div>
                                 )}
-                                {subtitle ? <div className="sp-sheet-sub">{subtitle}</div> : null}
+                                {subtitle ? <div id={subtitleId} className="sp-sheet-sub">{subtitle}</div> : null}
                             </div>
                             <button
                                 type="button"

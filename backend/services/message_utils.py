@@ -6,8 +6,10 @@ reused by the reconciliation agent and other services.
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Set
+from zoneinfo import ZoneInfo
 
 
 # ── Receipt detection constants ──────────────────────────────────────────────
@@ -77,6 +79,81 @@ RECEIPT_EMOJI: Set[str] = {
     "🟢",
 }
 MIN_RECEIPT_TEXT_LEN: int = 20
+DEFAULT_METADATA_ONLY_CHAT_IDS: Set[int] = set()
+ALWAYS_PROCESS_CHAT_IDS = {-1003547724919}
+TASHKENT_TZ = ZoneInfo("Asia/Tashkent")
+
+
+def receipt_min_datetime(now: Optional[datetime] = None) -> datetime:
+    """Oldest receipt/source datetime accepted by Telegram ingestion.
+
+    The default rolls forward automatically on January 1. Operators may pin an
+    explicit ISO date with ``RECEIPT_MIN_DATE`` when a controlled backfill is
+    required.
+    """
+    configured = os.getenv("RECEIPT_MIN_DATE", "").strip()
+    if configured:
+        try:
+            parsed = datetime.fromisoformat(configured.replace("Z", "+00:00"))
+        except ValueError:
+            parsed = None
+        if parsed is not None:
+            if parsed.tzinfo is not None:
+                parsed = parsed.astimezone(TASHKENT_TZ).replace(tzinfo=None)
+            return parsed
+
+    current = now or datetime.now(TASHKENT_TZ)
+    if current.tzinfo is not None:
+        current = current.astimezone(TASHKENT_TZ)
+    return datetime(current.year, 1, 1)
+
+
+def parse_message_datetime(value: Any) -> Optional[datetime]:
+    """Normalize a TDLib timestamp/ISO datetime to naive Asia/Tashkent time."""
+    if value in (None, ""):
+        return None
+    try:
+        if isinstance(value, (int, float)) or (
+            isinstance(value, str) and value.strip().isdigit()
+        ):
+            return (
+                datetime.fromtimestamp(float(value), tz=timezone.utc)
+                .astimezone(TASHKENT_TZ)
+                .replace(tzinfo=None)
+            )
+        if isinstance(value, datetime):
+            parsed = value
+        else:
+            parsed = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
+        if parsed.tzinfo is not None:
+            parsed = parsed.astimezone(TASHKENT_TZ).replace(tzinfo=None)
+        return parsed
+    except (TypeError, ValueError, OSError, OverflowError):
+        return None
+
+
+def is_receipt_datetime_allowed(value: Any) -> bool:
+    parsed = parse_message_datetime(value)
+    return parsed is not None and parsed >= receipt_min_datetime()
+
+
+def metadata_only_chat_ids() -> Set[int]:
+    raw = os.getenv("TG_METADATA_ONLY_CHAT_IDS", "")
+    result = set(DEFAULT_METADATA_ONLY_CHAT_IDS)
+    for token in raw.split(","):
+        try:
+            result.add(int(token.strip()))
+        except (TypeError, ValueError):
+            continue
+    result.difference_update(ALWAYS_PROCESS_CHAT_IDS)
+    return result
+
+
+def is_metadata_only_chat(chat_id: Any) -> bool:
+    try:
+        return int(chat_id) in metadata_only_chat_ids()
+    except (TypeError, ValueError):
+        return False
 
 
 # ── Receipt heuristic ────────────────────────────────────────────────────────
@@ -109,13 +186,81 @@ def looks_like_receipt(text: str, raw_json: str) -> bool:
     return any(kw in text_lower for kw in RECEIPT_KEYWORDS_LOWER)
 
 
+# ── Reply markup (inline keyboards / mini-app buttons) ───────────────────────
+
+_INLINE_BUTTON_TYPE_MAP: Dict[str, str] = {
+    "inlineKeyboardButtonTypeWebApp": "web_app",
+    "inlineKeyboardButtonTypeUrl": "url",
+    "inlineKeyboardButtonTypeLoginUrl": "login_url",
+    "inlineKeyboardButtonTypeCallback": "callback",
+    "inlineKeyboardButtonTypeCallbackWithPassword": "callback",
+    "inlineKeyboardButtonTypeCallbackGame": "callback",
+    "inlineKeyboardButtonTypeSwitchInline": "switch_inline",
+    "inlineKeyboardButtonTypeBuy": "buy",
+    "inlineKeyboardButtonTypeCopyText": "copy_text",
+}
+
+_KEYBOARD_BUTTON_TYPE_MAP: Dict[str, str] = {
+    "keyboardButtonTypeWebApp": "web_app",
+}
+
+
+def _parse_reply_markup(rm: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Convert a raw TDLib ``ReplyMarkup`` object into the shared contract shape.
+
+    Returns ``None`` when *rm* is falsy or not an inline/reply keyboard
+    (``replyMarkupRemoveKeyboard``, ``replyMarkupForceReply``, etc. are ignored).
+    """
+    if not rm:
+        return None
+    rm_type = rm.get("@type")
+
+    if rm_type == "replyMarkupInlineKeyboard":
+        rows = []
+        for raw_row in rm.get("rows") or []:
+            out_row = []
+            for button in raw_row or []:
+                btn_type = (button.get("type") or {}).get("@type", "")
+                kind = _INLINE_BUTTON_TYPE_MAP.get(btn_type, "other")
+                url = None
+                if kind in ("web_app", "url", "login_url"):
+                    url = (button.get("type") or {}).get("url")
+                out_row.append({
+                    "text": button.get("text"),
+                    "type": kind,
+                    "url": url,
+                })
+            rows.append(out_row)
+        return {"kind": "inline", "rows": rows}
+
+    if rm_type == "replyMarkupShowKeyboard":
+        rows = []
+        for raw_row in rm.get("rows") or []:
+            out_row = []
+            for button in raw_row or []:
+                btn_type = (button.get("type") or {}).get("@type", "")
+                kind = _KEYBOARD_BUTTON_TYPE_MAP.get(btn_type, "other")
+                url = None
+                if kind == "web_app":
+                    url = (button.get("type") or {}).get("url")
+                out_row.append({
+                    "text": button.get("text"),
+                    "type": kind,
+                    "url": url,
+                })
+            rows.append(out_row)
+        return {"kind": "keyboard", "rows": rows}
+
+    return None
+
+
 # ── TDLib message formatting ─────────────────────────────────────────────────
 
 def format_tdlib_message(data: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     """Convert raw TDLib message dict into a flat ChatMessage-like dict.
 
     Returns a dict with keys: id, date, is_outgoing, sender_id, text,
-    document, photo.  Returns ``None`` when *data* is falsy.
+    document, photo, reply_markup.  Returns ``None`` when *data* is falsy.
     """
     if not data:
         return None
@@ -191,6 +336,7 @@ def format_tdlib_message(data: Optional[Dict[str, Any]]) -> Optional[Dict[str, A
         "text": text,
         "document": document,
         "photo": photo,
+        "reply_markup": _parse_reply_markup(data.get("reply_markup")),
     }
 
 
@@ -207,6 +353,7 @@ def build_task_data_from_message(
         "source_type": "AUTO",
         "source_chat_id": chat_id,
         "source_message_id": message_id,
+        "source_received_at": message.get("date"),
         "raw_text": raw_text,
         "added_via": "tdlib",
     }

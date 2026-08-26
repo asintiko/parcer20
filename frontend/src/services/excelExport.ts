@@ -1,4 +1,4 @@
-import ExcelJS from 'exceljs';
+import type ExcelJS from 'exceljs';
 import { AccessScope, Transaction, securityApi } from './api';
 import { formatDate, formatTime, formatDateTime } from '../utils/dateTimeFormatters';
 
@@ -227,7 +227,10 @@ export const exportTransactionsToExcel = async (options: ExportOptions) => {
         // Export should still work if lock metadata endpoint is temporarily unavailable.
     }
 
-    const workbook = new ExcelJS.Workbook();
+    // Pulled in on demand so the ~900KB exceljs bundle never lands in the
+    // startup chunk — only when a user actually triggers an export.
+    const { default: ExcelJSModule } = await import('exceljs');
+    const workbook = new ExcelJSModule.Workbook();
     const sheet = workbook.addWorksheet('Транзакции', {
         properties: { defaultRowHeight: 15 },
         pageSetup: { fitToPage: true },

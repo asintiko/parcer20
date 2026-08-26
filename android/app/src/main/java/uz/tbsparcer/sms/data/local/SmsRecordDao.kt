@@ -88,9 +88,15 @@ interface SmsRecordDao {
     @Query(
         """UPDATE sms_records SET syncStatus = 'pending', retryCount = 0, errorMessage = NULL
               WHERE receivedAt BETWEEN :from AND :to
-              AND syncStatus IN ('synced','duplicate','skipped','error','failed')"""
+              AND syncStatus IN ('synced','duplicate','skipped','error','failed','auth_error')"""
     )
     suspend fun requeueRange(from: Long, to: Long): Int
+
+    @Query(
+        """UPDATE sms_records SET syncStatus = 'pending', retryCount = 0, errorMessage = NULL
+              WHERE syncStatus = 'auth_error'"""
+    )
+    suspend fun requeueAuthErrors(): Int
 
     @Query(
         "DELETE FROM sms_records WHERE syncStatus IN ('synced','duplicate','skipped') " +

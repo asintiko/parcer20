@@ -101,10 +101,10 @@ export function ScopeGuard({ children, action = 'sources' }: ScopeGuardProps) {
             setOtpScopeId(null);
             setOtpExpiresAt(null);
             setOtpSecondsLeft(0);
-            await Promise.all([
-                queryClient.invalidateQueries({ queryKey: ['security-status'] }),
-                queryClient.invalidateQueries({ queryKey: ['security-scopes'] }),
-            ]);
+            // Access is gated solely by status.current_scope; once it reports the
+            // granted scope the guard unmounts to children, so re-fetching the
+            // scopes list here would be wasted work.
+            await queryClient.invalidateQueries({ queryKey: ['security-status'] });
         },
     });
 

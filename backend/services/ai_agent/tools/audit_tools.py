@@ -51,9 +51,9 @@ def _parse_dt(value: Any) -> Optional[datetime]:
 def _scope_chat_ids(scope: Optional[dict]) -> Optional[List[int]]:
     if not scope or not isinstance(scope, dict):
         return None
-    chats = scope.get("allowed_chat_ids")
-    if not chats:
+    if "allowed_chat_ids" not in scope:
         return None
+    chats = scope.get("allowed_chat_ids") or []
     try:
         return [int(c) for c in chats]
     except Exception:  # noqa: BLE001
@@ -80,12 +80,9 @@ async def find_duplicate_transactions(db: Session, current_user: Dict[str, Any],
         Transaction.amount.isnot(None),
     )
     chat_ids = _scope_chat_ids(scope)
-    if chat_ids:
+    if chat_ids is not None:
         q = q.filter(
-            or_(
-                Transaction.source_chat_id.in_(chat_ids),
-                Transaction.source_chat_id.is_(None),
-            )
+            Transaction.source_chat_id.in_(chat_ids)
         )
     q = (
         q.group_by(
@@ -152,12 +149,9 @@ async def find_orphan_transactions(db: Session, current_user: Dict[str, Any], sc
         ),
     )
     chat_ids = _scope_chat_ids(scope)
-    if chat_ids:
+    if chat_ids is not None:
         q = q.filter(
-            or_(
-                Transaction.source_chat_id.in_(chat_ids),
-                Transaction.source_chat_id.is_(None),
-            )
+            Transaction.source_chat_id.in_(chat_ids)
         )
     q = q.order_by(Transaction.transaction_date.desc()).limit(int(arguments.get("limit") or 100))
 
@@ -192,6 +186,190 @@ async def find_orphan_transactions(db: Session, current_user: Dict[str, Any], sc
     )
 
 
+def _norm_amount(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    try:
+        return str(Decimal(str(value)).quantize(Decimal("0.01")))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _resolve_source_text(db: Session, tx: Transaction) -> Optional[str]:
+    """Prefer transactions.raw_message; fall back to cached tg_chat_messages."""
+    raw = (getattr(tx, "raw_message", None) or "").strip()
+    if raw:
+        return raw
+    chat_id = getattr(tx, "source_chat_id", None)
+    message_id = getattr(tx, "source_message_id", None)
+    if chat_id is None or message_id is None:
+        return None
+    try:
+        from database.models import TgChatMessage  # type: ignore
+
+        row = (
+            db.query(TgChatMessage)
+            .filter(
+                TgChatMessage.chat_id == int(chat_id),
+                TgChatMessage.message_id == int(message_id),
+            )
+            .first()
+        )
+    except Exception:  # noqa: BLE001
+        return None
+    if row is None:
+        return None
+    text = (getattr(row, "text", None) or "").strip()
+    return text or None
+
+
+async def verify_receipt_parse(db: Session, current_user: Dict[str, Any], scope: Optional[dict], arguments: Dict[str, Any]) -> Dict[str, Any]:
+    """Re-parse the source receipt text of a transaction and flag mismatches.
+
+    Deterministic verification only: re-runs the regex cascade (no DeepSeek/OCR)
+    on the stored source text and diffs the result against the saved fields.
+    Read-only — never mutates DB state.
+    """
+    tx_id_arg = arguments.get("transaction_id")
+    if tx_id_arg is None:
+        return _ok(
+            "Не указан transaction_id",
+            assistant_message="Чтобы сверить распознавание, укажите transaction_id.",
+        )
+    try:
+        tx_id = int(tx_id_arg)
+    except (TypeError, ValueError):
+        return _ok(
+            "Некорректный transaction_id",
+            assistant_message=f"transaction_id должен быть числом, получено: {tx_id_arg!r}.",
+        )
+
+    tx = db.query(Transaction).filter(Transaction.id == tx_id).first()
+    if tx is None:
+        return _ok(
+            f"Транзакция #{tx_id} не найдена",
+            assistant_message=f"Транзакции с id {tx_id} нет в базе.",
+        )
+
+    chat_ids = _scope_chat_ids(scope)
+    if chat_ids is not None and (
+        tx.source_chat_id is None or tx.source_chat_id not in chat_ids
+    ):
+        return _ok(
+            "Доступ к транзакции ограничен",
+            assistant_message=f"Транзакция #{tx_id} не входит в ваш scope.",
+        )
+
+    source_text = _resolve_source_text(db, tx)
+    if not source_text:
+        return _ok(
+            f"Нет исходного текста для сверки #{tx_id}",
+            assistant_message=(
+                f"У транзакции #{tx_id} нет сохранённого исходного текста "
+                "(ни raw_message, ни сообщение в кэше) — сверка невозможна."
+            ),
+            data={"transaction_id": tx_id, "has_source": False, "verdict": "no_source"},
+        )
+
+    from parsers.regex_parser import RegexParser
+
+    try:
+        parsed = RegexParser().parse(source_text)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("verify_receipt_parse regex failed for tx %s: %s", tx_id, exc)
+        parsed = None
+
+    if not parsed:
+        return _ok(
+            f"Не удалось переразобрать чек #{tx_id} regex-ом",
+            assistant_message=(
+                f"Regex-каскад не распознал исходный текст транзакции #{tx_id}. "
+                "Возможно, чек разобран через AI/Vision — детерминированная сверка не применима."
+            ),
+            data={
+                "transaction_id": tx_id,
+                "has_source": True,
+                "verdict": "suspicious",
+                "discrepancies": [{"field": "parse", "stored": "ok", "parsed": None}],
+            },
+        )
+
+    parsed_application: Optional[str] = None
+    parsed_operator = parsed.get("operator_raw")
+    if parsed_operator:
+        try:
+            from parsers.operator_mapper import OperatorMapper
+
+            parsed_application = OperatorMapper(db).map_operator(str(parsed_operator))
+        except Exception:  # noqa: BLE001
+            parsed_application = None
+
+    parsed_dt = parsed.get("transaction_date")
+    parsed_date_iso = parsed_dt.isoformat() if hasattr(parsed_dt, "isoformat") else None
+    stored_date_iso = tx.transaction_date.isoformat() if tx.transaction_date else None
+
+    comparisons = [
+        ("amount", _norm_amount(tx.amount), _norm_amount(parsed.get("amount"))),
+        (
+            "transaction_date",
+            stored_date_iso[:16] if stored_date_iso else None,
+            parsed_date_iso[:16] if parsed_date_iso else None,
+        ),
+        (
+            "operator",
+            (tx.operator_raw or "").strip() or None,
+            (str(parsed_operator).strip() if parsed_operator else None),
+        ),
+        ("application", tx.application_mapped, parsed_application),
+        ("card_last_4", tx.card_last_4, parsed.get("card_last_4")),
+        ("transaction_type", tx.transaction_type, parsed.get("transaction_type")),
+    ]
+
+    discrepancies: List[Dict[str, Any]] = []
+    for field, stored, parsed_val in comparisons:
+        # Skip fields the regex layer cannot determine (None parsed) to avoid
+        # false positives — application mapping in particular is best-effort.
+        if parsed_val is None and field in {"application", "card_last_4"}:
+            continue
+        if str(stored or "") != str(parsed_val or ""):
+            discrepancies.append({"field": field, "stored": stored, "parsed": parsed_val})
+
+    verdict = "ok" if not discrepancies else "suspicious"
+    if discrepancies:
+        diff_lines = "\n".join(
+            f"  · <b>{d['field']}</b>: сохранено {d['stored'] or '—'} ≠ разобрано {d['parsed'] or '—'}"
+            for d in discrepancies
+        )
+        assistant_message = (
+            f"⚠️ Транзакция #{tx_id}: найдено {len(discrepancies)} расхождений при сверке "
+            f"с исходным текстом:\n{diff_lines}"
+        )
+    else:
+        assistant_message = f"✅ Транзакция #{tx_id}: распознанные поля совпадают с исходным текстом."
+
+    return _ok(
+        f"Сверка #{tx_id}: {verdict} ({len(discrepancies)} расхождений)",
+        assistant_message=assistant_message,
+        data={
+            "transaction_id": tx_id,
+            "has_source": True,
+            "verdict": verdict,
+            "discrepancies": discrepancies,
+        },
+        cards=[
+            {
+                "type": "audit",
+                "title": f"Сверка чека #{tx_id}",
+                "body": {
+                    "verdict": verdict,
+                    "discrepancies": discrepancies,
+                    "parsing_method": parsed.get("parsing_method"),
+                },
+            }
+        ],
+    )
+
+
 async def chat_vs_db_reconcile(db: Session, current_user: Dict[str, Any], scope: Optional[dict], arguments: Dict[str, Any]) -> Dict[str, Any]:
     """Reconcile a monitored chat: how many messages cached vs how many turned into transactions.
 
@@ -205,7 +383,7 @@ async def chat_vs_db_reconcile(db: Session, current_user: Dict[str, Any], scope:
         )
     chat_id = int(chat_id_arg)
     chat_ids = _scope_chat_ids(scope)
-    if chat_ids and chat_id not in chat_ids:
+    if chat_ids is not None and chat_id not in chat_ids:
         return _ok(
             "Доступ к чату ограничен",
             assistant_message=f"Чат {chat_id} не входит в ваш scope.",
@@ -364,7 +542,7 @@ async def weekly_health_check(db: Session, current_user: Dict[str, Any], scope: 
     chat_ids = _scope_chat_ids(scope)
     monitored = db.query(MonitoredBotChat).filter(MonitoredBotChat.enabled.is_(True)).all()
     for ch in monitored:
-        if chat_ids and ch.chat_id not in chat_ids:
+        if chat_ids is not None and ch.chat_id not in chat_ids:
             continue
         result = await chat_vs_db_reconcile(
             db=db,
@@ -472,6 +650,11 @@ async def weekly_report_autofix(db: Session, current_user: Dict[str, Any], scope
     Aggregates duplicate-group merges and orphan reparses, returns a single
     preview that the user must confirm via the standard confirm flow.
     """
+    from services.ai_agent.authorization import actor_id, current_agent_authorization
+
+    auth = current_agent_authorization(db, actor_id(current_user))
+    auth.require_admin("weekly_autofix")
+
     health = await weekly_health_check(
         db=db, current_user=current_user, scope=scope, arguments=arguments
     )
@@ -486,7 +669,7 @@ async def weekly_report_autofix(db: Session, current_user: Dict[str, Any], scope
         )
 
     actions: List[Dict[str, Any]] = []
-    for group in duplicate_groups[:50]:
+    for group in duplicate_groups[:25]:
         ids = list(group.get("transaction_ids") or [])
         if len(ids) < 2:
             continue
@@ -499,7 +682,7 @@ async def weekly_report_autofix(db: Session, current_user: Dict[str, Any], scope
                 "transaction_date": group.get("transaction_date"),
             }
         )
-    for row in orphan_rows[:200]:
+    for row in orphan_rows[:25]:
         actions.append({"kind": "reparse_transaction", "transaction_id": row["id"]})
 
     summary = (

@@ -22,11 +22,13 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from datetime import datetime, timedelta
+import os
+import threading
+from datetime import datetime, timezone
 from hashlib import sha256
 from typing import Any, Dict, List, Optional
 
-from sqlalchemy import and_, func
+from sqlalchemy import func, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
@@ -38,6 +40,7 @@ logger = logging.getLogger(__name__)
 
 PAGE_SIZE = 100
 MAX_PAGES_PER_CYCLE = 5  # at most 500 new messages per chat per tick
+MAX_CHATS_PER_CYCLE = max(1, int(os.getenv("MONITORED_SYNC_MAX_CHATS_PER_CYCLE", "20")))
 RECEIPT_HINTS = (
     "uzs",
     "usd",
@@ -54,6 +57,53 @@ RECEIPT_HINTS = (
     "card",
     "карта",
 )
+
+_ACTIVE_CHAT_IDS: set[int] = set()
+_ACTIVE_CHAT_IDS_LOCK = threading.Lock()
+
+
+def _claim_local_chat(chat_id: int) -> bool:
+    with _ACTIVE_CHAT_IDS_LOCK:
+        if chat_id in _ACTIVE_CHAT_IDS:
+            return False
+        _ACTIVE_CHAT_IDS.add(chat_id)
+        return True
+
+
+def _release_local_chat(chat_id: int) -> None:
+    with _ACTIVE_CHAT_IDS_LOCK:
+        _ACTIVE_CHAT_IDS.discard(chat_id)
+
+
+def _try_database_chat_lock(db: Session, chat_id: int) -> bool:
+    """Use a session advisory lock on Postgres; other dialects use local exclusion."""
+    if db.get_bind().dialect.name != "postgresql":
+        return True
+    return bool(
+        db.execute(
+            text("SELECT pg_try_advisory_lock(:chat_id)"),
+            {"chat_id": int(chat_id)},
+        ).scalar()
+    )
+
+
+def _release_database_chat_lock(db: Session, chat_id: int) -> None:
+    if db.get_bind().dialect.name != "postgresql":
+        return
+    try:
+        db.execute(
+            text("SELECT pg_advisory_unlock(:chat_id)"),
+            {"chat_id": int(chat_id)},
+        )
+    except Exception:  # noqa: BLE001
+        db.rollback()
+        try:
+            db.execute(
+                text("SELECT pg_advisory_unlock(:chat_id)"),
+                {"chat_id": int(chat_id)},
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to release monitored sync lock for chat %s", chat_id)
 
 
 # --------------------------------------------------------------------------- #
@@ -287,122 +337,171 @@ async def sync_one_chat(
     *,
     fetch_callable,
 ) -> Dict[str, Any]:
-    """Sync one chat by walking back from latest until we hit stored cursor.
+    """Sync one chat without sharing manual history-loader progress fields."""
+    chat_id = int(chat.chat_id)
+    if not _claim_local_chat(chat_id):
+        return {"chat_id": chat_id, "skipped": True, "reason": "already_running"}
 
-    Direction: TDLib's getChatHistory returns messages OLDER than `from_message_id`.
-    We start from `from_message_id=0` (latest), persist messages, advance the
-    iterator with `min(page_ids)`, and stop when we reach the previously-stored
-    `cursor.cursor_message_id` (which is the highest id we've already saved).
+    database_lock_acquired = False
+    try:
+        database_lock_acquired = _try_database_chat_lock(db, chat_id)
+        if not database_lock_acquired:
+            return {"chat_id": chat_id, "skipped": True, "reason": "already_running"}
+        return await _sync_one_chat_locked(db, chat, fetch_callable=fetch_callable)
+    finally:
+        if database_lock_acquired:
+            _release_database_chat_lock(db, chat_id)
+        _release_local_chat(chat_id)
 
-    `fetch_callable(chat_id, from_message_id, limit)` returns raw TDLib message dicts.
-    The cursor is advanced ONLY after a successful page persist.
-    """
+
+async def _sync_one_chat_locked(
+    db: Session,
+    chat: MonitoredBotChat,
+    *,
+    fetch_callable,
+) -> Dict[str, Any]:
+    """Walk a frozen monitor window backwards, resuming across bounded ticks."""
     cursor = _get_or_create_cursor(db, chat.chat_id)
-    stored_max = int(cursor.cursor_message_id or 0)
+    stored_max = int(cursor.monitor_cursor_message_id or 0)
+    target_message_id = (
+        int(cursor.monitor_backfill_target_message_id)
+        if cursor.monitor_backfill_target_message_id is not None
+        else None
+    )
+    cursor.monitor_status = "running"
+    cursor.monitor_error = None
 
     total_new = 0
     pages = 0
-    page_min_id = 0  # 0 == "from latest"
-    highest_seen_in_run = 0
-    highest_persisted_in_run = 0  # M-3: track persisted-only watermark
-    persist_failed_ids: set[int] = set()
+    page_min_id = (
+        int(cursor.monitor_backfill_from_message_id or 0)
+        if target_message_id is not None
+        else 0
+    )
     reached_cursor = False
+    reached_history_start = False
 
     while pages < MAX_PAGES_PER_CYCLE:
+        page_start_id = page_min_id
         try:
             page = await fetch_callable(
                 chat_id=chat.chat_id,
-                from_message_id=page_min_id,
+                from_message_id=page_start_id,
                 limit=PAGE_SIZE,
             )
         except Exception as exc:  # noqa: BLE001
             logger.exception(
                 "TDLib fetch failed for chat %s at from_id=%s: %s",
                 chat.chat_id,
-                page_min_id,
+                page_start_id,
                 exc,
             )
-            cursor.error = str(exc)[:500]
-            cursor.status = "failed"
+            cursor.monitor_error = str(exc)[:500]
+            cursor.monitor_status = "failed"
             break
 
         if not page:
-            # Reached the start of history — full backfill complete.
-            cursor.status = "completed"
+            reached_history_start = True
             break
 
-        # Filter out messages that are older or equal to what's already stored.
-        # IMPORTANT for catching up: `cursor_message_id` is the ID we last saw,
-        # so we should stop at strictly less-than to be idempotent.
-        ids_in_page = [int(m.get("id") or 0) for m in page if m.get("id") is not None]
+        ids_in_page = [
+            int(message.get("id") or 0)
+            for message in page
+            if message.get("id") is not None
+        ]
         if not ids_in_page:
+            cursor.monitor_error = "fetched_page_without_message_ids"
+            cursor.monitor_status = "failed"
             break
 
         page_max = max(ids_in_page)
         page_min = min(ids_in_page)
-        highest_seen_in_run = max(highest_seen_in_run, page_max)
+        if target_message_id is None:
+            target_message_id = page_max
+            cursor.monitor_backfill_target_message_id = target_message_id
+            cursor.monitor_backfill_from_message_id = page_start_id
 
-        # Anything strictly newer than stored cursor is new for us.
-        new_msgs = [m for m in page if int(m.get("id") or 0) > stored_max]
-        if new_msgs:
-            inserted, failed_in_batch = _persist_messages(
-                db,
-                chat.chat_id,
-                getattr(chat, "chat_title", None),
-                new_msgs,
-            )
+        new_messages = [
+            message
+            for message in page
+            if stored_max < int(message.get("id") or 0) <= target_message_id
+        ]
+        if new_messages:
+            try:
+                inserted, failed_ids = _persist_messages(
+                    db,
+                    chat.chat_id,
+                    getattr(chat, "chat_title", None),
+                    new_messages,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.exception(
+                    "Persist failed for chat %s at from_id=%s: %s",
+                    chat.chat_id,
+                    page_start_id,
+                    exc,
+                )
+                db.rollback()
+                cursor.monitor_backfill_from_message_id = page_start_id
+                cursor.monitor_backfill_target_message_id = target_message_id
+                cursor.monitor_error = str(exc)[:500]
+                cursor.monitor_status = "failed"
+                break
             total_new += inserted
-            if failed_in_batch:
-                persist_failed_ids.update(failed_in_batch)
-                # M-3: cap watermark at last id BELOW the lowest failure so
-                # nothing failed gets jumped over on next tick.
-                lowest_failed = min(failed_in_batch)
-                successful_ids_in_page = [
-                    int(m.get("id") or 0)
-                    for m in new_msgs
-                    if int(m.get("id") or 0) < lowest_failed
-                ]
-                if successful_ids_in_page:
-                    highest_persisted_in_run = max(
-                        highest_persisted_in_run, max(successful_ids_in_page)
-                    )
-            else:
-                highest_persisted_in_run = max(highest_persisted_in_run, page_max)
+            if failed_ids:
+                cursor.monitor_backfill_from_message_id = page_start_id
+                cursor.monitor_backfill_target_message_id = target_message_id
+                cursor.monitor_error = (
+                    f"persist_failed: {sorted(failed_ids)[:10]}"
+                )[:500]
+                cursor.monitor_status = "partial"
+                pages += 1
+                break
 
         pages += 1
-
-        # Stop if this page already crossed the stored cursor — we've caught up.
         if stored_max > 0 and page_min <= stored_max:
             reached_cursor = True
             break
 
-        # Continue back: next iteration starts from this page's minimum id.
         page_min_id = page_min
+        cursor.monitor_backfill_from_message_id = page_min_id
+        cursor.monitor_backfill_target_message_id = target_message_id
 
-    # M-3: cursor advances ONLY when no persistence failures occurred.
-    # If any row failed, cursor stays so retry pulls failed messages again.
-    if cursor.status != "failed" and not persist_failed_ids:
-        if highest_seen_in_run > stored_max:
-            cursor.cursor_message_id = highest_seen_in_run
-    elif persist_failed_ids:
-        # Partial advance: lowest_failed - 1 is the last guaranteed-saved id.
-        if highest_persisted_in_run > stored_max:
-            cursor.cursor_message_id = highest_persisted_in_run
-        cursor.error = (
-            f"persist_failed: {sorted(list(persist_failed_ids))[:10]}"
-        )[:500]
-        cursor.status = "partial"
+    window_complete = reached_cursor or reached_history_start
+    if cursor.monitor_status not in ("failed", "partial"):
+        if window_complete:
+            if target_message_id is not None and target_message_id > stored_max:
+                cursor.monitor_cursor_message_id = target_message_id
+            cursor.monitor_backfill_from_message_id = None
+            cursor.monitor_backfill_target_message_id = None
+            cursor.monitor_status = "completed"
+        elif target_message_id is not None:
+            cursor.monitor_backfill_from_message_id = page_min_id
+            cursor.monitor_backfill_target_message_id = target_message_id
+            cursor.monitor_status = "running"
 
-    cursor.last_batch_at = datetime.utcnow()
-    if cursor.status not in ("failed", "partial"):
-        cursor.error = None
+    cursor.monitor_last_batch_at = datetime.now(timezone.utc)
+    if cursor.monitor_status not in ("failed", "partial"):
+        cursor.monitor_error = None
+    db.add(cursor)
     db.commit()
     return {
         "chat_id": chat.chat_id,
         "new_rows": total_new,
         "pages_done": pages,
-        "cursor_message_id": int(cursor.cursor_message_id or 0),
+        "monitor_cursor_message_id": int(cursor.monitor_cursor_message_id or 0),
+        "monitor_backfill_from_message_id": (
+            int(cursor.monitor_backfill_from_message_id)
+            if cursor.monitor_backfill_from_message_id is not None
+            else None
+        ),
+        "monitor_backfill_target_message_id": (
+            int(cursor.monitor_backfill_target_message_id)
+            if cursor.monitor_backfill_target_message_id is not None
+            else None
+        ),
         "reached_cursor": reached_cursor,
+        "reached_history_start": reached_history_start,
     }
 
 
@@ -411,11 +510,18 @@ async def sync_all_active_chats(*, fetch_callable) -> List[Dict[str, Any]]:
     results: List[Dict[str, Any]] = []
     with get_db() as db:
         chats = (
-            db.query(MonitoredBotChat).filter(MonitoredBotChat.enabled.is_(True)).all()
+            db.query(MonitoredBotChat)
+            .filter(MonitoredBotChat.enabled.is_(True))
+            .order_by(MonitoredBotChat.last_history_sync_at.asc().nullsfirst(), MonitoredBotChat.chat_id.asc())
+            .limit(MAX_CHATS_PER_CYCLE)
+            .all()
         )
         for chat in chats:
             try:
                 results.append(await sync_one_chat(db, chat, fetch_callable=fetch_callable))
+                chat.last_history_sync_at = datetime.now(timezone.utc)
+                db.add(chat)
+                db.commit()
             except Exception:  # noqa: BLE001
                 logger.exception("sync_one_chat failed for %s", chat.chat_id)
     return results

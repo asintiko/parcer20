@@ -9,10 +9,15 @@ TestClient = fastapi_testclient.TestClient
 
 from api.main import app
 from database.connection import get_db_session
-from database.models import AppLaunchConfig
+from database.models import AppLaunchConfig, User
 from services.access_control_service import hash_password
 from services.auth_bot_service import create_launch_session_token
 from services.root_access_config_service import hash_password_pbkdf2, reset_root_access_cache
+from fake_auth_redis import (
+    install_fake_auth_redis,
+    issue_active_app_token,
+    register_launch_session,
+)
 
 
 @pytest.fixture
@@ -49,7 +54,32 @@ def client(db_session, monkeypatch, tmp_path):
     monkeypatch.setenv("SYSTEM_ACCESS_ENFORCED", "true")
     monkeypatch.setenv("SCOPES_MANAGED_BY_CONFIG", "false")
     monkeypatch.setenv("ROOT_ACCESS_SERVER_CONFIG_PATH", str(config_path))
+    monkeypatch.setenv("LAUNCH_GATE_ENABLED", "true")
+    monkeypatch.setattr("api.main._launch_gate_cache_value", None)
+    monkeypatch.setattr("api.main._launch_gate_cache_expires_at", 0.0)
+    monkeypatch.setattr("api.main._get_launch_gate_enabled_runtime", lambda: True)
+    install_fake_auth_redis(monkeypatch)
     reset_root_access_cache()
+
+    password_hash, password_salt = hash_password("Strong!123")
+    user = User(
+        username="launch-test-admin",
+        password_hash=password_hash,
+        salt=password_salt,
+        role="admin",
+        display_name="Launch Test Admin",
+        allowed_tabs='["dashboard","reference","automation","userbot","logs","admin"]',
+        allowed_folders="[]",
+        forbidden_periods="[]",
+        allowed_sources="[]",
+        can_toggle_sources=True,
+        permissions_version=1,
+        is_active=True,
+    )
+    db_session.add(user)
+    db_session.commit()
+    db_session.refresh(user)
+    app_user_token = issue_active_app_token(user)
 
     # Launch middleware uses SessionLocal directly; point it to our test session.
     monkeypatch.setattr("database.connection.SessionLocal", lambda: db_session)
@@ -63,7 +93,12 @@ def client(db_session, monkeypatch, tmp_path):
     app.dependency_overrides[get_db_session] = override_db
     try:
         with TestClient(app) as test_client:
-            test_client.headers.update({"X-System-Access": system_token})
+            test_client.headers.update(
+                {
+                    "X-System-Access": system_token,
+                    "Authorization": f"Bearer {app_user_token}",
+                }
+            )
             yield test_client
     finally:
         app.dependency_overrides.pop(get_db_session, None)
@@ -91,7 +126,9 @@ def test_launch_session_required_for_protected_api(client, db_session):
     assert blocked.status_code == 403
     assert blocked.json()["detail"]["error"] == "launch_required"
 
-    launch_token = create_launch_session_token(ip_address="127.0.0.1")
+    launch_token = register_launch_session(
+        create_launch_session_token(ip_address="127.0.0.1")
+    )
     allowed = client.get("/api/transactions/years", headers={"X-Launch-Session": launch_token})
     assert allowed.status_code == 200, allowed.text
 
@@ -108,13 +145,18 @@ def test_sms_endpoints_exempt_from_launch_session(client, db_session, monkeypatc
     )
     db_session.commit()
 
-    monkeypatch.setenv("MOBILE_SMS_INGEST_KEY", "sms-test-key")
+    mobile_device_id = "android-test-1"
+    mobile_key = "sms-test-key-0123456789abcdef0123456789"
+    monkeypatch.setenv(
+        "MOBILE_DEVICE_KEYS_JSON",
+        json.dumps({mobile_device_id: {"current": mobile_key}}),
+    )
 
     class FakeParserOrchestrator:
         def __init__(self, _db):  # noqa: D401, ANN001
             pass
 
-        def parse_text(self, _text):
+        def parse_text(self, _text, fallback_datetime=None):  # noqa: ARG002
             return {
                 "transaction_date": "2026-02-14T10:30:00",
                 "amount": "100000.00",
@@ -128,14 +170,18 @@ def test_sms_endpoints_exempt_from_launch_session(client, db_session, monkeypatc
 
     monkeypatch.setattr("api.routes.sms.ParserOrchestrator", FakeParserOrchestrator)
 
-    health_res = client.get("/api/sms/health", headers={"X-Mobile-Ingest-Key": "sms-test-key"})
+    mobile_headers = {
+        "X-Mobile-Device-Id": mobile_device_id,
+        "X-Mobile-Ingest-Key": mobile_key,
+    }
+    health_res = client.get("/api/sms/health", headers=mobile_headers)
     assert health_res.status_code == 200, health_res.text
 
     ingest_res = client.post(
         "/api/sms/ingest",
-        headers={"X-Mobile-Ingest-Key": "sms-test-key"},
+        headers=mobile_headers,
         json={
-            "device_id": "android-test-1",
+            "device_id": mobile_device_id,
             "messages": [
                 {
                     "device_sms_id": "msg-1",

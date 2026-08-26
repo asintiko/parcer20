@@ -4,7 +4,7 @@ import json
 import logging
 import random
 import time
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, List, Optional
 
 from openai import AsyncOpenAI, OpenAI
 
@@ -300,10 +300,15 @@ class DeepSeekTextProvider:
         model: Optional[str] = None,
         temperature: float = 0.1,
         max_tokens: Optional[int] = None,
+        retry_count: Optional[int] = None,
+        timeout_seconds: Optional[float] = None,
     ) -> JsonDict:
-        retry_count = max(0, int(AI_RETRY_COUNT))
+        effective_retry_count = max(
+            0,
+            int(AI_RETRY_COUNT if retry_count is None else retry_count),
+        )
         last_error: Optional[Exception] = None
-        for attempt in range(retry_count + 1):
+        for attempt in range(effective_retry_count + 1):
             try:
                 response = self._get_sync_client().chat.completions.create(
                     model=model or self.default_model,
@@ -311,6 +316,7 @@ class DeepSeekTextProvider:
                     response_format={"type": "json_object"},
                     temperature=temperature,
                     max_tokens=max_tokens,
+                    timeout=timeout_seconds,
                 )
                 self._record_usage(model or self.default_model, getattr(response, 'usage', None), kind='json')
                 content = self._extract_text_content(response.choices[0].message.content)
@@ -321,7 +327,7 @@ class DeepSeekTextProvider:
                 if not self._is_retryable_error(exc):
                     logger.warning("DeepSeek terminal error (sync), no retry: %s", exc)
                     break
-                if attempt < retry_count:
+                if attempt < effective_retry_count:
                     time.sleep(self._retry_sleep(attempt))
         raise RuntimeError(str(last_error or "deepseek_request_failed"))
 

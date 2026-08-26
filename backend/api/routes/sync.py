@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Optional, Tuple, Type
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from sqlalchemy import and_, func, or_
+from sqlalchemy import and_, false, func, or_
 from sqlalchemy.orm import Session
 
 from api.dependencies import (
@@ -156,6 +156,7 @@ def _scope_filter_transactions(query, scope: Optional[Dict[str, Any]]):
 # other chats' titles/state. Transaction is handled separately (date+source via
 # the main builder); these three key on chat_id directly.
 _CHAT_BOUND_SYNC_MODELS = {
+    Transaction: "source_chat_id",
     MonitoredBotChat: "chat_id",
     HiddenBotChat: "chat_id",
     ReceiptProcessingTask: "chat_id",
@@ -165,16 +166,17 @@ _CHAT_BOUND_SYNC_MODELS = {
 def _apply_source_scope_to_model(query, model: Type, current_user: Optional[dict]):
     """Filter a chat-bound sync model by the operator's allowed_sources.
 
-    Empty/None allowed_sources (admin or no restriction configured) applies no
-    filter, matching the transactions API semantics. Non-chat-bound models are
-    returned unchanged.
+    Admins have ``None`` (unrestricted). An operator's empty set means no
+    source access and must produce an empty result.
     """
     column_name = _CHAT_BOUND_SYNC_MODELS.get(model)
     if column_name is None:
         return query
     allowed = get_allowed_sources_for_user(current_user)
-    if not allowed:
+    if allowed is None:
         return query
+    if not allowed:
+        return query.filter(false())
     return query.filter(getattr(model, column_name).in_(allowed))
 
 
@@ -294,8 +296,7 @@ def _table_manifest(
         query = _scope_filter_transactions(query, scope)
         query = _apply_forbidden_ranges(query, forbidden_ranges or [])
         query = _locked_period_filter_transactions(query, db)
-    else:
-        query = _apply_source_scope_to_model(query, model, current_user)
+    query = _apply_source_scope_to_model(query, model, current_user)
     total = query.count()
     latest_row_id = query.with_entities(func.max(getattr(model, id_column))).scalar()
 
@@ -321,7 +322,11 @@ def _table_manifest(
     }
 
 
-def _manifest_cache_key(scope: Optional[Dict[str, Any]]) -> str:
+def _manifest_cache_key(
+    scope: Optional[Dict[str, Any]],
+    current_user: Optional[dict],
+    forbidden_ranges: List[tuple[date, date]],
+) -> str:
     scope_from, scope_to, scope_years = get_scope_window(scope)
     raw_key = json.dumps(
         {
@@ -331,6 +336,18 @@ def _manifest_cache_key(scope: Optional[Dict[str, Any]]) -> str:
             "from": scope_from.isoformat() if scope_from else None,
             "to": scope_to.isoformat() if scope_to else None,
             "years": sorted(scope_years or []),
+            "user_id": int((current_user or {}).get("id") or (current_user or {}).get("user_id") or 0),
+            "role": str((current_user or {}).get("role") or ""),
+            "permissions_version": int((current_user or {}).get("permissions_version") or 0),
+            "allowed_sources": (
+                None
+                if get_allowed_sources_for_user(current_user) is None
+                else sorted(get_allowed_sources_for_user(current_user) or [])
+            ),
+            "forbidden_ranges": [
+                [date_from.isoformat(), date_to.isoformat()]
+                for date_from, date_to in forbidden_ranges
+            ],
         },
         sort_keys=True,
         ensure_ascii=False,
@@ -449,7 +466,7 @@ async def sync_manifest(
             "reason": "client_out_of_retention_window",
             "retention_days": retention_days,
         }
-    cache_key = _manifest_cache_key(effective_scope)
+    cache_key = _manifest_cache_key(effective_scope, current_user, forbidden_ranges)
     local_cached = _get_manifest_from_local_cache(cache_key)
     if local_cached:
         return local_cached
@@ -562,8 +579,7 @@ async def sync_table(
         base_query = _scope_filter_transactions(base_query, effective_scope)
         base_query = _apply_forbidden_ranges(base_query, forbidden_ranges)
         base_query = _locked_period_filter_transactions(base_query, db)
-    else:
-        base_query = _apply_source_scope_to_model(base_query, model, current_user)
+    base_query = _apply_source_scope_to_model(base_query, model, current_user)
 
     query = base_query
 
@@ -618,7 +634,7 @@ async def sync_table(
     server_checksum = _rows_checksum(checksum_rows, id_column=id_column_name, updated_column=updated_column_name)
 
     deleted_ids = _load_deleted_ids(db, table_name=table_name, since=since)
-    if model is Transaction and effective_scope:
+    if model is Transaction and str(current_user.get("role") or "").lower() != "admin":
         # Avoid leaking existence/deletion of out-of-scope transactions.
         deleted_ids = []
 

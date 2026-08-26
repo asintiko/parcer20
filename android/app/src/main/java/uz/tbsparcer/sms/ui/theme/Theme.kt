@@ -1,7 +1,9 @@
 package uz.tbsparcer.sms.ui.theme
 
 import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Shapes
 import androidx.compose.material3.Typography
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.lightColorScheme
@@ -11,6 +13,7 @@ import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 
 data class TbsPalette(
@@ -22,6 +25,16 @@ data class TbsPalette(
 val LocalTbs = staticCompositionLocalOf {
     TbsPalette(LBg, LSurface, LSurface2, LBorder, LInk, LInkSecondary, LAccent, LOnAccent, IncomeLight, ExpenseLight, false)
 }
+
+// Desktop editorial-monochrome radii: --radius-sm 2 / md 4 / lg 6 / xl 8.
+// Material3 buckets: extraSmall = chips/badges, small = controls (4), medium = cards (6), large = sheets (8).
+private val tbsShapes = Shapes(
+    extraSmall = RoundedCornerShape(2.dp),
+    small = RoundedCornerShape(4.dp),
+    medium = RoundedCornerShape(6.dp),
+    large = RoundedCornerShape(8.dp),
+    extraLarge = RoundedCornerShape(8.dp),
+)
 
 private val tbsTypography = Typography(
     bodyMedium = TextStyle(fontFamily = SansGrotesk, fontSize = 14.sp),
@@ -42,6 +55,6 @@ fun TbsTheme(darkTheme: Boolean = isSystemInDarkTheme(), content: @Composable ()
         lightColorScheme(background = LBg, surface = LSurface, primary = LAccent, onPrimary = LOnAccent, onBackground = LInk, onSurface = LInk, outline = LBorder)
 
     CompositionLocalProvider(LocalTbs provides palette) {
-        MaterialTheme(colorScheme = scheme, typography = tbsTypography, content = content)
+        MaterialTheme(colorScheme = scheme, typography = tbsTypography, shapes = tbsShapes, content = content)
     }
 }

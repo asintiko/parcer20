@@ -108,16 +108,17 @@ def _resolve_user_from_context(
     temp_token: Optional[str],
 ) -> User:
     user_id: Optional[int] = None
+    temp_payload: Optional[Dict[str, Any]] = None
     if isinstance(current_user, dict):
         try:
             user_id = int(current_user.get("id") or current_user.get("user_id") or 0) or None
         except Exception:
             user_id = None
     if user_id is None and temp_token:
-        payload = verify_temp_2fa_token(temp_token)
-        if payload:
+        temp_payload = verify_temp_2fa_token(temp_token)
+        if temp_payload:
             try:
-                user_id = int(payload.get("user_id") or payload.get("sub") or 0) or None
+                user_id = int(temp_payload.get("user_id") or temp_payload.get("sub") or 0) or None
             except Exception:
                 user_id = None
     if user_id is None:
@@ -125,7 +126,42 @@ def _resolve_user_from_context(
     user = db.get(User, int(user_id))
     if not user:
         raise HTTPException(status_code=404, detail="user_not_found")
+    if not user.is_active:
+        raise HTTPException(status_code=403, detail="inactive_user")
+    if temp_payload is not None:
+        token_version = int(temp_payload.get("permissions_version") or 0)
+        if token_version != int(user.permissions_version or 1):
+            raise HTTPException(status_code=401, detail="permissions_outdated")
     return user
+
+
+async def _require_fresh_2fa_step_up(
+    db: Session,
+    request: Request,
+    user: User,
+    code: str,
+    *,
+    action: str,
+) -> str:
+    if not bool(user.totp_enabled and user.totp_secret):
+        raise HTTPException(status_code=400, detail="2fa_not_enabled")
+    locked_seconds = await _check_2fa_lock(int(user.id))
+    if locked_seconds:
+        raise HTTPException(status_code=429, detail={"error": "locked", "locked_seconds": locked_seconds})
+    ok, method = verify_2fa_code(db, user, code)
+    if not ok:
+        lock_data = await _mark_2fa_failed(int(user.id))
+        _audit(
+            db,
+            request,
+            action=f"{action}_step_up_failed",
+            success=False,
+            user_id=int(user.id),
+            details=lock_data,
+        )
+        raise HTTPException(status_code=401, detail={"error": "invalid_code", **lock_data})
+    await _clear_2fa_failures(int(user.id))
+    return method
 
 
 async def _check_2fa_lock(user_id: int) -> Optional[int]:
@@ -204,8 +240,14 @@ async def setup_2fa(
         current_user=current_user,
         temp_token=payload.temp_token,
     )
+    if payload.temp_token:
+        temp_payload = verify_temp_2fa_token(payload.temp_token)
+        if not temp_payload or temp_payload.get("requires_2fa_setup") is not True:
+            raise HTTPException(status_code=403, detail="setup_not_authorized")
+    if user.totp_enabled or user.totp_secret or user.backup_codes:
+        raise HTTPException(status_code=409, detail="2fa_already_initialized")
 
-    payload = enable_2fa_setup(db, user)
+    setup_payload = enable_2fa_setup(db, user)
     _audit(
         db,
         request,
@@ -214,7 +256,7 @@ async def setup_2fa(
         user_id=int(user.id),
         details={"username": user.username},
     )
-    return TwoFactorSetupResponse(**payload)
+    return TwoFactorSetupResponse(**setup_payload)
 
 
 @router.post("/confirm")
@@ -230,6 +272,12 @@ async def confirm_2fa_setup(
         current_user=current_user,
         temp_token=payload.temp_token,
     )
+    if payload.temp_token:
+        temp_payload = verify_temp_2fa_token(payload.temp_token)
+        if not temp_payload or temp_payload.get("requires_2fa_setup") is not True:
+            raise HTTPException(status_code=403, detail="setup_not_authorized")
+    if user.totp_enabled:
+        raise HTTPException(status_code=409, detail="2fa_already_enabled")
 
     locked_seconds = await _check_2fa_lock(int(user.id))
     if locked_seconds:
@@ -274,6 +322,12 @@ async def verify_2fa_challenge(
     user = db.get(User, user_id)
     if not user:
         raise HTTPException(status_code=404, detail="user_not_found")
+    if not user.is_active:
+        raise HTTPException(status_code=403, detail="inactive_user")
+    if int(token_payload.get("permissions_version") or 0) != int(user.permissions_version or 1):
+        raise HTTPException(status_code=401, detail="permissions_outdated")
+    if token_payload.get("requires_2fa_setup") is True:
+        raise HTTPException(status_code=403, detail="setup_required")
 
     locked_seconds = await _check_2fa_lock(user_id)
     if locked_seconds:
@@ -306,6 +360,7 @@ async def verify_2fa_challenge(
 
 @router.post("/backup-codes")
 async def regenerate_2fa_backup_codes(
+    payload: TwoFactorCodeRequest,
     request: Request,
     db: Session = Depends(get_db_session),
     current_user: dict = Depends(get_current_app_user),
@@ -314,8 +369,13 @@ async def regenerate_2fa_backup_codes(
     user = db.get(User, int(current_user.get("id") or current_user.get("user_id") or 0))
     if not user:
         raise HTTPException(status_code=404, detail="user_not_found")
-    if not user.totp_enabled:
-        raise HTTPException(status_code=400, detail="2fa_not_enabled")
+    method = await _require_fresh_2fa_step_up(
+        db,
+        request,
+        user,
+        payload.code,
+        action="user_2fa_backup_codes_regenerate",
+    )
 
     codes = regenerate_backup_codes(db, user)
     _audit(
@@ -324,13 +384,14 @@ async def regenerate_2fa_backup_codes(
         action="user_2fa_backup_codes_regenerated",
         success=True,
         user_id=int(user.id),
-        details={"count": len(codes)},
+        details={"count": len(codes), "step_up_method": method},
     )
     return {"ok": True, "backup_codes": codes}
 
 
 @router.delete("")
 async def disable_user_2fa(
+    payload: TwoFactorCodeRequest,
     request: Request,
     db: Session = Depends(get_db_session),
     current_user: dict = Depends(get_current_app_user),
@@ -340,6 +401,14 @@ async def disable_user_2fa(
     if not user:
         raise HTTPException(status_code=404, detail="user_not_found")
 
+    method = await _require_fresh_2fa_step_up(
+        db,
+        request,
+        user,
+        payload.code,
+        action="user_2fa_disable",
+    )
+
     disable_2fa(db, user)
     _audit(
         db,
@@ -347,6 +416,6 @@ async def disable_user_2fa(
         action="user_2fa_disabled",
         success=True,
         user_id=int(user.id),
-        details={"username": user.username},
+        details={"username": user.username, "step_up_method": method},
     )
     return {"ok": True}

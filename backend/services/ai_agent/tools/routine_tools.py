@@ -35,6 +35,7 @@ async def create_routine_tool(
     arguments: Dict[str, Any],
 ) -> Dict[str, Any]:
     from services.ai_agent.routine_service import create_routine, serialize_routine
+    from services.ai_agent.authorization import actor_id, current_agent_authorization
 
     name = str(arguments.get("name") or "").strip() or "Сверка транзакций"
     task = str(arguments.get("task_prompt") or arguments.get("task") or "").strip()
@@ -45,11 +46,9 @@ async def create_routine_tool(
     if not task:
         task = "Сверить все транзакции с локально сохранёнными сообщениями Telegram и сообщить об ошибках."
 
-    user_id = None
-    try:
-        user_id = int(current_user.get("id") or current_user.get("user_id") or 0) or None
-    except Exception:  # noqa: BLE001
-        user_id = None
+    auth = current_agent_authorization(db, actor_id(current_user))
+    auth.require_dashboard()
+    user_id = auth.user_id
 
     try:
         row = create_routine(
@@ -59,6 +58,8 @@ async def create_routine_tool(
             cron=cron,
             kind=kind,
             created_by_user_id=user_id,
+            deliver_to_channel=auth.is_admin,
+            deliver_to_chat=True,
         )
     except ValueError as exc:
         return _ok(
@@ -93,8 +94,10 @@ async def list_routines_tool(
     arguments: Dict[str, Any],
 ) -> Dict[str, Any]:
     from services.ai_agent.routine_service import list_routines
+    from services.ai_agent.authorization import actor_id, current_agent_authorization
 
-    items = list_routines(db)
+    auth = current_agent_authorization(db, actor_id(current_user))
+    items = list_routines(db, actor_user_id=auth.user_id, is_admin=auth.is_admin)
     if not items:
         return _ok("Рутин пока нет.", assistant_message="Пока не настроено ни одной рутины.")
     lines = [f"• {r['name']} — {r['cron']} ({'вкл' if r['enabled'] else 'выкл'})" for r in items]

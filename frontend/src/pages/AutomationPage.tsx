@@ -4,13 +4,13 @@
  */
 import { Fragment, useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { useMutation, useQuery } from '@tanstack/react-query';
-import { useLocation } from 'react-router-dom';
 import { automationApi, telegramClientApi } from '../services/api';
 import type {
     VerificationSuggestion,
     ReconciliationItem,
     ReconciliationSummary,
     ChatSyncStatusItem,
+    AutomationProgress,
 } from '../services/api';
 import {
     Bot,
@@ -38,36 +38,10 @@ import { EmptyState } from '../components/ui';
 
 type TabType = 'mapping' | 'verification' | 'reconciliation';
 
-const _TASK_ID_KEY: Record<TabType, string> = {
-    mapping: 'automation_task_id',
-    verification: 'verification_task_id',
-    reconciliation: 'reconciliation_task_id',
-};
-
 export function AutomationPage() {
-    const location = useLocation();
-    // Deep-link from the agent: nav target carries cursor_hint.{automation_task_id, automation_tab}.
-    // Seed the matching tab + its task_id into localStorage synchronously, before tab children mount.
-    const deepLink = useMemo(() => {
-        const nav = (location.state as any)?.agentNavigation;
-        const hint = nav?.cursor_hint;
-        const tab = hint?.automation_tab as TabType | undefined;
-        const taskId = hint?.automation_task_id as string | undefined;
-        if (tab && (tab === 'mapping' || tab === 'verification' || tab === 'reconciliation')) {
-            if (taskId) localStorage.setItem(_TASK_ID_KEY[tab], String(taskId));
-            return { tab, taskId };
-        }
-        return null;
-    }, [location.state]);
-
     const [activeTab, setActiveTab] = useState<TabType>(() => {
-        if (deepLink) return deepLink.tab;
         return (localStorage.getItem('automation_active_tab') as TabType) || 'mapping';
     });
-
-    useEffect(() => {
-        if (deepLink) setActiveTab(deepLink.tab);
-    }, [deepLink]);
 
     useEffect(() => {
         localStorage.setItem('automation_active_tab', activeTab);
@@ -381,7 +355,7 @@ function MappingTab() {
                                                         {getConfidenceIcon(s.confidence)}{(s.confidence * 100).toFixed(0)}%
                                                     </div>
                                                 </td>
-                                                <td className="px-4 py-3"><div className="text-sm text-foreground-secondary max-w-xs truncate" title={s.reasoning}>{s.reasoning}</div></td>
+                                                <td className="px-4 py-3"><div className="text-sm text-foreground-secondary max-w-xs truncate" title={s.reasoning ?? undefined}>{s.reasoning}</div></td>
                                                 <td className="px-4 py-3">
                                                     <div className="flex items-center justify-center gap-2">
                                                         <button
@@ -567,19 +541,19 @@ function VerificationTab() {
                     <div className="mt-4 grid grid-cols-3 gap-4">
                         <StatCard
                             label="Проверено транзакций"
-                            value={(taskStatus.results as any).total_verified}
+                            value={taskStatus.results.total_verified}
                             color="info"
                             icon={<ShieldCheck className="w-8 h-8 text-info" />}
                         />
                         <StatCard
                             label="С ошибками"
-                            value={(taskStatus.results as any).transactions_with_errors}
+                            value={taskStatus.results.transactions_with_errors}
                             color="danger"
                             icon={<AlertCircle className="w-8 h-8 text-danger" />}
                         />
                         <StatCard
                             label="Всего исправлений"
-                            value={(taskStatus.results as any).total_corrections}
+                            value={taskStatus.results.total_corrections}
                             color="warning"
                             icon={<Sparkles className="w-8 h-8 text-warning" />}
                         />
@@ -898,7 +872,7 @@ function ReconciliationTab() {
         return <span className="text-xs text-foreground-secondary">{status.status}</span>;
     };
 
-    const formatDate = (d: string | null) => {
+    const formatDate = (d: string | null | undefined) => {
         if (!d) return '—';
         try {
             return new Date(d).toLocaleString('ru-RU', {
@@ -1238,18 +1212,18 @@ function ReconciliationTab() {
 /* ─────────────────────────────────────────── */
 /*  Shared Components                          */
 /* ─────────────────────────────────────────── */
-function ProgressBar({ status }: { status: any }) {
+function ProgressBar({ status }: { status?: { status: string; progress: AutomationProgress } | null }) {
     if (!status || (status.status !== 'processing' && status.status !== 'started')) return null;
     return (
         <div className="mt-4">
             <div className="flex justify-between items-center mb-2">
                 <span className="text-sm font-medium text-foreground">
-                    Прогресс: {status.progress.processed} / {status.progress.total}
+                    Прогресс: {status.progress.processed ?? 0} / {status.progress.total ?? 0}
                 </span>
-                <span className="text-sm font-bold text-primary">{status.progress.percent}%</span>
+                <span className="text-sm font-bold text-primary">{status.progress.percent ?? 0}%</span>
             </div>
             <div className="w-full bg-surface-2 rounded-full h-3 overflow-hidden">
-                <div className="h-full bg-gradient-to-r from-primary to-primary-dark transition-all duration-500 ease-out" style={{ width: `${status.progress.percent}%` }} />
+                <div className="h-full bg-gradient-to-r from-primary to-primary-dark transition-all duration-500 ease-out" style={{ width: `${status.progress.percent ?? 0}%` }} />
             </div>
         </div>
     );

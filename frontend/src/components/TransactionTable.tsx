@@ -16,6 +16,7 @@ import {
     PaginationState,
     type ColumnPinningState,
 } from '@tanstack/react-table';
+import { useVirtualizer } from '@tanstack/react-virtual';
 import { Transaction } from '../services/api';
 import { formatDate, formatTime, formatDateTime, EMPTY_VALUE as DATE_EMPTY } from '../utils/dateTimeFormatters';
 import { ChevronUp, ChevronDown, Search, FileText, Filter, Eye, Undo2, Redo2, Trash2 } from 'lucide-react';
@@ -154,6 +155,7 @@ const DEFAULT_COLUMN_ORDER: string[] = [
     'day',
     'operator_raw',
     'application_mapped',
+    'description',
     'receiver_name',
     'receiver_card',
     'amount',
@@ -388,19 +390,6 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
         return () => window.clearTimeout(timer);
     }, [ensureLockedVisibility, focusColumnId, focusColumnToken]);
 
-    useEffect(() => {
-        if (!normalizedHighlightRowIds.length || !tableContainerRef.current) return;
-        const viewport = tableContainerRef.current;
-        const selector = normalizedHighlightRowIds
-            .map((value) => `tr[data-rowid="${value}"]`)
-            .join(', ');
-        const target = viewport.querySelector<HTMLTableRowElement>(selector);
-        if (!target) return;
-        window.requestAnimationFrame(() => {
-            target.scrollIntoView({ behavior: 'smooth', block: 'center', inline: 'nearest' });
-        });
-    }, [data.length, normalizedHighlightRowIds]);
-
     // Debounce Search
     useEffect(() => {
         const timeout = setTimeout(() => {
@@ -574,6 +563,7 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
                 time: 'transaction_date',
                 operator_raw: 'operator_raw',
                 application_mapped: 'application_mapped',
+                description: 'description',
                 amount: 'amount',
                 balance_after: 'balance_after',
                 card_last_4: 'card_last_4',
@@ -702,6 +692,22 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
                     if (!value) return <div className="min-w-0 w-full truncate text-table-xs">—</div>;
                     return (
                         <OverflowTooltip text={value} className="block min-w-0 w-full truncate font-medium text-table-xs">
+                            {value}
+                        </OverflowTooltip>
+                    );
+                },
+            },
+            {
+                accessorKey: 'description',
+                id: 'description',
+                header: 'Описание',
+                size: 180,
+                minSize: 20,
+                cell: (info) => {
+                    const value = (info.getValue() as string | null)?.trim() || '';
+                    if (!value) return <div className="min-w-0 w-full truncate text-table-xs">—</div>;
+                    return (
+                        <OverflowTooltip text={value} className="block min-w-0 w-full truncate text-table-xs">
                             {value}
                         </OverflowTooltip>
                     );
@@ -847,6 +853,7 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
         time: 'time',
         operator_raw: 'text',
         application_mapped: 'text',
+        description: 'text',
         receiver_name: 'text',
         receiver_card: 'text',
         amount: 'number',
@@ -1182,6 +1189,48 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
     }, [density]);
     const rows = table.getRowModel().rows;
     const rowCount = rows.length;
+
+    const rowVirtualizer = useVirtualizer({
+        count: rowCount,
+        getScrollElement: () => tableContainerRef.current,
+        estimateSize: () => rowHeight,
+        overscan: 10,
+        // Header row is sticky inside the same scroll container; offset measured
+        // rows so the virtual window lines up under it.
+        getItemKey: (index) => rows[index]?.id ?? index,
+    });
+
+    // Re-measure when row height (density) changes so virtual offsets stay correct.
+    useEffect(() => {
+        rowVirtualizer.measure();
+    }, [rowHeight, rowVirtualizer]);
+
+    const virtualRows = rowVirtualizer.getVirtualItems();
+    const totalRowsHeight = rowVirtualizer.getTotalSize();
+    const visibleLeafColumnsCount = table.getVisibleLeafColumns().length;
+    const paddingTop = virtualRows.length > 0 ? virtualRows[0].start : 0;
+    const paddingBottom =
+        virtualRows.length > 0 ? totalRowsHeight - virtualRows[virtualRows.length - 1].end : 0;
+
+    useEffect(() => {
+        if (!normalizedHighlightRowIds.length || !tableContainerRef.current) return;
+        const highlightSet = new Set(normalizedHighlightRowIds);
+        // With row virtualization the target may not be mounted yet — scroll the
+        // virtual window to its index first, then center it once it paints.
+        const targetIndex = rows.findIndex((row) => highlightSet.has(Number(row.id)));
+        if (targetIndex < 0) return;
+        rowVirtualizer.scrollToIndex(targetIndex, { align: 'center' });
+        window.requestAnimationFrame(() => {
+            const viewport = tableContainerRef.current;
+            if (!viewport) return;
+            const selector = normalizedHighlightRowIds
+                .map((value) => `tr[data-rowid="${value}"]`)
+                .join(', ');
+            const target = viewport.querySelector<HTMLTableRowElement>(selector);
+            target?.scrollIntoView({ behavior: 'smooth', block: 'center', inline: 'nearest' });
+        });
+    }, [data.length, normalizedHighlightRowIds, rows, rowVirtualizer]);
+
     const visibleLeafColumns = table.getVisibleLeafColumns();
     const visibleColumnIndexMap = useMemo(() => {
         const map: Record<string, number> = {};
@@ -1596,6 +1645,7 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
         time: 'transaction_date',
         operator_raw: 'operator_raw',
         application_mapped: 'application_mapped',
+        description: 'description',
         receiver_name: 'receiver_name',
         receiver_card: 'receiver_card',
         amount: 'amount',
@@ -2604,7 +2654,15 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
                             ))}
                         </thead>
                         <tbody style={{ position: 'relative' }}>
-                            {rows.map((row, rowIndex) => {
+                            {paddingTop > 0 && (
+                                <tr aria-hidden="true" style={{ height: `${paddingTop}px` }}>
+                                    <td colSpan={visibleLeafColumnsCount} style={{ padding: 0, border: 'none' }} />
+                                </tr>
+                            )}
+                            {virtualRows.map((virtualRow) => {
+                                const rowIndex = virtualRow.index;
+                                const row = rows[rowIndex];
+                                if (!row) return null;
                                 const rowData = row.original;
                                 const lowConf = (rowData.parsing_confidence ?? 1) < LOW_CONFIDENCE_THRESHOLD;
                                 const highlighted = normalizedHighlightRowIds.includes(Number(row.id));
@@ -2691,6 +2749,11 @@ export const TransactionTable: React.FC<TransactionTableProps> = ({
                                     </tr>
                                 );
                             })}
+                            {paddingBottom > 0 && (
+                                <tr aria-hidden="true" style={{ height: `${paddingBottom}px` }}>
+                                    <td colSpan={visibleLeafColumnsCount} style={{ padding: 0, border: 'none' }} />
+                                </tr>
+                            )}
                         </tbody>
                                 </table>
                             </div>

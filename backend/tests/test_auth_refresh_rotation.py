@@ -117,6 +117,44 @@ def test_refresh_token_rotation(client, db_session):
     assert old_again.status_code == 401
 
 
+def test_active_session_registration_uses_refresh_expiry(client, db_session, monkeypatch):
+    from api.routes import auth as auth_routes
+
+    _seed_user(db_session, username="ttl-operator")
+    registrations = []
+    original_register = auth_routes.register_active_session
+
+    async def capture_registration(**kwargs):
+        registrations.append(kwargs)
+        return await original_register(**kwargs)
+
+    monkeypatch.setattr(auth_routes, "register_active_session", capture_registration)
+
+    login_res = client.post(
+        "/api/auth/login",
+        json={"username": "ttl-operator", "password": "Strong!123"},
+    )
+    assert login_res.status_code == 200, login_res.text
+    login_payload = login_res.json()
+    access_payload = verify_jwt_token(login_payload["token"])
+    refresh_payload = verify_jwt_token(login_payload["refresh_token"])
+    assert access_payload and refresh_payload
+    assert int(refresh_payload["exp"]) > int(access_payload["exp"])
+    assert registrations[-1]["token_kind"] == "app_user"
+    assert registrations[-1]["token_payload"]["kind"] == "refresh_token"
+    assert int(registrations[-1]["token_payload"]["exp"]) == int(refresh_payload["exp"])
+
+    refresh_res = client.post(
+        "/api/auth/refresh",
+        json={"refresh_token": login_payload["refresh_token"]},
+    )
+    assert refresh_res.status_code == 200, refresh_res.text
+    rotated_payload = verify_jwt_token(refresh_res.json()["refresh_token"])
+    assert rotated_payload
+    assert registrations[-1]["token_payload"]["kind"] == "refresh_token"
+    assert int(registrations[-1]["token_payload"]["exp"]) == int(rotated_payload["exp"])
+
+
 def test_refresh_rejected_for_revoked_session(client, db_session):
     _seed_user(db_session, username="revoked-operator")
 
@@ -143,4 +181,4 @@ def test_refresh_rejected_for_revoked_session(client, db_session):
 
     refresh_res = client.post("/api/auth/refresh", json={"refresh_token": refresh_token})
     assert refresh_res.status_code == 401
-    assert "session_revoked" in refresh_res.text
+    assert "session_inactive" in refresh_res.text

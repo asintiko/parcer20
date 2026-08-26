@@ -1,13 +1,21 @@
 import React, { useRef, useState } from 'react';
+import { useQuery } from '@tanstack/react-query';
 import { motion, AnimatePresence } from 'motion/react';
-import { Calendar, X, ArrowLeft, Eye, EyeOff, Bot, Users, User as UserIcon, Megaphone, CheckSquare, Lock } from 'lucide-react';
+import { Calendar, X, ArrowLeft, Eye, EyeOff, Bot, Users, User as UserIcon, Megaphone, CheckSquare, Lock, AppWindow } from 'lucide-react';
 import { Avatar } from './Avatar';
 import { PeriodPicker, formatRangeLabel } from './PeriodPicker';
-import type { TelegramChat } from '../../services/api';
+import { telegramClientApi, type TelegramChat } from '../../services/api';
 
 export interface DateRange {
     from?: string;
     to?: string;
+}
+
+export interface MenuAppOpenRequest {
+    chatId: number;
+    botUserId: number | null;
+    url: string;
+    text: string;
 }
 
 interface ChatHeaderProps {
@@ -18,6 +26,8 @@ interface ChatHeaderProps {
     selectionMode?: boolean;
     dateRange?: DateRange;
     onDateRangeChange?: (range: DateRange) => void;
+    /** Called when the chat exposes a menu-button mini app and the user opens it. */
+    onOpenMenuApp?: (req: MenuAppOpenRequest) => void;
 }
 
 const typeLabel = (type: string, memberCount?: number): string => {
@@ -60,6 +70,7 @@ export const ChatHeader: React.FC<ChatHeaderProps> = ({
     selectionMode,
     dateRange,
     onDateRangeChange,
+    onOpenMenuApp,
 }) => {
     const TypeIcon = typeIconFor(chat.chat_type);
     const monitorOn = chat.monitor_enabled;
@@ -69,6 +80,17 @@ export const ChatHeader: React.FC<ChatHeaderProps> = ({
     const range = dateRange || {};
     const hasFilter = Boolean(range.from || range.to);
     const rangeLabel = hasFilter ? formatRangeLabel(range) : '';
+
+    // Menu-button mini app — only bot chats can expose one.
+    const menuButtonQuery = useQuery({
+        queryKey: ['tg-menu-button', chat.chat_id],
+        queryFn: () => telegramClientApi.getChatMenuButton(chat.chat_id),
+        enabled: Boolean(onOpenMenuApp) && chat.chat_type === 'bot',
+        staleTime: 5 * 60 * 1000,
+        retry: false,
+    });
+    const menuApp = menuButtonQuery.data;
+    const menuAppAvailable = Boolean(menuApp?.available && menuApp?.url);
 
     return (
         <div className="tg-header">
@@ -110,6 +132,26 @@ export const ChatHeader: React.FC<ChatHeaderProps> = ({
             </AnimatePresence>
 
             <div className="tg-header-actions">
+                {menuAppAvailable && onOpenMenuApp ? (
+                    <button
+                        type="button"
+                        className="tg-header-app-btn"
+                        onClick={() =>
+                            onOpenMenuApp({
+                                chatId: chat.chat_id,
+                                botUserId: menuApp!.bot_user_id,
+                                url: menuApp!.url as string,
+                                text: menuApp!.text || 'Открыть приложение',
+                            })
+                        }
+                        aria-label={menuApp!.text || 'Открыть приложение'}
+                        title={menuApp!.text || 'Открыть мини-приложение'}
+                    >
+                        <AppWindow size={14} />
+                        <span className="tg-header-app-label">{menuApp!.text || 'Открыть приложение'}</span>
+                    </button>
+                ) : null}
+
                 {onDateRangeChange ? (
                     <>
                         <button

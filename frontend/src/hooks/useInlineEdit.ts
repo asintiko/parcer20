@@ -52,6 +52,11 @@ export const useInlineEdit = (options?: UseInlineEditOptions) => {
                 },
             );
             queryClient.invalidateQueries({ queryKey: ['transactions-init'] });
+            // Description is resolved at the operator level: a single edit changes the
+            // description for every receipt of the same merchant, so refetch the full list.
+            if ('description' in variables.data) {
+                queryClient.invalidateQueries({ queryKey: ['transactions-server'], exact: false });
+            }
             showToast('success', 'Изменения сохранены');
             options?.onSuccess?.({
                 rowId: variables.id,
@@ -95,6 +100,7 @@ export const useInlineEdit = (options?: UseInlineEditOptions) => {
                 time: 'transaction_date',
                 operator_raw: 'operator_raw',
                 application_mapped: 'application_mapped',
+                description: 'description',
                 amount: 'amount',
                 balance_after: 'balance_after',
                 card_last_4: 'card_last_4',

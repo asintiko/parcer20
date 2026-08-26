@@ -6,9 +6,12 @@ import uz.tbsparcer.sms.data.local.SettingsStore
 
 class MobileKeyInterceptor(private val settings: SettingsStore) : Interceptor {
     override fun intercept(chain: Interceptor.Chain): Response {
-        val req = chain.request().newBuilder()
-            .header("X-Mobile-Ingest-Key", settings.mobileKey)
-            .build()
+        val builder = chain.request().newBuilder()
+        if (settings.isProvisioned) {
+            builder.header("X-Mobile-Device-Id", settings.deviceId)
+            builder.header("X-Mobile-Ingest-Key", settings.mobileKey)
+        }
+        val req = builder.build()
         return chain.proceed(req)
     }
 }

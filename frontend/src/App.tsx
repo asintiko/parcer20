@@ -1,7 +1,7 @@
 /**
  * Main Application Component with Routing
  */
-import { useState, useEffect, ComponentType, ReactNode, useMemo, useRef } from 'react';
+import { lazy, Suspense, useState, useEffect, ComponentType, ReactNode, useMemo, useRef } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { BrowserRouter, HashRouter, Routes, Route, Navigate, useNavigate } from 'react-router-dom';
 import { AppShell } from './components/shell/AppShell';
@@ -10,14 +10,6 @@ import { AiAgentLauncher } from './components/AiAgentLauncher';
 import { ScopeGuard } from './components/ScopeGuard';
 import { SyncStatus } from './components/SyncStatus';
 import { useToast } from './components/Toast';
-import { TransactionsPage } from './pages/TransactionsPage';
-import { ReferencePage } from './pages/ReferencePage';
-import { UserbotPage } from './pages/UserbotPage';
-import { LogsPage } from './pages/LogsPage';
-import { AutomationPage } from './pages/AutomationPage';
-import { RoutinesPage } from './pages/RoutinesPage';
-import { SettingsPage } from './pages/SettingsPage';
-import { AuditPage } from './pages/AuditPage';
 import { LoginPage } from './pages/LoginPage';
 import { useAiAgent } from './contexts/AiAgentContext';
 import { useAiAgentNotifications } from './hooks/useAiAgentNotifications';
@@ -27,6 +19,23 @@ import { ru } from './i18n/ru';
 import { agentApi, API_BASE_URL, loadElectronSystemAccessStatus } from './services/api';
 import { syncManager, type SyncSnapshot } from './services/syncManager';
 import { useAuth } from './contexts/AuthContext';
+import { useAnyOverlayOpen } from './utils/overlayStore';
+
+const TransactionsPage = lazy(() => import('./pages/TransactionsPage').then((module) => ({ default: module.TransactionsPage })));
+const ReferencePage = lazy(() => import('./pages/ReferencePage').then((module) => ({ default: module.ReferencePage })));
+const UserbotPage = lazy(() => import('./pages/UserbotPage').then((module) => ({ default: module.UserbotPage })));
+const LogsPage = lazy(() => import('./pages/LogsPage').then((module) => ({ default: module.LogsPage })));
+const RoutinesPage = lazy(() => import('./pages/RoutinesPage').then((module) => ({ default: module.RoutinesPage })));
+const SettingsPage = lazy(() => import('./pages/SettingsPage').then((module) => ({ default: module.SettingsPage })));
+const AuditPage = lazy(() => import('./pages/AuditPage').then((module) => ({ default: module.AuditPage })));
+
+function RouteLoadingState() {
+    return (
+        <div className="flex min-h-[240px] items-center justify-center text-foreground-secondary" role="status">
+            {ru.common.loading}
+        </div>
+    );
+}
 
 function AppContent() {
     const [syncSnapshot, setSyncSnapshot] = useState<SyncSnapshot>({
@@ -35,6 +44,7 @@ function AppContent() {
         backoffMs: syncManager.getBackoffMs(),
     });
     const { openAgent, isOpen: isAgentOpen } = useAiAgent();
+    const anyOverlayOpen = useAnyOverlayOpen();
     const { hasTab, firstAllowedRoute } = useAuth();
     const { showToast } = useToast();
     const { unreadCount } = useAiAgentNotifications();
@@ -43,7 +53,10 @@ function AppContent() {
         queryKey: ['agent-launcher-state'],
         queryFn: () => agentApi.listThreads({ view: 'active' }),
         staleTime: 5000,
-        refetchInterval: 5000,
+        // Event-driven via SSE invalidation. Only poll when the agent drawer is
+        // open; while closed, keep a slow heartbeat so the launcher badge still
+        // reflects running/unread state without hammering the backend.
+        refetchInterval: isAgentOpen ? 8000 : 60000,
     });
     useSettingsSubscription();
     useScopeGuard();
@@ -170,31 +183,29 @@ function AppContent() {
                 </>
             )}
         >
-            <Routes>
-                <Route path="/" element={guardRoute('dashboard', <TransactionsPage />)} />
-                <Route path="/reference" element={guardRoute('reference', <ReferencePage />)} />
-                <Route
-                    path="/automation"
-                    element={guardRoute('admin', <AutomationPage />)}
-                />
-                <Route
-                    path="/userbot"
-                    element={
-                        guardRoute(
-                            'userbot',
-                            <ScopeGuard action="sources">
-                                <UserbotPage />
-                            </ScopeGuard>
-                        )
-                    }
-                />
-                <Route path="/logs" element={guardRoute('logs', <LogsPage />)} />
-                <Route path="/routines" element={guardRoute('admin', <RoutinesPage />)} />
-                <Route path="/settings" element={guardRoute('admin', <SettingsPage />)} />
-                <Route path="/audit" element={guardRoute('admin', <AuditPage />)} />
-                <Route path="*" element={<Navigate to={firstAllowedRoute()} replace />} />
-            </Routes>
-            {!isAgentOpen ? (
+            <Suspense fallback={<RouteLoadingState />}>
+                <Routes>
+                    <Route path="/" element={guardRoute('dashboard', <TransactionsPage />)} />
+                    <Route path="/reference" element={guardRoute('reference', <ReferencePage />)} />
+                    <Route
+                        path="/userbot"
+                        element={
+                            guardRoute(
+                                'userbot',
+                                <ScopeGuard action="sources">
+                                    <UserbotPage />
+                                </ScopeGuard>
+                            )
+                        }
+                    />
+                    <Route path="/logs" element={guardRoute('logs', <LogsPage />)} />
+                    <Route path="/routines" element={guardRoute('admin', <RoutinesPage />)} />
+                    <Route path="/settings" element={guardRoute('admin', <SettingsPage />)} />
+                    <Route path="/audit" element={guardRoute('admin', <AuditPage />)} />
+                    <Route path="*" element={<Navigate to={firstAllowedRoute()} replace />} />
+                </Routes>
+            </Suspense>
+            {!isAgentOpen && !anyOverlayOpen ? (
                 <AiAgentLauncher
                     unreadCount={unreadCount}
                     state={launcherState}
@@ -226,7 +237,6 @@ function AgentUiActionRouter() {
                 reference: '/reference',
                 audit: '/audit',
                 reports: '/audit',
-                automation: '/automation',
                 settings: '/settings',
                 logs: '/logs',
             };

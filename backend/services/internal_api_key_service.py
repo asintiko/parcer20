@@ -118,4 +118,3 @@ def is_internal_request(conn: Any) -> bool:
     client = getattr(conn, "client", None)
     host = getattr(client, "host", None) if client is not None else None
     return _ip_in_allowlist(host)
-

@@ -16,6 +16,7 @@ from services.root_access_config_service import (
     hash_password_pbkdf2,
     reset_root_access_cache,
 )
+from fake_auth_redis import install_fake_auth_redis, issue_active_app_token, seed_test_user
 
 
 def _add_tx(db_session, *, year: int, idx: int):
@@ -67,7 +68,12 @@ def _client_with_env(db_session, monkeypatch, *, config_path, with_token=None, s
     monkeypatch.setenv("SYSTEM_ACCESS_ENFORCED", "true")
     monkeypatch.setenv("SCOPES_MANAGED_BY_CONFIG", scopes_managed)
     monkeypatch.setenv("ROOT_ACCESS_SERVER_CONFIG_PATH", str(config_path))
+    install_fake_auth_redis(monkeypatch)
     reset_root_access_cache()
+
+    app_user_token = issue_active_app_token(
+        seed_test_user(db_session, username="system-access-test-admin")
+    )
 
     original_lifespan = app.router.lifespan_context
     app.router.lifespan_context = noop_lifespan
@@ -76,15 +82,20 @@ def _client_with_env(db_session, monkeypatch, *, config_path, with_token=None, s
         yield db_session
 
     app.dependency_overrides[get_db_session] = override_db
-    try:
-        client = TestClient(app)
-        if with_token:
-            client.headers.update({"X-System-Access": with_token})
-        return client
-    finally:
+    client = TestClient(app)
+    if with_token:
+        client.headers.update({"X-System-Access": with_token})
+    client.headers.update({"Authorization": f"Bearer {app_user_token}"})
+    original_close = client.close
+
+    def close_with_cleanup():
+        original_close()
         app.dependency_overrides.pop(get_db_session, None)
         app.router.lifespan_context = original_lifespan
         reset_root_access_cache()
+
+    client.close = close_with_cleanup
+    return client
 
 
 def test_blocked_when_server_config_missing(db_session, monkeypatch, tmp_path):

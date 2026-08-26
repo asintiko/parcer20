@@ -18,12 +18,32 @@ from database.models import (
     TgChatMessage,
     TgHistoryCursor,
     Transaction,
+    User,
 )
 from services.ai_agent.confirm_service import execute_confirmation_for_run
 from services.ai_agent.report_service import generate_report
 from services.ai_agent.session_service import create_run, create_thread, update_run
 from services.ai_agent.tools.cache_tools import monitored_chat_sync_audit
 from services.telegram_cache_service import TelegramCacheService
+
+
+@pytest.fixture(autouse=True)
+def _seed_current_admin(db_session):
+    db_session.add(
+        User(
+            id=1,
+            username="ai-confirm-admin",
+            password_hash="test-hash",
+            salt="test-salt",
+            role="admin",
+            is_active=True,
+            allowed_tabs='["dashboard"]',
+            allowed_folders="[]",
+            forbidden_periods="[]",
+            allowed_sources="[]",
+        )
+    )
+    db_session.commit()
 
 
 def _seed_transaction(db_session, *, idx: int, amount: str = "-100.00", operator: str | None = None) -> Transaction:

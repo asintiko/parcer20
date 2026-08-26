@@ -20,6 +20,38 @@ const TOOL_LABELS: Record<string, string> = {
     report_publish_tool: 'Публикация отчета',
     report_builder: 'Формирование отчета',
     fix_plan_builder: 'План действий',
+    verify_receipt_parse: 'Сверка чека',
+    auto_describe_operators: 'Описание операторов',
+    set_operator_description: 'Запись описания',
+    list_operator_descriptions: 'Список описаний',
+    rollback_operator_descriptions: 'Откат описаний',
+};
+
+const TOOL_PURPOSE: Record<string, string> = {
+    transaction_analytics: 'Считаю сводку по транзакциям',
+    app_mapping: 'Сопоставляю операторов с приложениями',
+    data_verification: 'Проверяю корректность данных',
+    bot_reconciliation: 'Сверяю транзакции с Telegram',
+    table_search_and_navigate: 'Ищу нужные строки и готовлю переход',
+    db_inspector: 'Смотрю состояние системы',
+    duplicate_detector: 'Ищу повторяющиеся операции',
+    processing_errors_analyzer: 'Разбираю ошибки обработки чеков',
+    source_health_check: 'Проверяю состояние источников',
+    monitored_chat_sync_audit: 'Сверяю чеки из мониторинга',
+    telegram_cache_search: 'Ищу сообщения в кеше Telegram',
+    message_to_transaction_trace: 'Прослеживаю путь от сообщения к транзакции',
+    failed_receipt_investigator: 'Разбираюсь, почему чек не обработался',
+    duplicate_merge_preview: 'Готовлю кандидатов на объединение',
+    receipt_reparse_preview: 'Перепроверяю распознавание чека',
+    monitor_config_inspector: 'Смотрю настройки мониторинга',
+    report_publish_tool: 'Публикую готовый отчет',
+    report_builder: 'Собираю отчет по данным',
+    fix_plan_builder: 'Составляю план исправлений',
+    verify_receipt_parse: 'Сверяю распознанный чек с исходным сообщением',
+    auto_describe_operators: 'Ищу в интернете и подписываю операторов',
+    set_operator_description: 'Записываю описание оператора',
+    list_operator_descriptions: 'Собираю список описаний операторов',
+    rollback_operator_descriptions: 'Откатываю записанные описания',
 };
 
 const STATUS_LABELS: Record<string, string> = {
@@ -73,9 +105,38 @@ export function formatToolLabel(toolName?: string | null): string {
     return TOOL_LABELS[toolName] || toolName;
 }
 
+export function formatToolPurpose(toolName?: string | null): string {
+    if (!toolName) return '';
+    return TOOL_PURPOSE[toolName] || '';
+}
+
 export function formatRunStatus(status?: string | null): string {
     if (!status) return 'Выполняется';
     return STATUS_LABELS[status] || status;
+}
+
+const WEB_READING_PREFIX = '🌐 Читаю в интернете';
+
+/** True when a payload describes the live "reading the web" step. */
+export function isWebSearchPayload(
+    payload?: Record<string, any> | null,
+    label?: string | null,
+): boolean {
+    if (payload && typeof payload === 'object') {
+        const step = String(payload.step || '').trim().toLowerCase();
+        if (step === 'web_search') return true;
+    }
+    if (typeof label === 'string' && label.trim().startsWith('🌐')) return true;
+    return false;
+}
+
+/** Live "🌐 Читаю в интернете: <operator>" line, operator drawn from payload. */
+export function formatWebSearchLabel(payload?: Record<string, any> | null): string {
+    const operator =
+        payload && typeof payload === 'object'
+            ? String(payload.operator || payload.query || payload.term || '').trim()
+            : '';
+    return operator ? `${WEB_READING_PREFIX}: ${operator}` : `${WEB_READING_PREFIX}…`;
 }
 
 export function formatRunStep(step?: string | null, toolName?: string | null): string {
@@ -90,15 +151,31 @@ export function formatRunStep(step?: string | null, toolName?: string | null): s
     if (normalized === 'confirmed') return 'Подтверждение получено';
     if (normalized === 'completed') return 'Ответ готов';
     if (normalized === 'failed') return 'Во время обработки возникла ошибка';
+    if (normalized === 'web_search') return `${WEB_READING_PREFIX}…`;
+    if (normalized === 'describe_operator') return 'Подписываю оператора';
+    if (normalized === 'write_description') return 'Записываю описание';
     return formatToolLabel(toolName);
 }
 
-export function formatRunEventLabel(eventType?: string | null, label?: string | null, toolName?: string | null): string {
+export function formatRunEventLabel(
+    eventType?: string | null,
+    label?: string | null,
+    toolName?: string | null,
+    payload?: Record<string, any> | null,
+): string {
     const normalized = String(eventType || '').trim().toLowerCase();
+    if (isWebSearchPayload(payload, label)) {
+        return label && label.trim().startsWith('🌐') ? label : formatWebSearchLabel(payload);
+    }
     if (normalized === 'planning_started') return 'Понимаю запрос';
     if (normalized === 'tool_selected') return label || `Выбран инструмент: ${formatToolLabel(toolName)}`;
     if (normalized === 'tool_started') return label || `Запускаю: ${formatToolLabel(toolName)}`;
-    if (normalized === 'tool_progress') return label || (toolName === 'monitored_chat_sync_audit' ? 'Сверяю чеки' : 'Проверяю данные');
+    if (normalized === 'tool_progress') {
+        if (label) return label;
+        if (toolName === 'monitored_chat_sync_audit') return 'Сверяю чеки';
+        if (toolName === 'auto_describe_operators') return 'Подписываю операторов';
+        return 'Проверяю данные';
+    }
     if (normalized === 'tool_finished') return label || 'Шаг завершен';
     if (normalized === 'awaiting_confirmation') return 'Жду подтверждения';
     if (normalized === 'completed') return 'Готово';
@@ -131,7 +208,6 @@ export function formatNotificationBody(notification: AgentNotification): string 
 
 export function formatNavigationLabel(target?: AgentLocateResult | null): string {
     if (!target) return 'Открыть';
-    if (target.route === '/automation') return 'Открыть Автоматизацию';
     if (target.focus_mode === 'filter') return 'Открыть операции';
     if (Array.isArray(target.row_ids) && target.row_ids.length > 1) return 'Показать операции';
     if (target.row_id) return 'Показать в таблице';

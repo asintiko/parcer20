@@ -203,6 +203,7 @@ def test_bulk_delete_operator_blocked_by_locked_period(client, db_session, user_
         "username": "operator",
         "role": "operator",
         "allowed_folders": [int(scope.id)],
+        "allowed_sources": [100],
     }
 
     tx = _seed_tx(db_session, idx=4, day=15)

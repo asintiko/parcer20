@@ -35,9 +35,12 @@ def _bool_env(name: str, default: bool) -> bool:
 
 
 def _dedup_mode() -> str:
-    mode = (os.getenv("FINGERPRINT_DEDUP_MODE", "dual") or "dual").strip().lower()
+    # Fingerprints are reconciliation hints, not idempotency keys.  The legacy
+    # hash collapses every card-less transfer with the same amount/minute, so it
+    # must never be consulted implicitly by the online ingestion path.
+    mode = (os.getenv("FINGERPRINT_DEDUP_MODE", "v2") or "v2").strip().lower()
     if mode not in {"legacy", "dual", "v2"}:
-        return "dual"
+        return "v2"
     return mode
 
 

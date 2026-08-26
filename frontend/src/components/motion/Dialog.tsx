@@ -1,6 +1,8 @@
 import React from 'react';
 import { motion, AnimatePresence, type Variants } from 'motion/react';
 import { X } from 'lucide-react';
+import { useRegisterOverlay } from '../../utils/overlayStore';
+import { useModalFocus } from '../../hooks/useModalFocus';
 
 /**
  * Center pop dialog primitive.
@@ -52,22 +54,11 @@ export const Dialog: React.FC<DialogProps> = ({
     width = 440,
     ariaLabel,
 }) => {
-    React.useEffect(() => {
-        if (!open) return;
-        const onKey = (e: KeyboardEvent) => {
-            if (e.key === 'Escape') {
-                e.preventDefault();
-                onClose();
-            }
-        };
-        window.addEventListener('keydown', onKey);
-        const prev = document.body.style.overflow;
-        document.body.style.overflow = 'hidden';
-        return () => {
-            window.removeEventListener('keydown', onKey);
-            document.body.style.overflow = prev;
-        };
-    }, [open, onClose]);
+    const dialogRef = React.useRef<HTMLDivElement>(null);
+    const titleId = React.useId();
+    const descriptionId = React.useId();
+    useRegisterOverlay(open);
+    useModalFocus(open, dialogRef, onClose);
 
     const widthCss = typeof width === 'number' ? `${width}px` : width;
 
@@ -87,10 +78,14 @@ export const Dialog: React.FC<DialogProps> = ({
                     {/* Centering wrapper — does NOT animate, owns flex layout */}
                     <div className="sp-dialog-center" role="presentation">
                         <motion.div
+                            ref={dialogRef}
                             className="sp-dialog"
                             role="dialog"
                             aria-modal="true"
                             aria-label={ariaLabel}
+                            aria-labelledby={ariaLabel ? undefined : titleId}
+                            aria-describedby={description ? descriptionId : undefined}
+                            tabIndex={-1}
                             variants={dialogVariants}
                             initial="hidden"
                             animate="visible"
@@ -101,11 +96,11 @@ export const Dialog: React.FC<DialogProps> = ({
                             <div className="sp-sheet-head">
                                 <div style={{ minWidth: 0 }}>
                                     {typeof title === 'string' ? (
-                                        <h3 className="sp-sheet-title">{title}</h3>
+                                        <h3 id={titleId} className="sp-sheet-title">{title}</h3>
                                     ) : (
-                                        title
+                                        <div id={titleId}>{title}</div>
                                     )}
-                                    {description ? <div className="sp-sheet-sub">{description}</div> : null}
+                                    {description ? <div id={descriptionId} className="sp-sheet-sub">{description}</div> : null}
                                 </div>
                                 <button
                                     type="button"

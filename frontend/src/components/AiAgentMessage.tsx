@@ -1,11 +1,11 @@
 import React from 'react';
 import { motion } from 'motion/react';
 import type { AgentLocateResult, AgentMessage, AgentReport, AgentRun } from '../services/api';
-import { AiAgentToolCard, type ToolCardSection } from './AiAgentToolCard';
+import { AiAgentToolCard, type ToolCardSection, type ToolCardStatus } from './AiAgentToolCard';
 import { AiAgentReportCard } from './AiAgentReportCard';
 import { AiAgentConfirmationCard } from './AiAgentConfirmationCard';
 import { AiAgentMarkdown } from './AiAgentMarkdown';
-import { formatNavigationLabel, humanizeSummaryKey, prettyJson } from '../utils/aiAgentDisplay';
+import { formatNavigationLabel, humanizeSummaryKey } from '../utils/aiAgentDisplay';
 import { useAiAgent, type AiAgentUiAction } from '../contexts/AiAgentContext';
 
 const formatTime = (raw?: string | null) => {
@@ -20,6 +20,19 @@ const formatValue = (value: unknown): string => {
     if (typeof value === 'number') return value.toLocaleString('ru-RU');
     if (typeof value === 'boolean') return value ? 'да' : 'нет';
     return String(value);
+};
+
+const resolveCardTool = (card: any): string | null => {
+    const raw = card?.tool || card?.tool_name || card?.payload?.tool_name;
+    return raw ? String(raw) : null;
+};
+
+const resolveCardStatus = (card: any): ToolCardStatus | undefined => {
+    const raw = String(card?.status || card?.payload?.status || '').toLowerCase();
+    if (raw === 'running' || raw === 'processing' || raw === 'pending') return 'running';
+    if (raw === 'failed' || raw === 'error') return 'failed';
+    if (raw === 'completed' || raw === 'done' || raw === 'ok' || raw === 'success') return 'completed';
+    return undefined;
 };
 
 interface AiAgentMessageProps {
@@ -63,7 +76,7 @@ export const AiAgentMessage: React.FC<AiAgentMessageProps> = ({
         dispatchUiAction(uiAction, { messageId: message.id });
     }, [dispatchUiAction, isUser, message.id, uiAction]);
 
-    const buildAnalyticsSections = (card: any): { eyebrow?: string; sections: ToolCardSection[]; details?: unknown } => {
+    const buildAnalyticsSections = (card: any): { eyebrow?: string; sections: ToolCardSection[] } => {
         const payload = card?.payload && typeof card.payload === 'object' ? card.payload : {};
         const totals = Array.isArray(payload.totals) ? payload.totals : [];
         const topApplications = Array.isArray(payload.top_applications) ? payload.top_applications : [];
@@ -106,10 +119,10 @@ export const AiAgentMessage: React.FC<AiAgentMessageProps> = ({
             });
         }
 
-        return { eyebrow: 'АНАЛИТИКА', sections, details: card?.details };
+        return { eyebrow: 'АНАЛИТИКА', sections };
     };
 
-    const buildAuditSections = (card: any): { eyebrow?: string; sections: ToolCardSection[]; details?: unknown } => {
+    const buildAuditSections = (card: any): { eyebrow?: string; sections: ToolCardSection[] } => {
         const payload = card?.payload && typeof card.payload === 'object' ? card.payload : {};
         const sections: ToolCardSection[] = [];
 
@@ -154,10 +167,10 @@ export const AiAgentMessage: React.FC<AiAgentMessageProps> = ({
             });
         }
 
-        return { eyebrow: 'АУДИТ', sections, details: card?.details };
+        return { eyebrow: 'АУДИТ', sections };
     };
 
-    const buildGenericSections = (card: any): { eyebrow?: string; sections: ToolCardSection[]; details?: unknown } => {
+    const buildGenericSections = (card: any): { eyebrow?: string; sections: ToolCardSection[] } => {
         const payload = card?.payload;
         const sections: ToolCardSection[] = [];
 
@@ -184,7 +197,6 @@ export const AiAgentMessage: React.FC<AiAgentMessageProps> = ({
         return {
             eyebrow: String(card?.type || 'РЕЗУЛЬТАТ').toUpperCase(),
             sections,
-            details: card?.details ?? card?.payload,
         };
     };
 
@@ -235,7 +247,9 @@ export const AiAgentMessage: React.FC<AiAgentMessageProps> = ({
                                     title={String(card?.title || 'Итоги')}
                                     body={String(card?.body || '')}
                                     sections={built.sections}
-                                    details={built.details}
+                                    tool={resolveCardTool(card)}
+                                    type="analytics"
+                                    status={resolveCardStatus(card)}
                                 />
                             );
                         }
@@ -248,7 +262,9 @@ export const AiAgentMessage: React.FC<AiAgentMessageProps> = ({
                                     title={String(card?.title || 'Аудит мониторинга чеков')}
                                     body={String(card?.body || '')}
                                     sections={built.sections}
-                                    details={built.details}
+                                    tool={resolveCardTool(card)}
+                                    type="audit"
+                                    status={resolveCardStatus(card)}
                                 />
                             );
                         }
@@ -260,7 +276,9 @@ export const AiAgentMessage: React.FC<AiAgentMessageProps> = ({
                                 title={String(card?.title || card?.type || 'Результат')}
                                 body={typeof card?.body === 'string' ? card.body : ''}
                                 sections={built.sections}
-                                details={built.details}
+                                tool={resolveCardTool(card)}
+                                type={card?.type ? String(card.type) : null}
+                                status={resolveCardStatus(card)}
                             />
                         );
                     })}
@@ -296,6 +314,3 @@ export const AiAgentMessage: React.FC<AiAgentMessageProps> = ({
         </motion.div>
     );
 };
-
-// utility re-export to keep imports tidy
-export { prettyJson };

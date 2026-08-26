@@ -11,8 +11,8 @@ from api.main import app
 from database.connection import get_db_session
 from database.models import User
 from services.access_control_service import hash_password
-from services.auth_service import create_app_user_token
 from services.root_access_config_service import hash_password_pbkdf2, reset_root_access_cache
+from fake_auth_redis import install_fake_auth_redis, issue_active_app_token
 
 
 def _seed_user(db_session, *, username: str, role: str) -> User:
@@ -38,13 +38,7 @@ def _seed_user(db_session, *, username: str, role: str) -> User:
 
 
 def _make_token(user: User) -> str:
-    return create_app_user_token(
-        user_id=int(user.id),
-        username=user.username,
-        role=user.role,
-        permissions_version=int(user.permissions_version),
-        display_name=user.display_name,
-    )
+    return issue_active_app_token(user)
 
 
 @pytest.fixture
@@ -82,6 +76,7 @@ def client(db_session, monkeypatch, tmp_path):
     monkeypatch.setenv("SCOPES_MANAGED_BY_CONFIG", "false")
     monkeypatch.setenv("ROOT_ACCESS_SERVER_CONFIG_PATH", str(config_path))
     monkeypatch.setenv("LAUNCH_GATE_ENABLED", "false")
+    install_fake_auth_redis(monkeypatch)
     reset_root_access_cache()
 
     original_lifespan = app.router.lifespan_context

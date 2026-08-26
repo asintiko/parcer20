@@ -101,7 +101,6 @@ def _build_message(health: Dict[str, Any]) -> str:
     failed = int(totals.get("failed", 0))
     stuck = int(totals.get("stuck", 0))
     dups = int(totals.get("duplicate_groups", 0))
-    orphan = int(totals.get("orphan_rows", 0))
 
     if has_issues:
         lines.append("")
@@ -112,8 +111,6 @@ def _build_message(health: Dict[str, Any]) -> str:
             lines.append(f"  ⏳ Зависших задач: <b>{stuck}</b>")
         if dups:
             lines.append(f"  ♻️ Групп дубликатов: <b>{dups}</b>")
-        if orphan:
-            lines.append(f"  🏷 Без маппинга: <b>{orphan}</b>")
 
         # Top 3 problem chats
         problem_chats = [

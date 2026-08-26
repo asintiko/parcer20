@@ -19,7 +19,12 @@ from services.access_control_service import (
     years_from_json,
     write_audit_log,
 )
-from services.auth_bot_service import is_session_revoked, touch_active_session, verify_launch_session_token
+from services.auth_bot_service import (
+    SessionStoreUnavailableError,
+    is_active_session,
+    touch_active_session,
+    verify_launch_session_token,
+)
 from services.auth_service import verify_jwt_token
 from services.internal_api_key_service import is_internal_request
 from services.root_access_config_service import (
@@ -60,13 +65,13 @@ def _resolve_auth_required() -> bool:
     # prod .env flag silently disable auth, so both triggers were removed.
     allow_insecure = _env_flag("ALLOW_INSECURE_NO_AUTH", False)
     env_name = _runtime_env_name()
-    prod_envs = {"prod", "production", "live"}
-    if allow_insecure and env_name not in prod_envs:
+    test_envs = {"test", "testing"}
+    if allow_insecure and env_name in test_envs:
         return False
 
     logger.warning(
         "AUTH_REQUIRED=false ignored. Set ALLOW_INSECURE_NO_AUTH=true in a "
-        "non-production environment to allow unauthenticated local access."
+        "declared test environment to allow unauthenticated test access."
     )
     return True
 
@@ -108,13 +113,23 @@ def _parse_iso_datetime(value: Any) -> Optional[datetime]:
         return None
 
 
-def _session_revoked(payload: Optional[Dict[str, Any]]) -> bool:
+async def require_session_active(payload: Optional[Dict[str, Any]]) -> str:
+    """Require a registered, non-revoked server-side session."""
     if not isinstance(payload, dict):
-        return False
+        raise HTTPException(status_code=401, detail="invalid_session")
     sid = str(payload.get("sid") or "").strip()
     if not sid:
-        return False
-    return bool(is_session_revoked(sid))
+        raise HTTPException(status_code=401, detail="missing_session_id")
+    token_kind = str(payload.get("kind") or "").strip()
+    expected_kind = "app_user" if token_kind in {"app_user", "refresh_token"} else token_kind
+    try:
+        active = await is_active_session(sid, expected_kind=expected_kind or None)
+    except SessionStoreUnavailableError as exc:
+        logger.error("Session store unavailable while authenticating sid=%s: %s", sid, exc)
+        raise HTTPException(status_code=503, detail="session_store_unavailable") from exc
+    if not active:
+        raise HTTPException(status_code=401, detail="session_inactive")
+    return sid
 
 
 def _normalize_int_list(values: Any) -> List[int]:
@@ -169,42 +184,30 @@ async def get_current_user_optional(
     payload = verify_jwt_token(token)
     if not payload:
         return None
-    if _session_revoked(payload):
+    token_kind = str(payload.get("kind") or "").lower()
+    if token_kind != "app_user":
         return None
+    await require_session_active(payload)
     user_id = _to_int(payload.get("sub") or payload.get("user_id"))
     if not user_id:
-        return payload
+        return None
     row = db.get(User, user_id)
     if not row:
-        if str(payload.get("kind") or "").lower() == "qr_user":
-            return {
-                "id": user_id,
-                "user_id": user_id,
-                "username": f"qr_{user_id}",
-                "display_name": payload.get("phone") or f"qr_{user_id}",
-                "role": "operator",
-                "allowed_tabs": ["dashboard"],
-                "allowed_folders": [],
-                "forbidden_periods": [],
-                "allowed_sources": [],
-                "can_toggle_sources": False,
-                "permissions_version": 1,
-                "session_ttl_days": 7,
-                "token_kind": "qr_legacy",
-                "exp": payload.get("exp"),
-                "phone": payload.get("phone"),
-            }
-        return payload
+        return None
+    if not row.is_active:
+        return None
+    token_version = _to_int(payload.get("permissions_version"))
+    db_version = int(row.permissions_version or 1)
+    if token_version != db_version:
+        return None
     snapshot = build_permissions_snapshot(row)
-    snapshot["token_kind"] = str(payload.get("kind") or "app_user")
+    snapshot["token_kind"] = "app_user"
     snapshot["exp"] = payload.get("exp")
     snapshot["phone"] = payload.get("phone")
-    sid = str(payload.get("sid") or "").strip()
-    if sid:
-        try:
-            await touch_active_session(sid)
-        except Exception:
-            pass
+    try:
+        await touch_active_session(str(payload["sid"]))
+    except Exception:
+        pass
     return snapshot
 
 
@@ -249,97 +252,56 @@ async def get_current_user(
             detail="Invalid or expired token",
             headers={"WWW-Authenticate": "Bearer"}
         )
-    if _session_revoked(payload):
+    token_kind = str(payload.get("kind") or "").lower()
+    if token_kind != "app_user":
         raise HTTPException(
             status_code=401,
-            detail="session_revoked",
+            detail="invalid_token_purpose",
             headers={"WWW-Authenticate": "Bearer"},
         )
+    await require_session_active(payload)
 
-    token_kind = str(payload.get("kind") or "").lower()
     user_id = _to_int(payload.get("sub") or payload.get("user_id"))
-
-    if user_id is not None:
-        row = db.get(User, user_id)
-        if row:
-            if not row.is_active:
-                raise HTTPException(status_code=403, detail="inactive_user")
-            token_version = _to_int(payload.get("permissions_version"))
-            db_version = int(row.permissions_version or 1)
-            if token_version is not None and token_kind == "app_user" and token_version != db_version:
-                raise HTTPException(status_code=401, detail="permissions_outdated")
-            snapshot = build_permissions_snapshot(row)
-            snapshot["token_kind"] = token_kind or "app_user"
-            snapshot["exp"] = payload.get("exp")
-            snapshot["phone"] = payload.get("phone")
-            sid = str(payload.get("sid") or "").strip()
-            if sid:
-                try:
-                    await touch_active_session(sid)
-                except Exception:
-                    pass
-            return snapshot
-
-    if token_kind == "qr_user":
-        return {
-            "id": user_id or 0,
-            "user_id": user_id or 0,
-            "username": f"qr_{user_id or 0}",
-            "display_name": payload.get("phone") or f"qr_{user_id or 0}",
-            "role": "operator",
-            "allowed_tabs": ["dashboard"],
-            "allowed_folders": [],
-            "forbidden_periods": [],
-            "allowed_sources": [],
-            "can_toggle_sources": False,
-            "permissions_version": 1,
-            "session_ttl_days": 7,
-            "token_kind": "qr_legacy",
-            "exp": payload.get("exp"),
-            "phone": payload.get("phone"),
-        }
-
-    if token_kind == "app_user":
+    if user_id is None:
         raise HTTPException(
             status_code=401,
             detail="Invalid or expired token",
             headers={"WWW-Authenticate": "Bearer"},
         )
-
-    return payload
+    row = db.get(User, user_id)
+    if not row:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid or expired token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    if not row.is_active:
+        raise HTTPException(status_code=403, detail="inactive_user")
+    token_version = _to_int(payload.get("permissions_version"))
+    db_version = int(row.permissions_version or 1)
+    if token_version != db_version:
+        raise HTTPException(status_code=401, detail="permissions_outdated")
+    snapshot = build_permissions_snapshot(row)
+    snapshot["token_kind"] = "app_user"
+    snapshot["exp"] = payload.get("exp")
+    snapshot["phone"] = payload.get("phone")
+    try:
+        await touch_active_session(str(payload["sid"]))
+    except Exception:
+        pass
+    return snapshot
 
 
 async def get_current_app_user(
     current_user: dict = Depends(get_current_user),
 ) -> dict:
-    if current_user.get("role"):
+    if current_user.get("role") and str(current_user.get("token_kind") or "").lower() in {"app_user", "local"}:
         return current_user
-    # Compatibility shim for the QR/legacy login path, which returns a roleless
-    # payload. Gate it to those token kinds only: without this check, ANY
-    # signature-valid JWT that lacks a role (e.g. a refresh_token presented as a
-    # bearer) was silently escalated to operator/dashboard access.
-    kind = str(current_user.get("token_kind") or current_user.get("kind") or "").lower()
-    if kind not in {"qr_user", "qr_legacy", "legacy"}:
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid or expired token",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    return {
-        "id": _to_int(current_user.get("user_id")) or 0,
-        "user_id": _to_int(current_user.get("user_id")) or 0,
-        "username": str(current_user.get("user_id") or "legacy"),
-        "display_name": str(current_user.get("phone") or "Legacy user"),
-        "role": "operator",
-        "allowed_tabs": ["dashboard"],
-        "allowed_folders": [],
-        "forbidden_periods": [],
-        "allowed_sources": [],
-        "can_toggle_sources": False,
-        "permissions_version": 1,
-        "session_ttl_days": 7,
-        "token_kind": "legacy",
-    }
+    raise HTTPException(
+        status_code=401,
+        detail="Invalid or expired token",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
 
 
 async def require_admin_user(
@@ -549,6 +511,28 @@ def configured_mobile_ingest_keys() -> List[str]:
     return keys
 
 
+def configured_export_keys() -> List[str]:
+    """
+    Active read-only transactions-export keys in priority order.
+
+    Consumed by the Excel Power Query live sheet (`GET /api/transactions/export.csv`).
+    Rotation mirrors the mobile ingest key:
+    - TRANSACTIONS_EXPORT_KEY: current primary key.
+    - TRANSACTIONS_EXPORT_KEY_PREVIOUS: prior key still accepted during rollout,
+      so operators on an older workbook keep pulling until they get the new file.
+      Drop PREVIOUS once every workbook has been re-issued.
+    """
+    keys: List[str] = []
+    for value in (
+        os.getenv("TRANSACTIONS_EXPORT_KEY", ""),
+        os.getenv("TRANSACTIONS_EXPORT_KEY_PREVIOUS", ""),
+    ):
+        normalized = str(value or "").strip()
+        if normalized and normalized not in keys:
+            keys.append(normalized)
+    return keys
+
+
 async def get_scope_context_optional(
     conn: HTTPConnection,
     db: Session = Depends(get_db_session),
@@ -574,7 +558,20 @@ async def get_scope_context_optional(
             "date_to": None,
         }
     token = x_access_token or conn.headers.get("x-access-token")
-    payload = decode_scope_token(token) if token else None
+    decoded_payload = decode_scope_token(token) if token else None
+    payload = _resolve_current_scope_payload(db, decoded_payload) if decoded_payload else None
+    if token and not payload:
+        try:
+            write_audit_log(
+                db,
+                action="scope_stale_or_invalid",
+                success=False,
+                ip_address=_extract_client_ip(conn),
+                details={"path": str(conn.url.path)},
+            )
+        except Exception:
+            pass
+        raise HTTPException(status_code=403, detail="Scoped access token is stale or invalid")
 
     # Admin users always have full data access in RBAC v1,
     # even when scoped mode is enabled globally.
@@ -720,6 +717,7 @@ async def require_launch_session(
     payload = verify_launch_session_token(token)
     if not payload:
         raise HTTPException(status_code=403, detail={"error": "launch_expired"})
+    await require_session_active(payload)
     if row.locked_until and row.locked_until > _now_naive():
         raise HTTPException(status_code=423, detail={"error": "launch_locked", "locked_until": row.locked_until.isoformat()})
 
@@ -774,3 +772,125 @@ async def require_mobile_ingest_key(
         )
     except Exception:
         pass
+
+
+async def require_export_key(
+    conn: HTTPConnection,
+    db: Session = Depends(get_db_session),
+    x_export_key: Optional[str] = Header(None, alias="X-Export-Key"),
+) -> None:
+    """
+    Validate the dedicated read-only key for the transactions CSV export.
+
+    Used by the Excel live sheet, which re-pulls once a minute per operator, so
+    success is intentionally NOT audit-logged (only failures) to keep audit_log
+    from being flooded by routine refreshes.
+    """
+    ip = _extract_client_ip(conn)
+    path = str(conn.url.path)
+    configured_keys = configured_export_keys()
+    if not configured_keys:
+        try:
+            write_audit_log(
+                db,
+                action="transactions_export_auth_fail",
+                success=False,
+                ip_address=ip,
+                details={"path": path, "reason": "export_key_not_configured"},
+            )
+        except Exception:
+            pass
+        raise HTTPException(status_code=503, detail="Transactions export key is not configured")
+
+    provided_key = (x_export_key or "").strip()
+    if not provided_key or not any(
+        secrets.compare_digest(provided_key, key) for key in configured_keys
+    ):
+        try:
+            write_audit_log(
+                db,
+                action="transactions_export_auth_fail",
+                success=False,
+                ip_address=ip,
+                details={"path": path, "reason": "invalid_export_key"},
+            )
+        except Exception:
+            pass
+        raise HTTPException(status_code=403, detail="Invalid X-Export-Key")
+
+
+def _normalized_scope_datetime(value: Any) -> Optional[str]:
+    parsed = _parse_iso_datetime(value)
+    if parsed is None:
+        return None
+    if parsed.tzinfo is not None:
+        parsed = parsed.replace(tzinfo=None)
+    return parsed.isoformat()
+
+
+def _scope_claims_match(token_payload: Dict[str, Any], current: Dict[str, Any]) -> bool:
+    return (
+        str(token_payload.get("scope_name") or "") == str(current.get("scope_name") or "")
+        and _normalize_int_list(token_payload.get("years")) == _normalize_int_list(current.get("years"))
+        and _normalized_scope_datetime(token_payload.get("date_from")) == _normalized_scope_datetime(current.get("date_from"))
+        and _normalized_scope_datetime(token_payload.get("date_to")) == _normalized_scope_datetime(current.get("date_to"))
+        and bool(token_payload.get("allow_transactions", True)) == bool(current.get("allow_transactions", True))
+        and bool(token_payload.get("allow_sources", False)) == bool(current.get("allow_sources", False))
+    )
+
+
+def _resolve_current_scope_payload(
+    db: Session,
+    token_payload: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    if not token_payload:
+        return None
+    scope_id = _to_int(token_payload.get("scope_id"))
+    if scope_id is None:
+        return None
+
+    row = db.get(AccessScope, scope_id)
+    if row is not None:
+        if not row.is_active:
+            return None
+        current = {
+            "scope_id": int(row.id),
+            "scope_name": row.name,
+            "years": years_from_json(row.years_json),
+            "date_from": row.period_start.isoformat() if row.period_start else None,
+            "date_to": row.period_end.isoformat() if row.period_end else None,
+            "allow_transactions": bool(row.allow_transactions),
+            "allow_sources": bool(row.allow_sources),
+        }
+        if not _scope_claims_match(token_payload, current):
+            return None
+        issued_at = _to_int(token_payload.get("iat"))
+        if issued_at is None:
+            return None
+        if row.updated_at is not None and issued_at < int(row.updated_at.timestamp()):
+            return None
+        return current
+
+    for configured in get_config_scopes(active_only=True):
+        public = config_scope_to_public_dict(configured)
+        if _to_int(public.get("id")) != scope_id:
+            continue
+        current = {
+            "scope_id": scope_id,
+            "scope_name": public.get("name"),
+            "years": public.get("years") or [],
+            "date_from": public.get("period_start"),
+            "date_to": public.get("period_end"),
+            "allow_transactions": bool(public.get("allow_transactions", True)),
+            "allow_sources": bool(public.get("allow_sources", False)),
+        }
+        if not _scope_claims_match(token_payload, current):
+            return None
+        issued_at = _to_int(token_payload.get("iat"))
+        if issued_at is None:
+            return None
+        config_updated_at = _parse_iso_datetime(public.get("updated_at"))
+        if config_updated_at is not None and issued_at < int(config_updated_at.timestamp()):
+            return None
+        return current
+    return None

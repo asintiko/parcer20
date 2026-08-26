@@ -1,9 +1,41 @@
-const { app, BrowserWindow, ipcMain, Menu, screen } = require('electron');
+const { app, BrowserWindow, dialog, ipcMain, Menu, safeStorage, screen, session, shell } = require('electron');
 const { autoUpdater } = require('electron-updater');
 const fs = require('fs');
 const path = require('path');
+const {
+    canonicalApiBaseUrl,
+    classifyExternalUrl,
+    hasSameOrigin,
+    importLegacyRefreshToken,
+    isAllowedApiRequest,
+    isSafeMiniAppUrl,
+    isTrustedRendererUrl,
+} = require('./security-policy.cjs');
 
 let mainWindow;
+
+// Absolute file:// path to the Mini App <webview> preload. Exposed to the renderer
+// via the 'miniapp:get-preload-path' ipc handler so <webview preload="..."> resolves
+// regardless of packaged vs. dev layout.
+const WEBAPP_PRELOAD_PATH = path.join(__dirname, 'webapp-preload.cjs');
+
+// Partition used by the Mini App <webview>. Must match the renderer
+// (MiniAppHost.tsx uses partition="persist:miniapp").
+const MINIAPP_PARTITION = 'persist:miniapp';
+const DIST_DIRECTORY = path.join(__dirname, '..', 'dist');
+const SECURE_STORAGE_KEYS = new Set(['refresh_token']);
+
+function isTrustedRendererEvent(event) {
+    if (!mainWindow || event.sender.id !== mainWindow.webContents.id) return false;
+    const senderUrl = event.senderFrame?.url || event.sender.getURL();
+    return isTrustedRendererUrl(senderUrl, DIST_DIRECTORY, process.env.VITE_DEV_SERVER_URL || '');
+}
+
+function requireTrustedRenderer(event) {
+    if (!isTrustedRendererEvent(event)) {
+        throw new Error('Untrusted renderer IPC sender');
+    }
+}
 
 function resolveClientAccessConfigCandidates() {
     const candidates = [];
@@ -129,6 +161,114 @@ function loadClientAccessConfig() {
     return lastFailure;
 }
 
+function publicClientAccessStatus() {
+    const config = loadClientAccessConfig();
+    let apiBaseUrl = null;
+    try {
+        apiBaseUrl = canonicalApiBaseUrl(config.apiBaseUrl || 'http://127.0.0.1:8000');
+    } catch (error) {
+        return {
+            ok: false,
+            source: config.source,
+            error: error?.message || String(error),
+            apiBaseUrl: null,
+        };
+    }
+    return {
+        ok: Boolean(config.ok),
+        source: config.source,
+        error: config.error,
+        apiBaseUrl,
+    };
+}
+
+function secureStorageFilePath() {
+    return path.join(app.getPath('userData'), 'secure-storage.json');
+}
+
+function readSecureStorageFile() {
+    const storagePath = secureStorageFilePath();
+    if (!fs.existsSync(storagePath)) return {};
+    const parsed = JSON.parse(fs.readFileSync(storagePath, 'utf8'));
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+}
+
+function writeSecureStorageFile(payload) {
+    const storagePath = secureStorageFilePath();
+    fs.mkdirSync(path.dirname(storagePath), { recursive: true, mode: 0o700 });
+    const temporaryPath = `${storagePath}.tmp`;
+    fs.writeFileSync(temporaryPath, JSON.stringify(payload), { encoding: 'utf8', mode: 0o600 });
+    fs.renameSync(temporaryPath, storagePath);
+}
+
+function assertSecureStorageKey(key) {
+    const normalized = String(key || '');
+    if (!SECURE_STORAGE_KEYS.has(normalized)) throw new Error('Unsupported secure storage key');
+    if (!safeStorage.isEncryptionAvailable()) throw new Error('OS-backed secure storage is unavailable');
+    return normalized;
+}
+
+function getSecureValue(key) {
+    const normalized = assertSecureStorageKey(key);
+    const encrypted = readSecureStorageFile()[normalized];
+    if (!encrypted) return null;
+    return safeStorage.decryptString(Buffer.from(String(encrypted), 'base64'));
+}
+
+function setSecureValue(key, value) {
+    const normalized = assertSecureStorageKey(key);
+    const plaintext = String(value || '');
+    if (!plaintext || plaintext.length > 16384) throw new Error('Invalid secure storage value');
+    const payload = readSecureStorageFile();
+    payload[normalized] = safeStorage.encryptString(plaintext).toString('base64');
+    writeSecureStorageFile(payload);
+}
+
+function removeSecureValue(key) {
+    const normalized = String(key || '');
+    if (!SECURE_STORAGE_KEYS.has(normalized)) throw new Error('Unsupported secure storage key');
+    const payload = readSecureStorageFile();
+    delete payload[normalized];
+    writeSecureStorageFile(payload);
+}
+
+function setupApiHeaderBroker() {
+    session.defaultSession.webRequest.onBeforeSendHeaders(
+        { urls: ['http://*/*', 'https://*/*'] },
+        (details, callback) => {
+            const requestHeaders = { ...(details.requestHeaders || {}) };
+            for (const headerName of Object.keys(requestHeaders)) {
+                if (headerName.toLowerCase() === 'x-system-access') delete requestHeaders[headerName];
+            }
+
+            const config = loadClientAccessConfig();
+            try {
+                const apiBaseUrl = canonicalApiBaseUrl(config.apiBaseUrl || 'http://127.0.0.1:8000');
+                const rendererTrusted = Boolean(
+                    mainWindow &&
+                    details.webContentsId === mainWindow.webContents.id &&
+                    isTrustedRendererUrl(
+                        mainWindow.webContents.getURL(),
+                        DIST_DIRECTORY,
+                        process.env.VITE_DEV_SERVER_URL || '',
+                    ),
+                );
+                if (
+                    config.ok &&
+                    config.token &&
+                    rendererTrusted &&
+                    isAllowedApiRequest(apiBaseUrl, details.url, details.method)
+                ) {
+                    requestHeaders['X-System-Access'] = config.token;
+                }
+            } catch {
+                // Invalid access config is fail-closed: no system header is attached.
+            }
+            callback({ requestHeaders });
+        },
+    );
+}
+
 function buildAppMenu() {
     const isMac = process.platform === 'darwin';
     const template = [
@@ -219,6 +359,74 @@ function buildAppMenu() {
     Menu.setApplicationMenu(Menu.buildFromTemplate(template));
 }
 
+// --- Mini App host wiring ---------------------------------------------------
+
+async function confirmAndOpenExternal(rawUrl) {
+    const external = classifyExternalUrl(rawUrl, process.env.MINIAPP_EXTERNAL_HTTPS_HOSTS || '');
+    if (!external) return false;
+    const options = {
+        type: 'question',
+        title: 'Открыть внешнюю ссылку?',
+        message: `Открыть ${external.host} вне TBSparcer?`,
+        detail: external.url,
+        buttons: ['Отмена', 'Открыть'],
+        defaultId: 0,
+        cancelId: 0,
+        noLink: true,
+    };
+    const result = mainWindow
+        ? await dialog.showMessageBox(mainWindow, options)
+        : await dialog.showMessageBox(options);
+    if (result.response !== 1) return false;
+    await shell.openExternal(external.url);
+    return true;
+}
+
+let miniAppHostReady = false;
+function setupMiniAppHost() {
+    if (miniAppHostReady) return;
+    miniAppHostReady = true;
+
+    try {
+        const miniSession = session.fromPartition(MINIAPP_PARTITION);
+        miniSession.setPermissionCheckHandler(() => false);
+        miniSession.setPermissionRequestHandler((_webContents, _permission, callback) => callback(false));
+    } catch (e) {
+        console.warn('[miniapp] failed to harden partition:', e?.message || e);
+    }
+
+    // Renderer resolves <webview preload="..."> from this.
+    ipcMain.handle('miniapp:get-preload-path', (event) => {
+        requireTrustedRenderer(event);
+        return WEBAPP_PRELOAD_PATH;
+    });
+
+    // Open a link outside the app (host chrome / bridge web_app_open_link).
+    ipcMain.handle('miniapp:open-external', async (event, url) => {
+        requireTrustedRenderer(event);
+        return confirmAndOpenExternal(url);
+    });
+
+    // Pin the webview preload and route any window.open / target=_blank from inside a
+    // mini app to the OS browser; never spawn an in-app popup window.
+    app.on('web-contents-created', (_event, contents) => {
+        if (contents.getType() === 'webview') {
+            contents.setWindowOpenHandler(({ url }) => {
+                if (isSafeMiniAppUrl(contents.getURL())) void confirmAndOpenExternal(url);
+                return { action: 'deny' };
+            });
+            contents.on('will-navigate', (event, url) => {
+                const currentUrl = contents.getURL();
+                if (!isSafeMiniAppUrl(url) || (currentUrl && !hasSameOrigin(currentUrl, url))) {
+                    event.preventDefault();
+                    if (currentUrl && isSafeMiniAppUrl(currentUrl)) void confirmAndOpenExternal(url);
+                }
+            });
+        }
+    });
+
+}
+
 function createWindow() {
     const iconPath = path.join(__dirname, 'assets', 'icon.png');
     const workArea = screen.getPrimaryDisplay().workAreaSize;
@@ -234,7 +442,13 @@ function createWindow() {
         webPreferences: {
             nodeIntegration: false,
             contextIsolation: true,
+            sandbox: true,
+            webSecurity: true,
+            allowRunningInsecureContent: false,
+            navigateOnDragDrop: false,
             preload: path.join(__dirname, 'preload.cjs'),
+            // Mini Apps render inside an Electron <webview> in the userbot chat.
+            webviewTag: true,
         },
         icon: fs.existsSync(iconPath) ? iconPath : undefined,
         title: 'TBSparcer',
@@ -245,6 +459,32 @@ function createWindow() {
     // stays reachable for us via the F12 / Ctrl+Shift+I before-input-event handler.
     mainWindow.setMenuBarVisibility(false);
     mainWindow.setAutoHideMenuBar(true);
+
+    mainWindow.webContents.on('will-attach-webview', (event, webPreferences, params) => {
+        if (!isSafeMiniAppUrl(params.src)) {
+            event.preventDefault();
+            return;
+        }
+        webPreferences.preload = WEBAPP_PRELOAD_PATH;
+        webPreferences.nodeIntegration = false;
+        webPreferences.contextIsolation = true;
+        webPreferences.sandbox = true;
+        webPreferences.webSecurity = true;
+        webPreferences.allowRunningInsecureContent = false;
+        params.allowpopups = false;
+        params.partition = MINIAPP_PARTITION;
+    });
+
+    mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+        void confirmAndOpenExternal(url);
+        return { action: 'deny' };
+    });
+    mainWindow.webContents.on('will-navigate', (event, url) => {
+        if (!isTrustedRendererUrl(url, DIST_DIRECTORY, process.env.VITE_DEV_SERVER_URL || '')) {
+            event.preventDefault();
+            void confirmAndOpenExternal(url);
+        }
+    });
 
     // Load the built React app
     mainWindow.loadFile(path.join(__dirname, '..', 'dist', 'index.html'));
@@ -285,7 +525,10 @@ function createWindow() {
 }
 
 app.whenReady().then(() => {
+    setupApiHeaderBroker();
+    setupMiniAppHost();
     createWindow();
+    setupAutoUpdates();
 
     app.on('activate', () => {
         if (BrowserWindow.getAllWindows().length === 0) {
@@ -293,7 +536,6 @@ app.whenReady().then(() => {
         }
     });
 
-    setupAutoUpdates();
 });
 
 app.on('window-all-closed', () => {
@@ -302,6 +544,8 @@ app.on('window-all-closed', () => {
     }
 });
 
+let downloadedUpdateReady = false;
+
 function setupAutoUpdates() {
     const sendToRenderer = (channel, payload) => {
         if (mainWindow) {
@@ -309,11 +553,38 @@ function setupAutoUpdates() {
         }
     };
 
-    ipcMain.handle('updates:get-version', () => app.getVersion());
-    ipcMain.handle('system-access:get-status', () => loadClientAccessConfig());
-    ipcMain.handle('system-access:get-token', () => loadClientAccessConfig().token || null);
-    ipcMain.handle('system-access:get-api-base-url', () => loadClientAccessConfig().apiBaseUrl || null);
-    ipcMain.handle('updates:check', async () => {
+    ipcMain.handle('system-access:get-status', (event) => {
+        requireTrustedRenderer(event);
+        return publicClientAccessStatus();
+    });
+    ipcMain.handle('secure-storage:get', (event, key) => {
+        requireTrustedRenderer(event);
+        return getSecureValue(key);
+    });
+    ipcMain.handle('secure-storage:migrate-legacy-refresh-token', (event, legacyValue) => {
+        requireTrustedRenderer(event);
+        return importLegacyRefreshToken({
+            legacyValue,
+            readExisting: () => getSecureValue('refresh_token'),
+            writeValue: (value) => setSecureValue('refresh_token', value),
+        });
+    });
+    ipcMain.handle('secure-storage:set', (event, key, value) => {
+        requireTrustedRenderer(event);
+        setSecureValue(key, value);
+        return true;
+    });
+    ipcMain.handle('secure-storage:remove', (event, key) => {
+        requireTrustedRenderer(event);
+        removeSecureValue(key);
+        return true;
+    });
+    ipcMain.handle('updates:get-version', (event) => {
+        requireTrustedRenderer(event);
+        return app.getVersion();
+    });
+    ipcMain.handle('updates:check', async (event) => {
+        requireTrustedRenderer(event);
         if (!app.isPackaged) {
             sendToRenderer('updates:event', { status: 'not-available', info: { reason: 'dev-mode' } });
             return true;
@@ -321,7 +592,8 @@ function setupAutoUpdates() {
         await autoUpdater.checkForUpdates();
         return true;
     });
-    ipcMain.handle('updates:download', async () => {
+    ipcMain.handle('updates:download', async (event) => {
+        requireTrustedRenderer(event);
         if (!app.isPackaged) {
             sendToRenderer('updates:event', { status: 'not-available', info: { reason: 'dev-mode' } });
             return true;
@@ -329,11 +601,13 @@ function setupAutoUpdates() {
         await autoUpdater.downloadUpdate();
         return true;
     });
-    ipcMain.handle('updates:install', (_event, opts = {}) => {
+    ipcMain.handle('updates:install', (event, opts = {}) => {
+        requireTrustedRenderer(event);
         if (!app.isPackaged) {
             sendToRenderer('updates:event', { status: 'not-available', info: { reason: 'dev-mode' } });
             return true;
         }
+        if (!downloadedUpdateReady) throw new Error('No downloaded update is ready to install');
         const { isSilent = false, isForceRunAfter = false } = opts;
         autoUpdater.quitAndInstall(isSilent, isForceRunAfter);
         return true;
@@ -342,18 +616,38 @@ function setupAutoUpdates() {
     if (!app.isPackaged) return; // в dev не дергаем апдейтер
 
     autoUpdater.autoDownload = false;
+    autoUpdater.autoInstallOnAppQuit = false;
     autoUpdater.on('checking-for-update', () => sendToRenderer('updates:event', { status: 'checking' }));
-    autoUpdater.on('update-available', (info) => sendToRenderer('updates:event', { status: 'available', info }));
+    autoUpdater.on('update-available', (info) => {
+        downloadedUpdateReady = false;
+        sendToRenderer('updates:event', { status: 'available', info });
+    });
     autoUpdater.on('update-not-available', (info) => sendToRenderer('updates:event', { status: 'not-available', info }));
     autoUpdater.on('download-progress', (progressObj) =>
         sendToRenderer('updates:event', { status: 'downloading', progress: progressObj })
     );
-    autoUpdater.on('update-downloaded', (info) => sendToRenderer('updates:event', { status: 'downloaded', info }));
-    autoUpdater.on('error', (err) => sendToRenderer('updates:event', { status: 'error', error: err?.message || String(err) }));
+    autoUpdater.on('update-downloaded', (info) => {
+        downloadedUpdateReady = true;
+        sendToRenderer('updates:event', { status: 'downloaded', info });
+    });
+    autoUpdater.on('error', (err) => {
+        downloadedUpdateReady = false;
+        sendToRenderer('updates:event', { status: 'error', error: err?.message || String(err) });
+    });
+
+    const checkForUpdatesSafely = async () => {
+        try {
+            await autoUpdater.checkForUpdates();
+        } catch (error) {
+            sendToRenderer('updates:event', { status: 'error', error: error?.message || String(error) });
+        }
+    };
+
+    mainWindow?.webContents.once('did-finish-load', () => {
+        setTimeout(() => void checkForUpdatesSafely(), 1500);
+    });
 
     // авто-проверка каждые 6 часов
     const intervalMinutes = parseInt(process.env.APP_UPDATE_INTERVAL_MIN || '360', 10);
-    setInterval(() => {
-        autoUpdater.checkForUpdates();
-    }, intervalMinutes * 60 * 1000);
+    setInterval(() => void checkForUpdatesSafely(), intervalMinutes * 60 * 1000);
 }

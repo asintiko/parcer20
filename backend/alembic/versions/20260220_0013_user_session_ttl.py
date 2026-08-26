@@ -64,4 +64,3 @@ def downgrade() -> None:
             # Skip unsupported DROP COLUMN on old sqlite.
             return
         op.drop_column("users", "session_ttl_days")
-

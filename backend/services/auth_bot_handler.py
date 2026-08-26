@@ -90,6 +90,27 @@ def _is_admin(message: Message) -> bool:
     return user_id in AUTH_ADMIN_IDS
 
 
+def _current_app_admin_id(message: Message) -> Optional[int]:
+    """Resolve an env allowlisted Telegram actor to a live app admin row."""
+    telegram_id = _admin_user_id(message)
+    if telegram_id is None or telegram_id not in AUTH_ADMIN_IDS:
+        return None
+    db = SessionLocal()
+    try:
+        row = (
+            db.query(User)
+            .filter(
+                User.telegram_id == telegram_id,
+                User.role == "admin",
+                User.is_active.is_(True),
+            )
+            .first()
+        )
+        return int(row.id) if row is not None else None
+    finally:
+        db.close()
+
+
 def _audit(
     action: str,
     *,
@@ -1176,6 +1197,18 @@ async def cmd_status(message: Message) -> None:
 async def cmd_codes_off(message: Message) -> None:
     if not _is_admin(message):
         return
+    app_admin_id = _current_app_admin_id(message)
+    if app_admin_id is None:
+        _audit(
+            "codes_off_blocked_actor",
+            success=False,
+            message=message,
+            details={"reason": "active_app_admin_required"},
+        )
+        await _safe_reply(message, "⛔ Нужен активный профиль администратора приложения.")
+        return
+    if not await _ensure_mutation_allowed_message(message, "codes_off"):
+        return
     try:
         if not _has_confirm_flag(message):
             await _safe_reply(
@@ -1189,12 +1222,27 @@ async def cmd_codes_off(message: Message) -> None:
         admin_id = _admin_user_id(message)
         db = SessionLocal()
         try:
+            current_admin = (
+                db.query(User)
+                .filter(
+                    User.id == app_admin_id,
+                    User.telegram_id == admin_id,
+                    User.role == "admin",
+                    User.is_active.is_(True),
+                )
+                .with_for_update()
+                .first()
+            )
+            if current_admin is None:
+                raise PermissionError("active_app_admin_required")
+            if not is_bot_control_enabled(db):
+                raise PermissionError("bot_control_disabled")
             update_settings(
                 db,
                 otp_enabled=False,
                 totp_2fa_enabled=False,
                 launch_gate_enabled=False,
-                updated_by=admin_id,
+                updated_by=app_admin_id,
             )
             force_disabled = int(
                 db.query(User)

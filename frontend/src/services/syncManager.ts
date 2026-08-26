@@ -1,5 +1,5 @@
 import { db, SyncMetaEntry } from '../storage/db';
-import { securityApi, syncApi, SyncManifestResponse, SyncTableResponse } from './api';
+import { getScopeToken, securityApi, syncApi, SyncManifestResponse, SyncTableResponse } from './api';
 
 export type SyncState = 'idle' | 'syncing' | 'error';
 
@@ -48,7 +48,6 @@ const TABLE_MAP: Record<string, keyof typeof db> = {
 };
 
 const nowIso = () => new Date().toISOString();
-const SCOPE_TOKEN_KEY = 'access_scope_token';
 const SCOPE_FINGERPRINT_META_KEY = 'scopeFingerprint';
 const SYNC_BOOTSTRAP_CURSOR_PREFIX = 'syncBootstrapCursor:';
 const SYNC_BOOTSTRAP_STARTED_AT_PREFIX = 'syncBootstrapStartedAt:';
@@ -132,15 +131,7 @@ export class SyncManager {
 
     private getScopeFingerprint(): string {
         if (typeof window === 'undefined') return 'server';
-        let token = window.localStorage.getItem(SCOPE_TOKEN_KEY) || '';
-        if (!token) {
-            const legacySessionToken = window.sessionStorage.getItem(SCOPE_TOKEN_KEY) || '';
-            if (legacySessionToken) {
-                token = legacySessionToken;
-                window.localStorage.setItem(SCOPE_TOKEN_KEY, legacySessionToken);
-                window.sessionStorage.removeItem(SCOPE_TOKEN_KEY);
-            }
-        }
+        const token = getScopeToken() || '';
         let hash = 0;
         for (let i = 0; i < token.length; i += 1) {
             hash = ((hash << 5) - hash + token.charCodeAt(i)) | 0;
@@ -350,6 +341,9 @@ export class SyncManager {
         const sinceId = bootstrapMode ? cursor : localMeta?.last_server_id;
         const maxPages = bootstrapMode ? INITIAL_SYNC_MAX_PAGES_PER_CYCLE : INCREMENTAL_SYNC_MAX_PAGES_PER_CYCLE;
 
+        const syncMode = bootstrapMode ? (isInitialSync ? 'bootstrap' : 'bootstrap-resume') : 'incremental';
+        let rowsDownloaded = 0;
+
         let pagesFetched = 0;
         let hasMore = true;
         let completed = false;
@@ -383,6 +377,7 @@ export class SyncManager {
             });
             pagesFetched += 1;
             const pageRows = page.rows?.length || 0;
+            rowsDownloaded += pageRows;
 
             const lastRow = pageRows ? page.rows[pageRows - 1] : null;
             const pageLastServerId = Number(lastRow?.id ?? lastRow?.chat_id ?? 0);
@@ -438,6 +433,12 @@ export class SyncManager {
         if (bootstrapMode && completed) {
             await this.clearBootstrapState(tableName);
         }
+        if (rowsDownloaded > 0 || pagesFetched > 1 || bootstrapMode) {
+            console.info(
+                `[sync] ${tableName}: mode=${syncMode} rows=${rowsDownloaded} pages=${pagesFetched}` +
+                    (bootstrapMode ? ` complete=${completed}` : ` since=${since || '∅'} since_id=${sinceId ?? '∅'}`)
+            );
+        }
         return bootstrapMode && !completed;
     }
 
@@ -491,8 +492,11 @@ export class SyncManager {
                 return;
             }
             await this.resetMirrorOnScopeChangeIfNeeded();
+            const cycleStartedAt = Date.now();
             const manifest = await this.getManifestCached();
             let bootstrapPending = false;
+            const syncedTables: string[] = [];
+            const skippedTables: string[] = [];
             for (const table of TABLE_ORDER) {
                 const serverMeta = manifest.tables[table];
                 if (!serverMeta) {
@@ -513,12 +517,20 @@ export class SyncManager {
                 });
                 const hasBootstrapCursor = Boolean(await this.readBootstrapCursor(table));
                 if (!hasBootstrapCursor && !this.shouldSyncTable(table, manifest, meta)) {
+                    skippedTables.push(table);
                     continue;
                 }
+                syncedTables.push(table);
                 const tableBootstrapPending = await this.syncSingleTable(table, meta);
                 bootstrapPending = bootstrapPending || tableBootstrapPending;
             }
             await db.meta.put({ key: 'lastSyncAt', value: nowIso() });
+            console.info(
+                `[sync] cycle done in ${Date.now() - cycleStartedAt}ms` +
+                    ` synced=[${syncedTables.join(',') || '∅'}]` +
+                    ` skipped(up-to-date)=${skippedTables.length}` +
+                    ` bootstrapPending=${bootstrapPending}`
+            );
             this.state = 'idle';
             this.backoffMs = bootstrapPending ? INITIAL_SYNC_CONTINUE_DELAY_MS : DEFAULT_SYNC_BACKOFF_MS;
             this.emit();

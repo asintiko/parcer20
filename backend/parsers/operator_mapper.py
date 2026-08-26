@@ -6,6 +6,7 @@ import os
 import re
 import threading
 import time
+import unicodedata
 from typing import Optional, List, Tuple, Dict
 
 from sqlalchemy.orm import Session
@@ -83,11 +84,18 @@ class OperatorMapper:
         """
         if not value:
             return ""
-        normalized = value.upper()
-        normalized = re.sub(r"[\s\t\n]+", " ", normalized)
-        normalized = re.sub(r"[^A-Z0-9 ]", " ", normalized)
+        normalized = unicodedata.normalize("NFKC", str(value)).upper()
+        normalized = "".join(
+            char if char.isalnum() else " "
+            for char in normalized
+        )
         normalized = " ".join(normalized.split())
         return normalized
+
+    @staticmethod
+    def _contains_token_sequence(value: str, pattern: str) -> bool:
+        """Match normalized phrases only at token boundaries."""
+        return bool(re.search(rf"(?:^| ){re.escape(pattern)}(?: |$)", value))
 
     def refresh_cache(self) -> None:
         """Reload cache from operator_reference (only active rows). Force = bypass TTL."""
@@ -119,7 +127,7 @@ class OperatorMapper:
                 exact_match = (ref_id, pattern, app, is_p2p)
                 break
 
-            if pattern in normalized_input:
+            if self._contains_token_sequence(normalized_input, pattern):
                 plen = len(pattern)
                 if plen > best_len:
                     best_len = plen
@@ -175,7 +183,10 @@ class OperatorMapper:
             score = 0.0
             if pattern == normalized_input:
                 score += 100  # exact match bonus
-            if pattern in normalized_input or normalized_input in pattern:
+            if (
+                self._contains_token_sequence(normalized_input, pattern)
+                or self._contains_token_sequence(pattern, normalized_input)
+            ):
                 score += len(pattern)
 
             pattern_tokens = set(pattern.split())

@@ -2,6 +2,7 @@
 FastAPI Main Application
 Entry point for REST API
 """
+import asyncio
 import time
 from collections import defaultdict
 from contextlib import asynccontextmanager, suppress
@@ -30,13 +31,17 @@ from services.root_access_config_service import (
     system_access_enforced,
     verify_system_access_token,
 )
-from services.auth_bot_service import verify_launch_session_token
+from services.auth_bot_service import (
+    SessionStoreUnavailableError,
+    is_active_session,
+    verify_launch_session_token,
+)
 from services.internal_api_key_service import is_internal_request
 from services.system_settings_service import get_settings
 from api.response_helpers import error_response, build_error_payload
 
 logger = logging.getLogger(__name__)
-APP_VERSION = str(os.getenv("APP_VERSION", "1.4.17")).strip() or "1.4.17"
+APP_VERSION = str(os.getenv("APP_VERSION", "1.4.24")).strip() or "1.4.24"
 
 _launch_gate_cache_value: Optional[bool] = None
 _launch_gate_cache_expires_at: float = 0.0
@@ -495,7 +500,12 @@ class LaunchSessionMiddleware(BaseHTTPMiddleware):
             from database.connection import get_db
             from database.models import AppLaunchConfig
         except Exception:
-            return await call_next(request)
+            logger.exception("Launch gate dependencies unavailable")
+            return error_response(
+                status_code=503,
+                detail={"error": "launch_gate_unavailable"},
+                error_code="launch_gate_unavailable",
+            )
 
         with get_db() as db:
             launch_cfg = db.get(AppLaunchConfig, 1)
@@ -512,6 +522,23 @@ class LaunchSessionMiddleware(BaseHTTPMiddleware):
 
             payload = verify_launch_session_token(token)
             if not payload:
+                return error_response(
+                    status_code=403,
+                    detail={"error": "launch_expired"},
+                    error_code="launch_expired",
+                )
+            try:
+                active = await is_active_session(
+                    str(payload.get("sid") or ""),
+                    expected_kind="launch_session",
+                )
+            except SessionStoreUnavailableError:
+                return error_response(
+                    status_code=503,
+                    detail={"error": "launch_session_store_unavailable"},
+                    error_code="launch_session_store_unavailable",
+                )
+            if not active:
                 return error_response(
                     status_code=403,
                     detail={"error": "launch_expired"},
@@ -1018,7 +1045,7 @@ async def internal_metrics(
 
     if not is_valid_internal_api_key(x_internal_api_key):
         raise HTTPException(status_code=401, detail="invalid_internal_api_key")
-    snap = _metrics.snapshot()
+    snap = await asyncio.to_thread(_metrics.snapshot)
     # Bonus: include AI provider cumulative usage if available.
     try:
         from services.ai_provider import get_text_ai_provider
@@ -1062,6 +1089,7 @@ from api.routes import (
     audit,
     auth,
     automation,
+    descriptions,
     feed,
     logs,
     periods,
@@ -1084,6 +1112,7 @@ app.include_router(ai_agent.router, tags=["Agent"])
 app.include_router(transactions.router, prefix="/api/transactions", tags=["Transactions"])
 app.include_router(analytics.router, prefix="/api/analytics", tags=["Analytics"])
 app.include_router(reference.router, prefix="/api/reference", tags=["Reference"])
+app.include_router(descriptions.router, prefix="/api/descriptions", tags=["Descriptions"])
 app.include_router(logs.router, prefix="/api/logs", tags=["Logs"])
 app.include_router(automation.router, tags=["Automation"])
 app.include_router(reconciliation.router, tags=["Automation"])

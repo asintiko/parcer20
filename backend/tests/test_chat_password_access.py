@@ -12,10 +12,16 @@ from api.routes.telegram_client import tdlib_manager_dep
 from database.connection import get_db_session
 from services.auth_bot_service import create_launch_session_token
 from services.root_access_config_service import hash_password_pbkdf2, reset_root_access_cache
+from fake_auth_redis import (
+    install_fake_auth_redis,
+    issue_active_app_token,
+    register_launch_session,
+    seed_test_user,
+)
 
 
 class FakeTDLibManager:
-    async def get_messages(self, chat_id: int, limit: int = 50, from_message_id: int = 0, fetch_all: bool = False):  # noqa: ARG002
+    async def get_messages(self, chat_id: int, limit: int = 50, from_message_id: int = 0, fetch_all: bool = False, **kwargs):  # noqa: ARG002
         return {
             "total": 1,
             "items": [
@@ -64,7 +70,12 @@ def client(db_session, monkeypatch, tmp_path):
     monkeypatch.setenv("SYSTEM_ACCESS_ENFORCED", "true")
     monkeypatch.setenv("SCOPES_MANAGED_BY_CONFIG", "false")
     monkeypatch.setenv("ROOT_ACCESS_SERVER_CONFIG_PATH", str(config_path))
+    install_fake_auth_redis(monkeypatch)
     reset_root_access_cache()
+
+    app_user_token = issue_active_app_token(
+        seed_test_user(db_session, username="chat-password-test-admin")
+    )
 
     original_lifespan = app.router.lifespan_context
     app.router.lifespan_context = noop_lifespan
@@ -80,7 +91,10 @@ def client(db_session, monkeypatch, tmp_path):
             test_client.headers.update(
                 {
                     "X-System-Access": system_token,
-                    "X-Launch-Session": create_launch_session_token(ip_address="127.0.0.1"),
+                    "X-Launch-Session": register_launch_session(
+                        create_launch_session_token(ip_address="127.0.0.1")
+                    ),
+                    "Authorization": f"Bearer {app_user_token}",
                 }
             )
             yield test_client

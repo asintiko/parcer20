@@ -14,6 +14,7 @@ from database.connection import get_db_session
 from database.models import AccessScope, Transaction
 from services.access_control_service import hash_password, years_to_json
 from services.root_access_config_service import hash_password_pbkdf2, reset_root_access_cache
+from fake_auth_redis import install_fake_auth_redis, issue_active_app_token, seed_test_user
 
 
 @pytest.fixture
@@ -50,7 +51,12 @@ def client(db_session, monkeypatch, tmp_path):
     monkeypatch.setenv("SYSTEM_ACCESS_ENFORCED", "true")
     monkeypatch.setenv("SCOPES_MANAGED_BY_CONFIG", "false")
     monkeypatch.setenv("ROOT_ACCESS_SERVER_CONFIG_PATH", str(config_path))
+    install_fake_auth_redis(monkeypatch)
     reset_root_access_cache()
+
+    app_user_token = issue_active_app_token(
+        seed_test_user(db_session, username="scope-test-admin")
+    )
 
     original_lifespan = app.router.lifespan_context
     app.router.lifespan_context = noop_lifespan
@@ -61,7 +67,12 @@ def client(db_session, monkeypatch, tmp_path):
     app.dependency_overrides[get_db_session] = override_db
     try:
         with TestClient(app) as test_client:
-            test_client.headers.update({"X-System-Access": system_token})
+            test_client.headers.update(
+                {
+                    "X-System-Access": system_token,
+                    "Authorization": f"Bearer {app_user_token}",
+                }
+            )
             yield test_client
     finally:
         app.dependency_overrides.pop(get_db_session, None)
@@ -142,7 +153,17 @@ def test_transactions_require_scope_token_when_scope_enabled(client, db_session)
     _add_tx(db_session, year=2026, idx=10)
     _add_scope(db_session, name="tx-only", password="1234", years=[2026], allow_transactions=True, allow_sources=False)
 
-    res = client.get("/api/transactions/years")
+    operator = seed_test_user(
+        db_session,
+        username="scope-missing-token-operator",
+        role="operator",
+    )
+    operator_token = issue_active_app_token(operator)
+
+    res = client.get(
+        "/api/transactions/years",
+        headers={"Authorization": f"Bearer {operator_token}"},
+    )
     assert res.status_code == 403
     assert "Scoped access token required" in res.text
 

@@ -13,10 +13,9 @@ from database.connection import get_db_session
 from database.models import User
 from services.access_control_service import hash_password
 from services.auth_bot_service import register_active_session, revoke_active_session
-from services.auth_service import create_app_user_token
 from services.auth_service import verify_jwt_token
 from services.root_access_config_service import hash_password_pbkdf2, reset_root_access_cache
-from fake_auth_redis import install_fake_auth_redis
+from fake_auth_redis import install_fake_auth_redis, issue_active_app_token
 
 
 def _seed_user(db_session, *, username: str, password: str, role: str = "admin") -> User:
@@ -121,13 +120,7 @@ def test_user_login_lockout(client, db_session):
 
 def test_permissions_outdated_invalidates_old_token(client, db_session):
     user = _seed_user(db_session, username="u1", password="pw", role="admin")
-    token = create_app_user_token(
-        user_id=int(user.id),
-        username=user.username,
-        role=user.role,
-        permissions_version=int(user.permissions_version),
-        display_name=user.display_name,
-    )
+    token = issue_active_app_token(user)
 
     user.permissions_version = int(user.permissions_version) + 1
     db_session.commit()
@@ -139,13 +132,7 @@ def test_permissions_outdated_invalidates_old_token(client, db_session):
 
 def test_revoked_session_invalidates_verify(client, db_session):
     user = _seed_user(db_session, username="revoked-admin", password="pw", role="admin")
-    token = create_app_user_token(
-        user_id=int(user.id),
-        username=user.username,
-        role=user.role,
-        permissions_version=int(user.permissions_version),
-        display_name=user.display_name,
-    )
+    token = issue_active_app_token(user)
     decoded = verify_jwt_token(token)
     assert decoded and decoded.get("sid")
 
@@ -163,4 +150,4 @@ def test_revoked_session_invalidates_verify(client, db_session):
 
     res = client.get("/api/auth/verify", headers={"Authorization": f"Bearer {token}"})
     assert res.status_code == 401
-    assert "session_revoked" in res.text
+    assert "session_inactive" in res.text

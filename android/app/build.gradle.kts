@@ -1,19 +1,8 @@
-import java.util.Properties
-
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
     id("com.google.devtools.ksp")
     id("com.google.dagger.hilt.android")
-}
-
-// Mobile ingest key is injected at build time — never source-controlled. Precedence:
-// local.properties (dev) → MOBILE_INGEST_KEY env (CI) → "" (forces manual entry in onboarding).
-val mobileIngestKey: String = run {
-    val props = Properties()
-    val lp = rootProject.file("local.properties")
-    if (lp.exists()) lp.inputStream().use(props::load)
-    props.getProperty("MOBILE_INGEST_KEY") ?: System.getenv("MOBILE_INGEST_KEY") ?: ""
 }
 
 android {
@@ -24,10 +13,9 @@ android {
         applicationId = "uz.tbsparcer.sms"
         minSdk = 26
         targetSdk = 35
-        versionCode = 1
-        versionName = "1.0.0"
+        versionCode = 4
+        versionName = "1.0.3"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
-        buildConfigField("String", "MOBILE_INGEST_KEY", "\"$mobileIngestKey\"")
     }
 
     signingConfigs {

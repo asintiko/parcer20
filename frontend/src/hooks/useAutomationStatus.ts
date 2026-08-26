@@ -3,6 +3,7 @@
  */
 import { useEffect, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
+import { isAxiosError } from 'axios';
 import { automationApi } from '../services/api';
 
 export function useAutomationStatus() {
@@ -23,8 +24,8 @@ export function useAutomationStatus() {
             return status === 'processing' || status === 'started' ? 3000 : false;
         },
         // Clean up if task not found
-        retry: (failureCount, error: any) => {
-            if (error?.response?.status === 404) {
+        retry: (failureCount, error: unknown) => {
+            if (isAxiosError(error) && error.response?.status === 404) {
                 localStorage.removeItem('automation_task_id');
                 setActiveTaskId(null);
                 return false;

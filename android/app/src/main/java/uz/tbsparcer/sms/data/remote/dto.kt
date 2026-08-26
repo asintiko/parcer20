@@ -81,3 +81,12 @@ data class SourceItem(
 
 @JsonClass(generateAdapter = true)
 data class SourcesResponse(val items: List<SourceItem>)
+
+@JsonClass(generateAdapter = true)
+data class AppUpdateManifest(
+    val versionCode: Int,
+    val versionName: String,
+    val url: String,
+    val sha256: String,
+    val notes: String? = null,
+)
