@@ -1,0 +1,94 @@
+/* Контейнер для валютных вкладок */
+.currency-tabs-container {
+  display: flex;
+  align-items: center;
+  padding: 8px 16px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+}
+
+.currency-tabs {
+  display: flex;
+  gap: 4px;
+  background: var(--surface-2);
+  border-radius: 8px;
+  padding: 4px;
+}
+
+.currency-tab {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 20px;
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: all 0.2s ease;
+  user-select: none;
+}
+
+.currency-tab:hover {
+  background: var(--surface-3);
+  color: var(--text);
+}
+
+.currency-tab.active {
+  background: var(--primary);
+  color: white;
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+}
+
+.currency-tab.active:hover {
+  background: var(--primary);
+  color: white;
+}
+
+.currency-tab-label {
+  font-weight: 600;
+  letter-spacing: 0.5px;
+}
+
+.currency-tab-count {
+  font-size: 12px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.2);
+  min-width: 24px;
+  text-align: center;
+}
+
+.currency-tab:not(.active) .currency-tab-count {
+  background: var(--surface-3);
+  color: var(--text-secondary);
+}
+
+/* Анимация при переключении */
+@keyframes tabSwitch {
+  0% {
+    opacity: 0.8;
+    transform: translateY(-2px);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.currency-tab.active {
+  animation: tabSwitch 0.2s ease;
+}
+
+/* Темная тема */
+[data-theme='dark'] .currency-tabs {
+  background: var(--surface-3);
+}
+
+[data-theme='dark'] .currency-tab.active {
+  background: var(--primary);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.5);
+}

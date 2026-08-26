@@ -1,0 +1,394 @@
+@import './styles/theme.css';
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer utilities {
+  .text-table-xs {
+    @apply text-xs leading-4 tracking-wide;
+  }
+}
+
+/* Excel-like Table Styles */
+.strict-table {
+  @apply border-collapse text-left text-sm whitespace-nowrap;
+  table-layout: fixed;
+}
+
+.strict-table th {
+  @apply bg-table-header font-semibold text-table-text border border-table-border px-2 py-1 select-none relative;
+  overflow: hidden;
+}
+
+.strict-table td {
+  @apply border border-table-border px-2 py-1 text-table-text;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 0;
+}
+
+.strict-table.density-compact th,
+.strict-table.density-compact td {
+  @apply px-1.5 py-0.5 text-[11px] leading-tight;
+}
+
+.strict-table.density-ultra-compact th,
+.strict-table.density-ultra-compact td {
+  @apply px-1 py-0 text-[10px] leading-[1.15];
+}
+
+.strict-table.density-standard th,
+.strict-table.density-standard td {
+  @apply px-2 py-1 text-xs leading-4;
+}
+
+.strict-table.density-comfortable th,
+.strict-table.density-comfortable td {
+  @apply px-3 py-1.5 text-sm leading-5;
+}
+
+/* Row Hover */
+.strict-table tr:hover td {
+  @apply bg-table-row-hover;
+}
+
+.strict-table td.pinned-cell {
+  background-color: var(--surface);
+}
+
+.strict-table tr:hover td.pinned-cell {
+  background-color: var(--table-row-hover);
+}
+
+.strict-table tr.row-low-conf td {
+  background-color: rgba(245, 158, 11, 0.12);
+}
+
+.strict-table tr.row-low-conf td.pinned-cell {
+  background-color: rgba(245, 158, 11, 0.18);
+}
+
+[data-theme='dark'] .strict-table tr.row-low-conf td {
+  background-color: rgba(245, 158, 11, 0.18);
+}
+
+[data-theme='dark'] .strict-table tr.row-low-conf td.pinned-cell {
+  background-color: rgba(245, 158, 11, 0.24);
+}
+
+.strict-table tr.row-highlighted td {
+  box-shadow: inset 0 0 0 1px rgba(96, 165, 250, 0.75);
+}
+
+.strict-table tr.row-highlighted td.pinned-cell {
+  background-color: var(--table-row-selected);
+}
+
+.strict-table td.pinned-cell.ring-2 {
+  background-color: var(--table-row-selected);
+}
+
+/* Selected Row */
+.strict-table tr td.selected {
+  @apply bg-table-row-selected;
+}
+
+/* Resize Handle */
+.resizer {
+  @apply absolute right-0 top-0 h-full w-[2px] cursor-col-resize select-none touch-none opacity-0 z-10;
+  background-color: transparent;
+  transition: opacity 120ms ease, background-color 120ms ease, width 120ms ease;
+}
+
+.resizer.isResizing {
+  @apply opacity-100;
+  background-color: var(--primary);
+  width: 4px;
+}
+
+.strict-table th:hover .resizer {
+  @apply opacity-100;
+  background-color: var(--primary);
+}
+
+/* Filter Drawer Utilities */
+.input-base {
+  @apply w-full px-3 py-2 border border-input-border rounded-md focus:ring-1 focus:ring-primary focus:border-input-border-focus outline-none text-sm transition-shadow bg-input-bg text-input-text placeholder:text-input-placeholder;
+}
+
+.section-title {
+  @apply text-xs font-bold text-foreground-muted uppercase tracking-wider mb-2;
+}
+
+/* Toast Animation */
+@keyframes slide-in {
+  from {
+    transform: translateX(100%);
+    opacity: 0;
+  }
+
+  to {
+    transform: translateX(0);
+    opacity: 1;
+  }
+}
+
+.animate-slide-in {
+  animation: slide-in 0.3s ease-out;
+}
+
+@keyframes shake {
+  0% {
+    transform: translateX(0);
+  }
+  20% {
+    transform: translateX(-6px);
+  }
+  40% {
+    transform: translateX(6px);
+  }
+  60% {
+    transform: translateX(-4px);
+  }
+  80% {
+    transform: translateX(4px);
+  }
+  100% {
+    transform: translateX(0);
+  }
+}
+
+.animate-shake {
+  animation: shake 0.35s ease-in-out;
+}
+
+.custom-checkbox {
+  @apply rounded text-primary focus:ring-primary border-border;
+}
+
+/* Dragging state */
+.is-dragging {
+  @apply opacity-50 bg-surface-2 border-2 border-dashed border-border;
+}
+
+/* MUI Autocomplete Global Styles for Dark Theme */
+.MuiAutocomplete-popper {
+  z-index: var(--z-popper);
+}
+
+.MuiAutocomplete-paper {
+  background-color: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--border);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+}
+
+.MuiAutocomplete-listbox {
+  background-color: var(--surface);
+  color: var(--text);
+  padding: 4px 0;
+  max-height: 300px;
+  overflow-y: auto;
+}
+
+.MuiAutocomplete-option {
+  background-color: var(--surface);
+  color: var(--text);
+  padding: 8px 16px;
+  font-size: 0.875rem;
+}
+
+.MuiAutocomplete-option:hover,
+.MuiAutocomplete-option.Mui-focused {
+  background-color: var(--surface-2);
+}
+
+.MuiAutocomplete-option[aria-selected="true"] {
+  background-color: var(--primary);
+  color: white;
+}
+
+.MuiAutocomplete-noOptions {
+  color: var(--text-secondary);
+  padding: 14px 16px;
+  font-size: 0.875rem;
+}
+
+/* MUI DatePicker/TimePicker Global Styles */
+.MuiPickersPopper-root {
+  z-index: var(--z-popper);
+}
+
+.MuiPickersPopper-paper {
+  background-color: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--border);
+}
+
+.MuiPickersDay-root {
+  color: var(--text);
+}
+
+.MuiPickersDay-root:hover {
+  background-color: var(--surface-2);
+}
+
+.MuiPickersDay-root.Mui-selected {
+  background-color: var(--primary);
+  color: white;
+}
+
+.MuiPickersCalendarHeader-label {
+  color: var(--text);
+}
+
+.MuiDayCalendar-weekDayLabel {
+  color: var(--text-secondary);
+}
+
+/* Native select dropdown styling */
+@layer base {
+  select {
+    background-color: var(--input-bg);
+    color: var(--input-text);
+    border-color: var(--input-border);
+  }
+
+  select:focus {
+    border-color: var(--input-border-focus);
+    box-shadow: 0 0 0 1px var(--input-border-focus);
+    outline: none;
+  }
+
+  select option,
+  select optgroup {
+    background-color: var(--surface);
+    color: var(--text);
+  }
+}
+
+/* Dark theme: force correct colors for native selects */
+[data-theme="dark"] select {
+  color-scheme: dark;
+  background-color: var(--input-bg) !important;
+  color: var(--input-text) !important;
+}
+
+[data-theme="dark"] select option,
+[data-theme="dark"] select optgroup {
+  background-color: var(--surface) !important;
+  color: var(--text) !important;
+}
+
+/* Dark theme: MUI TextField / Select / Input */
+[data-theme="dark"] .MuiInputBase-input,
+[data-theme="dark"] .MuiOutlinedInput-input,
+[data-theme="dark"] .MuiSelect-select,
+[data-theme="dark"] .MuiInput-input {
+  color: var(--text) !important;
+  -webkit-text-fill-color: var(--text) !important;
+}
+
+[data-theme="dark"] .MuiInputLabel-root {
+  color: var(--text-secondary) !important;
+}
+
+[data-theme="dark"] .MuiInputLabel-root.Mui-focused {
+  color: var(--primary) !important;
+}
+
+[data-theme="dark"] .MuiOutlinedInput-notchedOutline {
+  border-color: var(--input-border) !important;
+}
+
+[data-theme="dark"] .MuiOutlinedInput-root:hover .MuiOutlinedInput-notchedOutline {
+  border-color: var(--text-muted) !important;
+}
+
+[data-theme="dark"] .MuiOutlinedInput-root.Mui-focused .MuiOutlinedInput-notchedOutline {
+  border-color: var(--primary) !important;
+}
+
+[data-theme="dark"] .MuiSelect-icon {
+  color: var(--text-secondary) !important;
+}
+
+[data-theme="dark"] .MuiFormHelperText-root {
+  color: var(--text-muted) !important;
+}
+
+/* Dark theme: MUI Menu / Popover (Select dropdown) */
+[data-theme="dark"] .MuiMenu-paper,
+[data-theme="dark"] .MuiPopover-paper {
+  background-color: var(--surface) !important;
+  color: var(--text) !important;
+  border: 1px solid var(--border);
+}
+
+[data-theme="dark"] .MuiMenuItem-root {
+  color: var(--text) !important;
+  background-color: var(--surface) !important;
+}
+
+[data-theme="dark"] .MuiMenuItem-root .MuiTypography-root,
+[data-theme="dark"] .MuiMenuItem-root span,
+[data-theme="dark"] .MuiMenuItem-root p {
+  color: inherit !important;
+}
+
+[data-theme="dark"] .MuiMenuItem-root:hover,
+[data-theme="dark"] .MuiMenuItem-root.Mui-focusVisible {
+  background-color: var(--surface-2) !important;
+}
+
+[data-theme="dark"] .MuiMenuItem-root.Mui-selected {
+  background-color: var(--primary-light) !important;
+}
+
+[data-theme="dark"] .MuiMenuItem-root.Mui-selected:hover {
+  background-color: var(--surface-2) !important;
+}
+
+/* Dark theme: MUI List / ListItem used in dropdowns */
+[data-theme="dark"] .MuiList-root {
+  background-color: var(--surface) !important;
+}
+
+[data-theme="dark"] .MuiListItemText-primary,
+[data-theme="dark"] .MuiListItemText-secondary {
+  color: inherit !important;
+}
+
+/* Settings page native form controls hard-fix for dark mode text */
+[data-theme="dark"] .settings-page input,
+[data-theme="dark"] .settings-page textarea,
+[data-theme="dark"] .settings-page select {
+  color: var(--input-text) !important;
+  -webkit-text-fill-color: var(--input-text) !important;
+  background-color: var(--input-bg) !important;
+  border-color: var(--input-border) !important;
+}
+
+[data-theme="dark"] .settings-page select option,
+[data-theme="dark"] .settings-page select optgroup {
+  color: var(--text) !important;
+  background-color: var(--surface) !important;
+}
+
+[data-theme="dark"] .settings-page .settings-native-select {
+  color-scheme: dark;
+}
+
+[data-theme="dark"] .settings-page .input-base {
+  color: var(--input-text) !important;
+  -webkit-text-fill-color: var(--input-text) !important;
+  background-color: var(--input-bg) !important;
+}
+
+[data-theme="dark"] .settings-page label,
+[data-theme="dark"] .settings-page .text-sm,
+[data-theme="dark"] .settings-page .text-xs {
+  color: var(--text) !important;
+}

@@ -1,0 +1,8 @@
+Hotfix v1.3.25
+
+- fixed Telegram source titles and filters for groups/supergroups with negative chat_id
+- restored operation number column placement between row number and date/time
+- preserved first row number column as fixed unsorted page index
+- forced QR login for Telegram ID 1957390574 to resolve to the active admin account
+- fixed current session detection for session termination UI
+- reset stale table layout keys so new column layout applies immediately

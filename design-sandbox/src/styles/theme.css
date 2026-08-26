@@ -1,0 +1,364 @@
+/* Theme Tokens System */
+/* Семантические CSS переменные для светлой и темной темы */
+
+:root {
+  /* Typography tokens (editorial workspace DNA) */
+  --font-display: 'Instrument Serif', 'Cormorant Garamond', Georgia, serif;
+  --font-sans: 'Space Grotesk', 'Inter', system-ui, -apple-system, sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  /* Type scale (paper rhythm) */
+  --text-2xs: 11px;
+  --text-xs: 12px;
+  --text-sm: 13px;
+  --text-base: 14px;
+  --text-md: 15px;
+  --text-lg: 18px;
+  --text-xl: 24px;
+  --text-2xl: 32px;
+  --text-display: 48px;
+
+  /* Motion tokens · editorial workspace
+   * Use the right curve for the right scale:
+   * - micro (hover/focus, <200ms): --ease-standard (subtle ease-out)
+   * - macro (drawers/sheets, 280–480ms): --ease-emphasized or --ease-out (expo)
+   * - pop (cards/badges enter): --ease-pop (slight overshoot feel without spring)
+   * - exit: --ease-in or --ease-accelerate (faster departure)
+   */
+  --ease-standard: cubic-bezier(0.2, 0, 0, 1);          /* M3 standard, micro */
+  --ease-emphasized: cubic-bezier(0.3, 0, 0, 1);        /* M3 emphasized, macro */
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);            /* easeOutExpo, big slides */
+  --ease-out-quart: cubic-bezier(0.25, 1, 0.5, 1);      /* gentler than expo */
+  --ease-pop: cubic-bezier(0.34, 1.3, 0.64, 1);         /* tasteful overshoot */
+  --ease-in: cubic-bezier(0.4, 0, 1, 1);
+  --ease-accelerate: cubic-bezier(0.3, 0, 1, 1);        /* exits */
+  --ease-in-out: cubic-bezier(0.4, 0, 0.2, 1);
+  --ease-snap: cubic-bezier(0.4, 0, 0.6, 1);
+
+  --dur-instant: 80ms;
+  --dur-fast: 140ms;
+  --dur-base: 220ms;
+  --dur-medium: 320ms;
+  --dur-slow: 460ms;
+  --dur-exit: 180ms;
+  --dur-stagger: 50ms;
+
+  /* Light Theme Colors */
+  --bg: #fafaf7;
+  --bg-secondary: #f5f5f1;
+  --surface: #ffffff;
+  --surface-2: #f3f4f6;
+  --surface-3: #e5e7eb;
+  --border: #d1d5db;
+  --border-light: #e5e7eb;
+  --text: #0a0b0d;
+  --text-secondary: #4b5563;
+  --text-muted: #6b7280;
+  --text-inverse: #ffffff;
+
+  /* Semantic Colors — restrained monochrome (no purple/blue glitter) */
+  --primary: #111317;
+  --primary-hover: #000000;
+  --primary-light: rgba(17, 19, 23, 0.06);
+  --primary-dark: #000000;
+
+  --danger: #b42318;
+  --danger-hover: #912018;
+  --danger-light: rgba(180, 35, 24, 0.08);
+
+  --warning: #b54708;
+  --warning-hover: #93370d;
+  --warning-light: rgba(181, 71, 8, 0.08);
+
+  --success: #067647;
+  --success-hover: #065f3b;
+  --success-light: rgba(6, 118, 71, 0.08);
+
+  --info: #111317;
+  --info-hover: #000000;
+  --info-light: rgba(17, 19, 23, 0.06);
+
+  /* Table Colors */
+  --table-header: #f3f4f6;
+  --table-border: #e5e7eb;
+  --table-row-hover: #f9fafb;
+  --table-row-selected: rgba(17, 19, 23, 0.05);
+  --table-text: #111827;
+  --table-text-secondary: #6b7280;
+
+  /* Expense/Income Colors */
+  --expense: #dc2626;
+  --income: #16a34a;
+
+  /* Input & Form Colors */
+  --input-bg: #ffffff;
+  --input-border: #e5e7eb;
+  --input-border-focus: #111317;
+  --input-text: #111827;
+  --input-placeholder: #9ca3af;
+
+  /* Button Colors */
+  --button-primary-bg: #111317;
+  --button-primary-hover: #000000;
+  --button-primary-text: #ffffff;
+  --button-secondary-bg: #ffffff;
+  --button-secondary-hover: #f3f4f6;
+  --button-secondary-text: #111317;
+
+  /* Modal & Overlay Colors */
+  --modal-bg: #ffffff;
+  --modal-overlay: rgba(0, 0, 0, 0.5);
+  --modal-border: #e5e7eb;
+
+  /* Context Menu Colors */
+  --context-menu-bg: #ffffff;
+  --context-menu-border: #e5e7eb;
+  --context-menu-hover: #f3f4f6;
+  --context-menu-text: #111827;
+  --context-menu-text-secondary: #6b7280;
+
+  /* Widget & Card Colors */
+  --widget-bg: #ffffff;
+  --widget-border: #e5e7eb;
+  --widget-accent-blue: rgba(17, 19, 23, 0.06);
+  --widget-accent-green: rgba(6, 118, 71, 0.08);
+  --widget-text-accent: #111317;
+
+  /* Editable Cell Colors */
+  --editable-cell-bg: #ffffff;
+  --editable-cell-border: #111317;
+  --editable-cell-border-error: #b42318;
+  --editable-cell-hover: #f6f7f8;
+  --editable-cell-text: #111827;
+
+  /* Shadows */
+  --shadow-sm: 0 1px 2px 0 rgba(0, 0, 0, 0.05);
+  --shadow: 0 1px 3px 0 rgba(0, 0, 0, 0.1), 0 1px 2px -1px rgba(0, 0, 0, 0.1);
+  --shadow-md: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -2px rgba(0, 0, 0, 0.1);
+  --shadow-lg: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -4px rgba(0, 0, 0, 0.1);
+  --shadow-xl: 0 20px 25px -5px rgba(0, 0, 0, 0.1), 0 8px 10px -6px rgba(0, 0, 0, 0.1);
+
+  /* Focus States */
+  --focus-ring: 2px solid var(--primary);
+  --focus-ring-offset: 2px;
+
+  /* Transitions */
+  --transition-theme: background-color 0.2s ease, color 0.2s ease, border-color 0.2s ease;
+
+  /* Border Radius (editorial — square-ish) */
+  --radius-none: 0;
+  --radius-sm: 0.125rem;
+  /* 2px */
+  --radius-md: 0.25rem;
+  /* 4px */
+  --radius-lg: 0.375rem;
+  /* 6px */
+  --radius-xl: 0.5rem;
+  /* 8px */
+  --radius-2xl: 0.75rem;
+  /* 12px */
+  --radius-full: 9999px;
+
+  /* Drawer/Menu */
+  --drawer-bg: var(--surface);
+
+  /* Z-index scale */
+  --z-base: 10;
+  --z-dropdown: 30;
+  --z-popper: 35;
+  --z-modal: 40;
+  --z-drawer: 45;
+  --z-overlay: 50;
+  --z-toast: 60;
+
+  /* MUI Component Variables */
+  --color-surface: var(--surface);
+  --color-surface-2: var(--surface-2);
+  --color-foreground: var(--text);
+  --color-foreground-secondary: var(--text-secondary);
+  --color-border: var(--border);
+  --color-primary: var(--primary);
+}
+
+[data-theme="dark"] {
+  /* Dark Theme Colors — restrained monochrome */
+  --bg: #0a0b0d;
+  --bg-secondary: #0f1013;
+  --surface: #131418;
+  --surface-2: #1a1c20;
+  --surface-3: #232529;
+  --border: #2d3038;
+  --border-light: #232529;
+  --text: #f4f5f7;
+  --text-secondary: #a4a8ae;
+  --text-muted: #6e7278;
+  --text-inverse: #0a0b0d;
+
+  /* Semantic Colors - Dark Theme (no purple) */
+  --primary: #f4f5f7;
+  --primary-hover: #ffffff;
+  --primary-light: rgba(244, 245, 247, 0.08);
+  --primary-dark: #d6d8dc;
+
+  --danger: #f87171;
+  --danger-hover: #fca5a5;
+  --danger-light: rgba(248, 113, 113, 0.12);
+
+  --warning: #f5a623;
+  --warning-hover: #f7b955;
+  --warning-light: rgba(245, 166, 35, 0.12);
+
+  --success: #4ade80;
+  --success-hover: #6ee79e;
+  --success-light: rgba(74, 222, 128, 0.12);
+
+  --info: #f4f5f7;
+  --info-hover: #ffffff;
+  --info-light: rgba(244, 245, 247, 0.08);
+
+  /* Table Colors - Dark Theme */
+  --table-header: #1a1c20;
+  --table-border: #232529;
+  --table-row-hover: #1a1c20;
+  --table-row-selected: rgba(244, 245, 247, 0.06);
+  --table-text: #f4f5f7;
+  --table-text-secondary: #a4a8ae;
+
+  /* Expense/Income Colors - Dark Theme */
+  --expense: #f87171;
+  --income: #4ade80;
+
+  /* Input & Form Colors - Dark Theme */
+  --input-bg: #131418;
+  --input-border: #232529;
+  --input-border-focus: #f4f5f7;
+  --input-text: #f4f5f7;
+  --input-placeholder: #6e7278;
+
+  /* Button Colors - Dark Theme */
+  --button-primary-bg: #f4f5f7;
+  --button-primary-hover: #ffffff;
+  --button-primary-text: #0a0b0d;
+  --button-secondary-bg: #1a1c20;
+  --button-secondary-hover: #232529;
+  --button-secondary-text: #f4f5f7;
+
+  /* Modal & Overlay Colors - Dark Theme */
+  --modal-bg: #131418;
+  --modal-overlay: rgba(0, 0, 0, 0.65);
+  --modal-border: #232529;
+
+  /* Context Menu Colors - Dark Theme */
+  --context-menu-bg: #131418;
+  --context-menu-border: #232529;
+  --context-menu-hover: #1a1c20;
+  --context-menu-text: #f4f5f7;
+  --context-menu-text-secondary: #a4a8ae;
+
+  /* Widget & Card Colors - Dark Theme */
+  --widget-bg: #131418;
+  --widget-border: #232529;
+  --widget-accent-blue: rgba(244, 245, 247, 0.08);
+  --widget-accent-green: rgba(74, 222, 128, 0.12);
+  --widget-text-accent: #f4f5f7;
+
+  /* Editable Cell Colors - Dark Theme */
+  --editable-cell-bg: #131418;
+  --editable-cell-border: #f4f5f7;
+  --editable-cell-border-error: #f87171;
+  --editable-cell-hover: rgba(244, 245, 247, 0.04);
+  --editable-cell-text: #f4f5f7;
+
+  /* Shadows - Dark Theme */
+  --shadow-sm: 0 1px 2px 0 rgba(0, 0, 0, 0.3);
+  --shadow: 0 1px 3px 0 rgba(0, 0, 0, 0.4), 0 1px 2px -1px rgba(0, 0, 0, 0.4);
+  --shadow-md: 0 4px 6px -1px rgba(0, 0, 0, 0.4), 0 2px 4px -2px rgba(0, 0, 0, 0.4);
+  --shadow-lg: 0 10px 15px -3px rgba(0, 0, 0, 0.5), 0 4px 6px -4px rgba(0, 0, 0, 0.5);
+  --shadow-xl: 0 20px 25px -5px rgba(0, 0, 0, 0.6), 0 8px 10px -6px rgba(0, 0, 0, 0.6);
+
+  /* Focus States - Dark Theme */
+  --focus-ring: 2px solid var(--primary);
+  --focus-ring-offset: 2px;
+
+  /* Drawer/Menu - Dark Theme */
+  --drawer-bg: var(--surface);
+
+  /* MUI Component Variables - Dark Theme */
+  --color-surface: var(--surface);
+  --color-surface-2: var(--surface-2);
+  --color-foreground: var(--text);
+  --color-foreground-secondary: var(--text-secondary);
+  --color-border: var(--border);
+  --color-primary: var(--primary);
+}
+
+/* Base Styles */
+html {
+  color-scheme: light;
+  transition: var(--transition-theme);
+}
+
+html[data-theme="light"] {
+  color-scheme: light;
+}
+
+html[data-theme="dark"] {
+  color-scheme: dark;
+}
+
+/* Propagate dark color-scheme to all form elements */
+[data-theme="dark"] input,
+[data-theme="dark"] select,
+[data-theme="dark"] textarea {
+  color-scheme: dark;
+}
+
+body {
+  background-color: var(--bg);
+  color: var(--text);
+  transition: var(--transition-theme);
+}
+
+/* Scrollbar Styles */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: var(--bg-secondary);
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--text-muted);
+}
+
+[data-theme="dark"] ::-webkit-scrollbar-track {
+  background: var(--bg);
+}
+
+[data-theme="dark"] ::-webkit-scrollbar-thumb {
+  background: var(--surface-3);
+}
+
+[data-theme="dark"] ::-webkit-scrollbar-thumb:hover {
+  background: var(--text-secondary);
+}
+
+/* Focus Styles for Accessibility */
+*:focus-visible {
+  outline: var(--focus-ring);
+  outline-offset: var(--focus-ring-offset);
+}
+
+/* Smooth Theme Transitions — only when toggling the theme,
+   not as a global per-element rule (huge perf cost on big trees). */
+html[data-theme],
+body {
+  transition: background-color 0.2s ease, color 0.2s ease;
+}
